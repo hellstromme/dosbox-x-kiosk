@@ -69,6 +69,11 @@ public:
     std::string opt_agent_config;
     bool opt_agent_self_test = false;
 #endif
+#if defined(C_KIOSK)
+    bool opt_kiosk_mode = false;
+    std::string opt_kiosk_db;
+    std::string opt_kiosk_conf;
+#endif
     std::vector<std::string> config_file_list;
     std::vector<std::string> opt_o;
     std::vector<std::string> opt_c;

@@ -135,6 +135,11 @@ char* revert_escape_newlines(const char* aMessage);
 #include "control.h"
 #include "dos_inc.h"
 #include "dosbox.h"
+#if defined(C_KIOSK)
+#include "kiosk/kiosk_main.h"
+#include "kiosk/kiosk_db.h"
+#include "kiosk/ui/kiosk_ui.h"
+#endif
 #include "menudef.h"
 #include "pic.h"
 #include "timer.h"
@@ -7531,6 +7536,17 @@ bool DOSBOX_parse_argv() {
             control->opt_agent_self_test = true;
         }
 #endif
+#if defined(C_KIOSK)
+        else if (optname == "kiosk-mode") {
+            control->opt_kiosk_mode = true;
+        }
+        else if (optname == "kiosk-db") {
+            if (!control->cmdline->NextOptArgv(control->opt_kiosk_db)) return false;
+        }
+        else if (optname == "kiosk-conf") {
+            if (!control->cmdline->NextOptArgv(control->opt_kiosk_conf)) return false;
+        }
+#endif
         else if (optname == "nolog") {
             control->opt_nolog = true;
         }
@@ -8511,6 +8527,22 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
         }
         LOG_MSG("Agent self-test completed: success");
         return 0;
+    }
+#endif
+#if defined(C_KIOSK)
+    if (control->opt_kiosk_mode) {
+        fprintf(stderr, "KIOSK: DOSBox-X Kiosk Edition flag detected.\n");
+        LOG_MSG("KIOSK: DOSBox-X Kiosk Edition flag detected.");
+        KioskManager::GetInstance().SetKioskModeActive(true);
+        if (KioskManager::GetInstance().Initialize(control->opt_kiosk_db, control->opt_kiosk_conf)) {
+            fprintf(stderr, "KIOSK: Subsystems initialized successfully (SQLite %s, ImGui %s).\n",
+                    KioskDatabase::GetInstance().GetSQLiteVersion().c_str(),
+                    KioskUI::GetInstance().GetImGuiVersion().c_str());
+            LOG_MSG("KIOSK: Subsystems initialized successfully (SQLite %s, ImGui %s).",
+                    KioskDatabase::GetInstance().GetSQLiteVersion().c_str(),
+                    KioskUI::GetInstance().GetImGuiVersion().c_str());
+        }
+        fflush(stderr);
     }
 #endif
 

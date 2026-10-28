@@ -87,6 +87,11 @@ SUBDIRS += monitor
 #dosbox_x_LDADD += monitor/libmonitor.a
 endif
 
+if C_KIOSK
+SUBDIRS += kiosk
+dosbox_x_LDADD += kiosk/libkiosk.a libs/sqlite3/libsqlite3.a libs/imgui/libimgui.a
+endif
+
 if EMSCRIPTEN
 dosbox_x_js:
 	cp dosbox-x dosbox-x.js

@@ -258,6 +258,14 @@ AC_ARG_ENABLE(emscripten,AC_HELP_STRING([--enable-emscripten],[Enable Emscripten
 dnl Allow disabling X11 integration if your platform doesn't support it
 AC_ARG_ENABLE(x11,AC_HELP_STRING([--disable-x11],[Don't enable X11 integration]))
 
+dnl DOSBox-X Kiosk Edition
+AH_TEMPLATE(C_KIOSK,[Define to 1 to enable DOSBox-X Kiosk Edition appliance features])
+AC_ARG_ENABLE(kiosk,AC_HELP_STRING([--enable-kiosk],[Enable DOSBox-X Kiosk Edition appliance features]),enable_kiosk=$enableval,enable_kiosk=no)
+if test "x$enable_kiosk" = "xyes"; then
+    AC_DEFINE(C_KIOSK, 1, [Define to 1 to enable DOSBox-X Kiosk Edition])
+fi
+AM_CONDITIONAL(C_KIOSK, test "x$enable_kiosk" = "xyes")
+
 dnl Optimize for speed by default
 AC_ARG_ENABLE(optimize,AC_HELP_STRING([--disable-optimize],[Don't enable compiler optimizations]))
 
@@ -1638,6 +1646,9 @@ src/builtin/Makefile
 src/misc/Makefile
 src/shell/Makefile
 src/platform/Makefile
+src/kiosk/Makefile
+src/libs/sqlite3/Makefile
+src/libs/imgui/Makefile
 include/Makefile
 contrib/macos/dosbox-x.plist
 contrib/linux/dosbox-x.spec

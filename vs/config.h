@@ -404,5 +404,10 @@ typedef         double     Real64;
 #define HAS_CDIRECTLPT 0
 #endif
 
+/* Define to 1 to enable DOSBox-X Kiosk Edition appliance features */
+#ifndef C_KIOSK
+#define C_KIOSK 1
+#endif
+
 /* Linux-side configure script will write/rewrite this file so both Windows and Linux builds carry the same information --J.C. */
 #include "config_package.h"
