@@ -594,6 +594,13 @@ fi
 
 AC_SUBST([SDL_STRING])
 
+dnl DOSBox-X Kiosk Edition requires SDL2
+if test "x$enable_kiosk" = "xyes"; then
+    if test "x$SDL_STRING" != "xSDL2"; then
+        AC_MSG_ERROR([--enable-kiosk requires SDL2. Please configure with --enable-sdl2])
+    fi
+fi
+
 AH_TEMPLATE(C_GAMELINK,[Define to 1 to enable game link headless mode])
 AC_CHECK_LIB(rt, main, have_rt_lib=yes, have_rt_lib=no , )
 AC_ARG_ENABLE(gamelink,AC_HELP_STRING([--disable-gamelink],[Disable headless game link output mode (only for SDL2)]),,enable_gamelink=yes)

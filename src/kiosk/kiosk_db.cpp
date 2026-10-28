@@ -1,3 +1,4 @@
+#include "config.h"
 #include "kiosk_db.h"
 #include "sqlite3.h"
 #include "logging.h"

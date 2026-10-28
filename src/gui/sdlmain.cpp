@@ -7470,6 +7470,11 @@ bool DOSBOX_parse_argv() {
             fprintf(stderr,"                                          Make sure to surround the string in quotes to cover spaces.\n");
             fprintf(stderr,"  -time-limit <n>                         Kill the emulator after 'n' seconds\n");
             fprintf(stderr,"  -fastlaunch                             Fast launch mode (skip the BIOS logo and welcome banner)\n");
+#if defined(C_KIOSK)
+            fprintf(stderr,"  -kiosk-mode                             Launch DOSBox-X directly into Kiosk Mode\n");
+            fprintf(stderr,"  -kiosk-db <path>                        Specify database path for Kiosk catalog\n");
+            fprintf(stderr,"  -kiosk-conf <path>                      Specify base configuration file for Kiosk\n");
+#endif
 #if C_DEBUG
             fprintf(stderr,"  -helpdebug                              Show debug-related options\n");
 #endif
@@ -10770,6 +10775,11 @@ fresh_boot:
 #if defined(C_DOSBOX_AGENT)
         agent_server.Stop();
         dosbox_agent::AGENT_BridgeShutdown();
+#endif
+#if defined(C_KIOSK)
+        if (control->opt_kiosk_mode) {
+            KioskManager::GetInstance().Shutdown();
+        }
 #endif
 
         LOG::Exit();

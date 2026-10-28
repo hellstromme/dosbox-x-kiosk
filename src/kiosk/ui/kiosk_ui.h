@@ -11,9 +11,13 @@ class KioskUI {
 public:
     static KioskUI& GetInstance();
 
-    bool Initialize(SDL_Window* window, void* gl_context);
+    bool Initialize(SDL_Window* window = nullptr, void* gl_context = nullptr);
+    bool InitializeContext();
+    bool InitializeBackend(SDL_Window* window, void* gl_context);
     void Shutdown();
-    bool IsInitialized() const { return m_initialized; }
+
+    bool IsInitialized() const { return m_context_initialized; }
+    bool IsBackendInitialized() const { return m_backend_initialized; }
 
     bool ProcessEvent(const SDL_Event* event);
     void NewFrame();
@@ -27,7 +31,8 @@ private:
     KioskUI(const KioskUI&) = delete;
     KioskUI& operator=(const KioskUI&) = delete;
 
-    bool m_initialized = false;
+    bool m_context_initialized = false;
+    bool m_backend_initialized = false;
     SDL_Window* m_window = nullptr;
 };
 

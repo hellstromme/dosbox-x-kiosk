@@ -404,8 +404,8 @@ typedef         double     Real64;
 #define HAS_CDIRECTLPT 0
 #endif
 
-/* Define to 1 to enable DOSBox-X Kiosk Edition appliance features */
-#ifndef C_KIOSK
+/* Define to 1 to enable DOSBox-X Kiosk Edition appliance features (requires SDL2) */
+#if !defined(C_KIOSK) && defined(C_SDL2)
 #define C_KIOSK 1
 #endif
 
