@@ -32,6 +32,11 @@ powershell -ExecutionPolicy Bypass -File .agents/skills/dosbox-config-tester/scr
 ```
 - Validates Kiosk CLI flags, SQLite catalog connection, Dear ImGui context, and clean shutdown without window hangs or shell quoting errors.
 
+### 2.3 Specialized Custom Subagents
+Two dedicated subagents are configured to isolate heavy context operations:
+- **`build-verifier`** ([spec](.agents/agents/build-verifier.md)): Runs MSBuild and runtime testing in an isolated subagent context, shielding the primary conversation from token-heavy compiler logs.
+- **`code-reviewer`** ([spec](.agents/agents/code-reviewer.md)): Conducts pre-commit adversarial reviews against the architecture constraints below.
+
 ---
 
 ## 3. Architecture & Code Quality Constraints
@@ -55,9 +60,7 @@ powershell -ExecutionPolicy Bypass -File .agents/skills/dosbox-config-tester/scr
 
 ## 4. Phase Verification & Commit Lifecycle
 Before committing changes at each phase milestone:
-1. **Build Verification**: Run `build.ps1` for both `Debug SDL2|x64` and `Debug|x64`.
-2. **Runtime Verification**: Run `test-kiosk.ps1` to verify clean startup and shutdown.
-3. **Pre-Commit Code Review Subagent**:
-   - Spawn a dedicated `research` subagent to perform an adversarial review of `git diff master`.
-   - Remediate all critical, portability, and concurrency findings.
+1. **Build & Runtime Verification**: Invoke `build-verifier` (or run `build.ps1` and `test-kiosk.ps1`).
+2. **Pre-Commit Code Review**: Invoke `code-reviewer` to perform an adversarial review of `git diff master`.
+3. **Remediation**: Remediate all critical, portability, and concurrency findings.
 4. **Commit**: Use Conventional Commits (`feat(kiosk): ...`, `fix(kiosk): ...`).
