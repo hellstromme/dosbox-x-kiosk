@@ -22,4 +22,9 @@ Notes:
 - Verified legacy non-SDL2 MSBuild compatibility (`Debug|x64` builds with 0 errors).
 - Passed adversarial code-reviewer subagent with CERTIFIED CLEAN (PASSED) status.
 - Committed Phase 1 on `feature/kiosk-phase-1` (commit `4ea5f1f13`).
+- Completed Phase 1 retrospective in `docs/Kiosk/Phase1_Retrospective.md` (commit `efae940f8`).
+- Pinned C++14 across MSVC (`<LanguageStandard>stdcpp14</LanguageStandard>`) and added C++14 linter to `.githooks/pre-commit.ps1`.
+- Enhanced `dosbox-config-tester` with `-Tests` to execute Google Tests in 1s without console hangs.
+- Added `add-source.ps1` to `msbuild-runner` skill for automated, XML-safe source registration.
+- Fixed stream isolation and path-matching bug in `.agents/hooks/pre-tool-enforcer.ps1`.
 Next: Begin Phase 2 (ImGui Carousel Frontend & Skeuomorphic Caddy UI).
