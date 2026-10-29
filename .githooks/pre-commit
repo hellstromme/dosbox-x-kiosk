@@ -1,0 +1,4 @@
+#!/bin/sh
+# Git pre-commit hook wrapper for DOSBox-X Kiosk Edition
+powershell -ExecutionPolicy Bypass -File .githooks/pre-commit.ps1
+exit $?
