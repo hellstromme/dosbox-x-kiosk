@@ -10,7 +10,9 @@
 [CmdletBinding()]
 param(
     [string]$ExecutablePath = "",
-    [switch]$KioskMode = $true,
+    [switch]$Tests = $false,
+    [string]$TestFilter = "Kiosk*",
+    [switch]$KioskMode = $false,
     [string]$KioskDb = "",
     [string]$KioskConf = "",
     [int]$TimeLimit = 5,
@@ -20,6 +22,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# If neither -Tests nor -KioskMode was specified, default to -KioskMode for backward compatibility
+if (-not $Tests -and -not $PSBoundParameters.ContainsKey('KioskMode')) {
+    $KioskMode = $true
+}
 
 # 1. Resolve DOSBox-X Executable
 if (-not $ExecutablePath) {
@@ -47,25 +54,40 @@ $resolvedExe = (Resolve-Path $ExecutablePath).Path
 # 2. Build argument list
 $arguments = [System.Collections.Generic.List[string]]::new()
 
-if ($KioskMode) {
-    $arguments.Add("-kiosk-mode")
-}
-if ($KioskDb) {
-    $arguments.Add("-kiosk-db")
-    $arguments.Add($KioskDb)
-}
-if ($KioskConf) {
-    $arguments.Add("-kiosk-conf")
-    $arguments.Add($KioskConf)
-}
-if ($FastLaunch) {
-    $arguments.Add("-fastlaunch")
-}
-if ($ExitImmediately) {
-    $arguments.Add("-exit")
-} elseif ($TimeLimit -gt 0) {
-    $arguments.Add("-time-limit")
-    $arguments.Add($TimeLimit.ToString())
+if ($Tests) {
+    $arguments.Add("-tests")
+    if ($TestFilter) {
+        $arguments.Add("--gtest_filter=$TestFilter")
+    }
+    $arguments.Add("-set")
+    $arguments.Add("waitonerror=false")
+    if ($FastLaunch) {
+        $arguments.Add("-fastlaunch")
+    }
+    if ($ExitImmediately) {
+        $arguments.Add("-exit")
+    }
+} else {
+    if ($KioskMode) {
+        $arguments.Add("-kiosk-mode")
+    }
+    if ($KioskDb) {
+        $arguments.Add("-kiosk-db")
+        $arguments.Add($KioskDb)
+    }
+    if ($KioskConf) {
+        $arguments.Add("-kiosk-conf")
+        $arguments.Add($KioskConf)
+    }
+    if ($FastLaunch) {
+        $arguments.Add("-fastlaunch")
+    }
+    if ($ExitImmediately) {
+        $arguments.Add("-exit")
+    } elseif ($TimeLimit -gt 0) {
+        $arguments.Add("-time-limit")
+        $arguments.Add($TimeLimit.ToString())
+    }
 }
 
 foreach ($arg in $AdditionalArgs) {
@@ -102,6 +124,25 @@ Remove-Item $errFile -Force -ErrorAction SilentlyContinue
 Remove-Item $outFile -Force -ErrorAction SilentlyContinue
 
 # 3. Analyze Results
+if ($Tests) {
+    $testsPassed = ($exitCode -eq 0)
+    Write-Host "-----------------------------------------------------------------"
+    Write-Host "[dosbox-config-tester] Mode:             Unit Tests (Google Test)"
+    Write-Host "[dosbox-config-tester] Filter:           $TestFilter"
+    Write-Host "[dosbox-config-tester] Exit Code:        $exitCode"
+    Write-Host "[dosbox-config-tester] Runtime:          $($sw.Elapsed.TotalSeconds.ToString('F2'))s"
+    Write-Host "-----------------------------------------------------------------"
+    if ($testsPassed) {
+        Write-Host "[dosbox-config-tester] OVERALL STATUS: PASS (All tests passed cleanly)" -ForegroundColor Green
+        Write-Host "================================================================="
+        exit 0
+    } else {
+        Write-Host "[dosbox-config-tester] OVERALL STATUS: FAIL (Unit tests failed with exit code $exitCode)" -ForegroundColor Red
+        Write-Host "================================================================="
+        exit 1
+    }
+}
+
 $kioskFlagDetected = $allLogs -match "KIOSK: DOSBox-X Kiosk Edition flag detected\."
 $dbOpened = $allLogs -match "KIOSK: Opened SQLite database (.*)"
 $dbMatch = if ($dbOpened) { $Matches[1] } else { "None" }

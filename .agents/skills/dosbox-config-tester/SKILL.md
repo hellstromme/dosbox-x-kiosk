@@ -30,17 +30,26 @@ The runner script ([`scripts/test-kiosk.ps1`](./scripts/test-kiosk.ps1)) automat
 powershell -ExecutionPolicy Bypass -File .agents/skills/dosbox-config-tester/scripts/test-kiosk.ps1
 ```
 
-### 2. Custom Catalog Database Test
+### 2. Run Google Unit Tests
+```powershell
+# Run all Kiosk unit tests (defaults to -TestFilter "Kiosk*")
+powershell -ExecutionPolicy Bypass -File .agents/skills/dosbox-config-tester/scripts/test-kiosk.ps1 -Tests
+
+# Run specific test filter
+powershell -ExecutionPolicy Bypass -File .agents/skills/dosbox-config-tester/scripts/test-kiosk.ps1 -Tests -TestFilter "KioskDatabaseFixture*"
+```
+
+### 3. Custom Catalog Database Test
 ```powershell
 powershell -ExecutionPolicy Bypass -File .agents/skills/dosbox-config-tester/scripts/test-kiosk.ps1 -KioskDb "C:\path\to\catalog.db"
 ```
 
-### 3. Timed Runtime Test (e.g. run for 3 seconds instead of exiting immediately)
+### 4. Timed Runtime Test (e.g. run for 3 seconds instead of exiting immediately)
 ```powershell
 powershell -ExecutionPolicy Bypass -File .agents/skills/dosbox-config-tester/scripts/test-kiosk.ps1 -ExitImmediately:$false -TimeLimit 3
 ```
 
-### 4. Test Specific Binary (e.g. Release Build)
+### 5. Test Specific Binary (e.g. Release Build)
 ```powershell
 powershell -ExecutionPolicy Bypass -File .agents/skills/dosbox-config-tester/scripts/test-kiosk.ps1 -ExecutablePath "bin/x64/Release SDL2/dosbox-x.exe"
 ```
@@ -50,7 +59,9 @@ powershell -ExecutionPolicy Bypass -File .agents/skills/dosbox-config-tester/scr
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `-ExecutablePath` | String | Auto-detected | Path to `dosbox-x.exe`. |
-| `-KioskMode` | Switch | `true` | Passes `-kiosk-mode`. |
+| `-Tests` | Switch | `false` | Runs Google Test suite headlessly with `-tests` and `-set waitonerror=false`. |
+| `-TestFilter` | String | `"Kiosk*"` | Test filter expression passed to `--gtest_filter`. |
+| `-KioskMode` | Switch | `true` (when not `-Tests`) | Passes `-kiosk-mode`. |
 | `-KioskDb` | String | `""` | Passes `-kiosk-db <path>`. |
 | `-KioskConf` | String | `""` | Passes `-kiosk-conf <path>`. |
 | `-TimeLimit` | Int | `5` | Time in seconds before emulator exits (when `-ExitImmediately` is false). |

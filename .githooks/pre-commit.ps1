@@ -52,7 +52,28 @@ foreach ($file in $stagedFiles) {
     }
 }
 
-# 3. Rule 2: Architecture check in vs/dosbox-x.vcxproj
+# 3. Rule 2: C++14 compliance check in kiosk and tests code
+# Reject C++17/C++20 headers (<optional>, <string_view>, <variant>, <filesystem>, <any>)
+$forbiddenHeaders = @("optional", "string_view", "variant", "filesystem", "any")
+foreach ($file in $stagedFiles) {
+    if ($file -like "src/kiosk/*" -or $file -like "src/kiosk/**/*" -or $file -like "tests/kiosk*") {
+        if (Test-Path $file) {
+            $lines = Get-Content $file
+            $lineNum = 0
+            foreach ($line in $lines) {
+                $lineNum++
+                if ($line -match '^#\s*include\s*[<"]([^>"]+)[>"]') {
+                    $inc = $Matches[1]
+                    if ($forbiddenHeaders -contains $inc) {
+                        $violations.Add("$file : Line $lineNum includes forbidden C++17 header '<$inc>'. DOSBox-X Kiosk code must strictly adhere to C++14.")
+                    }
+                }
+            }
+        }
+    }
+}
+
+# 4. Rule 3: Architecture check in vs/dosbox-x.vcxproj
 # Kiosk/imgui compilation units must be excluded from non-SDL2 configurations
 if ($stagedFiles -contains "vs/dosbox-x.vcxproj") {
     $vcxprojContent = Get-Content "vs/dosbox-x.vcxproj" -Raw

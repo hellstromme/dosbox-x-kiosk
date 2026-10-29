@@ -24,7 +24,7 @@ try {
 
     # 1. MSBuild Token Protection Interceptor
     # If the agent attempts raw MSBuild execution without token-saving flags, append them.
-    if ($cmd -match "(?i)msbuild(\.exe)?" -and $cmd -notmatch "(?i)build\.ps1") {
+    if ($cmd -match "(?i)(^|[\s;&|])(\S*[\\/])?msbuild(\.exe)?(\s|$)" -and $cmd -notmatch "(?i)build\.ps1" -and $cmd -notmatch "(?i)msbuild-runner") {
         $modifiedCmd = $cmd
         $needsRewrite = $false
 
