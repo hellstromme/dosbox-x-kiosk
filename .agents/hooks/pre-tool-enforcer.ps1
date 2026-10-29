@@ -52,12 +52,17 @@ try {
     # 2. Git Pre-Commit Architectural Gate
     if ($cmd -match "(^|\s|&&|;)git\s+commit") {
         $preCommitScript = Join-Path $PSScriptRoot "../../.githooks/pre-commit.ps1"
+        $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
         if (Test-Path $preCommitScript) {
-            $checkProcess = Start-Process powershell -ArgumentList "-ExecutionPolicy", "Bypass", "-File", "`"$preCommitScript`"" -NoNewWindow -Wait -PassThru
+            $tmpOut = Join-Path $env:TEMP "precommit_out.log"
+            $tmpErr = Join-Path $env:TEMP "precommit_err.log"
+            $checkProcess = Start-Process powershell -ArgumentList "-ExecutionPolicy", "Bypass", "-File", "`"$preCommitScript`"" -WorkingDirectory $repoRoot -NoNewWindow -Wait -PassThru -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
             if ($checkProcess.ExitCode -ne 0) {
+                $errContent = ""
+                if (Test-Path $tmpOut) { $errContent = (Get-Content $tmpOut -Raw).Trim() }
                 $response = @{
                     decision = "deny"
-                    reason = "Commit blocked by DOSBox-X Kiosk architectural pre-commit checks. Please ensure all src/kiosk/*.cpp files include 'config.h' at the top and vcxproj includes non-SDL2 exclusion guards."
+                    reason = "Commit blocked by DOSBox-X Kiosk architectural pre-commit checks. $errContent"
                 }
                 Write-Output ($response | ConvertTo-Json -Compress)
                 exit 0

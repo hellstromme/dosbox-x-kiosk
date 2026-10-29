@@ -8,6 +8,11 @@
 
 $ErrorActionPreference = "Stop"
 
+$repoRoot = (git rev-parse --show-toplevel 2>$null)
+if ($repoRoot -and (Test-Path $repoRoot)) {
+    Set-Location $repoRoot
+}
+
 Write-Host "[pre-commit] Checking staged changes against Kiosk architectural constraints..." -ForegroundColor Cyan
 
 # 1. Get staged files (Added, Copied, Modified)
@@ -56,7 +61,10 @@ if ($stagedFiles -contains "vs/dosbox-x.vcxproj") {
         "..\src\libs\imgui\imgui.cpp",
         "..\src\libs\imgui\backends\imgui_impl_sdl2.cpp",
         "..\src\kiosk\kiosk_main.cpp",
-        "..\src\kiosk\ui\kiosk_ui.cpp"
+        "..\src\kiosk\kiosk_db.cpp",
+        "..\src\kiosk\ui\kiosk_ui.cpp",
+        "..\src\kiosk\machine\archetypes.cpp",
+        "..\src\kiosk\machine\config_synthesizer.cpp"
     )
     foreach ($entry in $kioskEntries) {
         if ($vcxprojContent.Contains($entry)) {
@@ -64,8 +72,8 @@ if ($stagedFiles -contains "vs/dosbox-x.vcxproj") {
             $pattern = [regex]::Escape($entry) + "[\s\S]*?</ClCompile>"
             $match = [regex]::Match($vcxprojContent, $pattern)
             if ($match.Success) {
-                if (-not $match.Value.Contains("ExcludedFromBuild Condition=""!$(Configuration.Contains('SDL2'))""")) {
-                    $violations.Add("vs/dosbox-x.vcxproj : '$entry' is missing non-SDL2 exclusion guard (<ExcludedFromBuild Condition=""!$(Configuration.Contains('SDL2'))"">true</ExcludedFromBuild>).")
+                if (-not $match.Value.Contains('ExcludedFromBuild Condition="!$(Configuration.Contains(''SDL2''))"')) {
+                    $violations.Add("vs/dosbox-x.vcxproj : '$entry' is missing non-SDL2 exclusion guard (<ExcludedFromBuild Condition=""!`$(Configuration.Contains('SDL2'))"">true</ExcludedFromBuild>).")
                 }
             }
         }

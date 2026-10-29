@@ -145,6 +145,9 @@
     <Filter Include="Sources\kiosk">
       <UniqueIdentifier>{a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Sources\kiosk\machine">
+      <UniqueIdentifier>{c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Sources\kiosk\ui">
       <UniqueIdentifier>{b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e}</UniqueIdentifier>
     </Filter>
@@ -1788,7 +1791,6 @@
     <ClCompile Include="..\src\agent\trace\trace_store.cpp">
       <Filter>Sources\agent</Filter>
     </ClCompile>
-  </ItemGroup>
     <ClCompile Include="..\src\libs\sqlite3\sqlite3.c">
       <Filter>Sources\libs\sqlite3</Filter>
     </ClCompile>
@@ -1816,9 +1818,16 @@
     <ClCompile Include="..\src\kiosk\kiosk_db.cpp">
       <Filter>Sources\kiosk</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\kiosk\machine\archetypes.cpp">
+      <Filter>Sources\kiosk\machine</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\kiosk\machine\config_synthesizer.cpp">
+      <Filter>Sources\kiosk\machine</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\kiosk\ui\kiosk_ui.cpp">
       <Filter>Sources\kiosk\ui</Filter>
     </ClCompile>
+  </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\src\aviwriter\avi.h">
       <Filter>Sources\aviwriter</Filter>
@@ -2840,7 +2849,6 @@
     <ClInclude Include="..\include\agent\trace_store.h">
       <Filter>Sources\agent</Filter>
     </ClInclude>
-  </ItemGroup>
     <ClInclude Include="..\src\libs\sqlite3\sqlite3.h">
       <Filter>Sources\libs\sqlite3</Filter>
     </ClInclude>
@@ -2871,9 +2879,16 @@
     <ClInclude Include="..\src\kiosk\kiosk_db.h">
       <Filter>Sources\kiosk</Filter>
     </ClInclude>
+    <ClInclude Include="..\src\kiosk\machine\archetypes.h">
+      <Filter>Sources\kiosk\machine</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\kiosk\machine\config_synthesizer.h">
+      <Filter>Sources\kiosk\machine</Filter>
+    </ClInclude>
     <ClInclude Include="..\src\kiosk\ui\kiosk_ui.h">
       <Filter>Sources\kiosk\ui</Filter>
     </ClInclude>
+  </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\src\winres.rc">
       <Filter>Sources</Filter>
