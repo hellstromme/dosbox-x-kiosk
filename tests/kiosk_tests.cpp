@@ -309,7 +309,7 @@ TEST(KioskSynthesizerTest, SynthesizeRealHddBootConfig) {
     m.archetype_tier = 4;
     m.boot_mode = "REAL_HDD_BOOT";
     m.primary_hdd_path = "C:\\kiosk\\hdd_c.img";
-    m.primary_hdd_chs = "512,63,16,520";
+    m.primary_hdd_chs = "520,16,63";
 
     CaddyBindingRecord b1;
     b1.target_drive = "A";
@@ -334,7 +334,7 @@ TEST(KioskSynthesizerTest, SynthesizeRealHddBootConfig) {
     EXPECT_NE(std::string::npos, conf.find("cputype             = 486"));
     EXPECT_NE(std::string::npos, conf.find("[autoexec]"));
     EXPECT_NE(std::string::npos, conf.find("IMGMOUNT 2 \"C:\\kiosk\\hdd_c.img\" -t hdd -fs none -size 512,63,16,520 -ide 1m"));
-    EXPECT_NE(std::string::npos, conf.find("IMGMOUNT 0 \"C:\\kiosk\\floppy1.img\" -t fd -fs none"));
+    EXPECT_NE(std::string::npos, conf.find("IMGMOUNT 0 \"C:\\kiosk\\floppy1.img\" -t floppy -fs none"));
     EXPECT_NE(std::string::npos, conf.find("IMGMOUNT D \"C:\\kiosk\\cdrom.iso\" -t iso -fs iso -ide 2m"));
     EXPECT_NE(std::string::npos, conf.find("BOOT -l c"));
 }
@@ -395,7 +395,7 @@ TEST(KioskSynthesizerTest, SynthesizeIntegratedDosWithCaddyAndSpacedExe) {
 
     std::string conf = ConfigSynthesizer::GetInstance().SynthesizeConfig(m, &item, caddy);
 
-    EXPECT_NE(std::string::npos, conf.find("IMGMOUNT 0 \"C:\\games\\disk1.img\" -t fd -fs none"));
+    EXPECT_NE(std::string::npos, conf.find("IMGMOUNT A \"C:\\games\\disk1.img\" -t floppy"));
     EXPECT_NE(std::string::npos, conf.find("IMGMOUNT D \"C:\\games\\music.iso\" -t iso"));
     EXPECT_NE(std::string::npos, conf.find("\"MY GAME.EXE\" -v"));
     EXPECT_NE(std::string::npos, conf.find("EXIT"));

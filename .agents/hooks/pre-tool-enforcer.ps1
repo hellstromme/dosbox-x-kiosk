@@ -24,7 +24,7 @@ try {
 
     # 1. MSBuild Token Protection Interceptor
     # If the agent attempts raw MSBuild execution without token-saving flags, append them.
-    if ($cmd -match "(?i)(^|[\s;&|])(\S*[\\/])?msbuild(\.exe)?(\s|$)" -and $cmd -notmatch "(?i)build\.ps1" -and $cmd -notmatch "(?i)msbuild-runner") {
+    if ($cmd -match "(?i)(^|[\s;&|""'])(?:[^\s""']*[\\/])?msbuild(?:\.exe)?(?:[""']|\s|$)" -and $cmd -notmatch "(?i)build\.ps1" -and $cmd -notmatch "(?i)msbuild-runner") {
         $modifiedCmd = $cmd
         $needsRewrite = $false
 
@@ -58,8 +58,9 @@ try {
             $tmpErr = Join-Path $env:TEMP "precommit_err.log"
             $checkProcess = Start-Process powershell -ArgumentList "-ExecutionPolicy", "Bypass", "-File", "`"$preCommitScript`"" -WorkingDirectory $repoRoot -NoNewWindow -Wait -PassThru -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
             if ($checkProcess.ExitCode -ne 0) {
-                $errContent = ""
-                if (Test-Path $tmpOut) { $errContent = (Get-Content $tmpOut -Raw).Trim() }
+                $outText = if (Test-Path $tmpOut) { (Get-Content $tmpOut -Raw).Trim() } else { "" }
+                $errText = if (Test-Path $tmpErr) { (Get-Content $tmpErr -Raw).Trim() } else { "" }
+                $errContent = @($outText, $errText) | Where-Object { $_ } | ForEach-Object { $_.Trim() } -join "`n"
                 $response = @{
                     decision = "deny"
                     reason = "Commit blocked by DOSBox-X Kiosk architectural pre-commit checks. $errContent"

@@ -33,8 +33,9 @@ $violations = [System.Collections.Generic.List[string]]::new()
 # Every .cpp in src/kiosk/ must have #include "config.h" before any other include
 foreach ($file in $stagedFiles) {
     if ($file -like "src/kiosk/*.cpp" -or $file -like "src/kiosk/**/*.cpp") {
-        if (Test-Path $file) {
-            $lines = Get-Content $file
+        $rawIndexContent = git show ":$file" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $null -ne $rawIndexContent) {
+            $lines = $rawIndexContent -split "`r?`n"
             $firstInclude = $null
             foreach ($line in $lines) {
                 $trimmed = $line.Trim()
@@ -57,12 +58,13 @@ foreach ($file in $stagedFiles) {
 $forbiddenHeaders = @("optional", "string_view", "variant", "filesystem", "any")
 foreach ($file in $stagedFiles) {
     if ($file -like "src/kiosk/*" -or $file -like "src/kiosk/**/*" -or $file -like "tests/kiosk*") {
-        if (Test-Path $file) {
-            $lines = Get-Content $file
+        $rawIndexContent = git show ":$file" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $null -ne $rawIndexContent) {
+            $lines = $rawIndexContent -split "`r?`n"
             $lineNum = 0
             foreach ($line in $lines) {
                 $lineNum++
-                if ($line -match '^#\s*include\s*[<"]([^>"]+)[>"]') {
+                if ($line -match '^\s*#\s*include\s*[<"]([^>"]+)[>"]') {
                     $inc = $Matches[1]
                     if ($forbiddenHeaders -contains $inc) {
                         $violations.Add("$file : Line $lineNum includes forbidden C++17 header '<$inc>'. DOSBox-X Kiosk code must strictly adhere to C++14.")
@@ -76,7 +78,10 @@ foreach ($file in $stagedFiles) {
 # 4. Rule 3: Architecture check in vs/dosbox-x.vcxproj
 # Kiosk/imgui compilation units must be excluded from non-SDL2 configurations
 if ($stagedFiles -contains "vs/dosbox-x.vcxproj") {
-    $vcxprojContent = Get-Content "vs/dosbox-x.vcxproj" -Raw
+    $vcxprojContent = git show ":vs/dosbox-x.vcxproj" 2>$null
+    if (-not $vcxprojContent) {
+        $vcxprojContent = Get-Content "vs/dosbox-x.vcxproj" -Raw
+    }
     $kioskEntries = @(
         "..\src\libs\sqlite3\sqlite3.c",
         "..\src\libs\imgui\imgui.cpp",
@@ -93,7 +98,7 @@ if ($stagedFiles -contains "vs/dosbox-x.vcxproj") {
             $pattern = [regex]::Escape($entry) + "[\s\S]*?</ClCompile>"
             $match = [regex]::Match($vcxprojContent, $pattern)
             if ($match.Success) {
-                if (-not $match.Value.Contains('ExcludedFromBuild Condition="!$(Configuration.Contains(''SDL2''))"')) {
+                if ($match.Value -notmatch '<ExcludedFromBuild\s+Condition="!\$\(Configuration\.Contains\(''SDL2''\)\)"\s*>\s*true\s*</ExcludedFromBuild>') {
                     $violations.Add("vs/dosbox-x.vcxproj : '$entry' is missing non-SDL2 exclusion guard (<ExcludedFromBuild Condition=""!`$(Configuration.Contains('SDL2'))"">true</ExcludedFromBuild>).")
                 }
             }

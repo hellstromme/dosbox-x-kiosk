@@ -68,7 +68,21 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
             ss << "# Mount primary boot hard drive on Primary IDE Master\n"
                << "IMGMOUNT 2 \"" << machine.primary_hdd_path << "\" -t hdd -fs none";
             if (!machine.primary_hdd_chs.empty()) {
-                ss << " -size " << machine.primary_hdd_chs;
+                // Parse primary_hdd_chs (C,H,S format) and convert to -size 512,S,H,C
+                std::vector<std::string> tokens;
+                std::stringstream chs_ss(machine.primary_hdd_chs);
+                std::string token;
+                while (std::getline(chs_ss, token, ',')) {
+                    token.erase(0, token.find_first_not_of(" \t\r\n"));
+                    token.erase(token.find_last_not_of(" \t\r\n") + 1);
+                    if (!token.empty()) tokens.push_back(token);
+                }
+                if (tokens.size() == 3) {
+                    // tokens: C, H, S -> IMGMOUNT -size 512,S,H,C
+                    ss << " -size 512," << tokens[2] << "," << tokens[1] << "," << tokens[0];
+                } else if (!tokens.empty()) {
+                    ss << " -size " << machine.primary_hdd_chs;
+                }
             }
             ss << " -ide 1m\n";
         }
@@ -80,7 +94,7 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
             for (const auto& b : drive_bindings["A"]) {
                 ss << " \"" << b.resolved_file_path << "\"";
             }
-            ss << " -t fd -fs none\n";
+            ss << " -t floppy -fs none\n";
         }
 
         if (drive_bindings.find("B") != drive_bindings.end() && !drive_bindings["B"].empty()) {
@@ -89,7 +103,7 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
             for (const auto& b : drive_bindings["B"]) {
                 ss << " \"" << b.resolved_file_path << "\"";
             }
-            ss << " -t fd -fs none\n";
+            ss << " -t floppy -fs none\n";
         }
 
         // 3. Mount optical caddy (Drive D on Secondary IDE Master, Drive E on Secondary IDE Slave)
@@ -125,23 +139,23 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
                << "MOUNT C \"" << machine.primary_hdd_path << "\"\n";
         }
 
-        // 2. Mount floppies if queued (Drive A = 0, Drive B = 1)
+        // 2. Mount floppies if queued (Drive A and Drive B with DOS filesystem)
         if (drive_bindings.find("A") != drive_bindings.end() && !drive_bindings["A"].empty()) {
             ss << "# Floppy Drive A: Session Caddy\n"
-               << "IMGMOUNT 0";
+               << "IMGMOUNT A";
             for (const auto& b : drive_bindings["A"]) {
                 ss << " \"" << b.resolved_file_path << "\"";
             }
-            ss << " -t fd -fs none\n";
+            ss << " -t floppy\n";
         }
 
         if (drive_bindings.find("B") != drive_bindings.end() && !drive_bindings["B"].empty()) {
             ss << "# Floppy Drive B: Session Caddy\n"
-               << "IMGMOUNT 1";
+               << "IMGMOUNT B";
             for (const auto& b : drive_bindings["B"]) {
                 ss << " \"" << b.resolved_file_path << "\"";
             }
-            ss << " -t fd -fs none\n";
+            ss << " -t floppy\n";
         }
 
         // 3. Mount CD-ROMs if queued (Drive D and Drive E)
@@ -235,8 +249,12 @@ bool ConfigSynthesizer::WriteConfigFile(const std::string& config_content, const
         return false;
     }
     out << config_content;
+    if (!out.good()) {
+        out.close();
+        return false;
+    }
     out.close();
-    return true;
+    return !out.fail();
 }
 
 #endif // defined(C_KIOSK)
