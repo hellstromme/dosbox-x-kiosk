@@ -1,4 +1,7 @@
 #include "config.h"
+
+#if defined(C_KIOSK)
+
 #include "kiosk_main.h"
 #include "kiosk_db.h"
 #include "ui/kiosk_ui.h"
@@ -63,3 +66,5 @@ void KioskManager::Shutdown() {
         m_state = KioskState::DISABLED;
     }
 }
+
+#endif // defined(C_KIOSK)

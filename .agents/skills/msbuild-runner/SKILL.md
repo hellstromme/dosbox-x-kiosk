@@ -44,6 +44,12 @@ powershell -ExecutionPolicy Bypass -File .agents/skills/msbuild-runner/scripts/b
 powershell -ExecutionPolicy Bypass -File .agents/skills/msbuild-runner/scripts/build.ps1 -Configuration "Release SDL2" -Platform "x64"
 ```
 
+### 5. Adding New Source or Header Files
+Use `scripts/add-source.ps1` to automatically register new C++ files in `vs/dosbox-x.vcxproj` and `vs/dosbox-x.vcxproj.filters` with proper non-SDL2 exclusion guards and XML ItemGroup structure:
+```powershell
+powershell -ExecutionPolicy Bypass -File .agents/skills/msbuild-runner/scripts/add-source.ps1 -FilePath "src/kiosk/ui/my_new_widget.cpp"
+```
+
 ## Parameter Reference
 
 | Parameter | Type | Default | Description |

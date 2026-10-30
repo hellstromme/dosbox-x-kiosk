@@ -383,6 +383,11 @@
   <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Release SDL2|ARM64'">
     <VcpkgEnabled>false</VcpkgEnabled>
   </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp14</LanguageStandard>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <AdditionalIncludeDirectories>$(SolutionDir)pcap;$(SolutionDir);$(SolutionDir)..;$(SolutionDir)..\include;$(SolutionDir)..\src;$(SolutionDir)..\src\aviwriter;$(SolutionDir)..\src\libs\mt32;$(SolutionDir)..\src\hardware\snd_pc98\cbus;$(SolutionDir)..\src\hardware\snd_pc98\common;$(SolutionDir)..\src\hardware\snd_pc98\generic;$(SolutionDir)..\src\hardware\snd_pc98\sound;$(SolutionDir)..\src\hardware\snd_pc98\x11;$(SolutionDir)..\src\hardware\snd_pc98\sound\getsnd;$(SolutionDir)libpdcurses;$(SolutionDir)zlib;$(SolutionDir)libpng;$(SolutionDir)freetype\include;$(SolutionDir)sdl\include;$(SolutionDir)sdlnet;$(SolutionDir)..\src\monitor;$(SolutionDir)..\src\libs\sqlite3;$(SolutionDir)..\src\libs\imgui;$(SolutionDir)..\src\libs\imgui\backends;$(SolutionDir)..\src\libs\stb;$(SolutionDir)..\src\kiosk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -1738,6 +1743,12 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\kiosk\ui\kiosk_ui.cpp">
       <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="..\src\kiosk\machine\archetypes.cpp">
+      <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="..\src\kiosk\machine\config_synthesizer.cpp">
+      <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\src\winres.rc" />
@@ -1754,6 +1765,8 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\src\kiosk\kiosk_main.h" />
     <ClInclude Include="..\src\kiosk\kiosk_db.h" />
     <ClInclude Include="..\src\kiosk\ui\kiosk_ui.h" />
+    <ClInclude Include="..\src\kiosk\machine\archetypes.h" />
+    <ClInclude Include="..\src\kiosk\machine\config_synthesizer.h" />
     <ClInclude Include="..\include\8255.h" />
     <ClInclude Include="..\include\bios.h" />
     <ClInclude Include="..\include\bios_disk.h" />

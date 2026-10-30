@@ -1,4 +1,7 @@
 #include "config.h"
+
+#if defined(C_KIOSK)
+
 #include "kiosk_ui.h"
 #include "logging.h"
 #include "imgui.h"
@@ -106,3 +109,5 @@ void KioskUI::RenderFrame() {
 std::string KioskUI::GetImGuiVersion() const {
     return IMGUI_VERSION;
 }
+
+#endif // defined(C_KIOSK)

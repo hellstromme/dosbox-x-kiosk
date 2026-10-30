@@ -10,7 +10,9 @@
 [CmdletBinding()]
 param(
     [string]$ExecutablePath = "",
-    [switch]$KioskMode = $true,
+    [switch]$Tests = $false,
+    [string]$TestFilter = "Kiosk*",
+    [switch]$KioskMode = $false,
     [string]$KioskDb = "",
     [string]$KioskConf = "",
     [int]$TimeLimit = 5,
@@ -20,6 +22,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# If neither -Tests nor -KioskMode was specified, default to -KioskMode for backward compatibility
+if (-not $Tests -and -not $PSBoundParameters.ContainsKey('KioskMode')) {
+    $KioskMode = $true
+}
 
 # 1. Resolve DOSBox-X Executable
 if (-not $ExecutablePath) {
@@ -46,26 +53,44 @@ $resolvedExe = (Resolve-Path $ExecutablePath).Path
 
 # 2. Build argument list
 $arguments = [System.Collections.Generic.List[string]]::new()
+$tempDir = [System.IO.Path]::GetTempPath()
+$gtestXml = if ($Tests) { Join-Path $tempDir "gtest_result_$([System.Guid]::NewGuid().ToString('N')).xml" } else { "" }
 
-if ($KioskMode) {
-    $arguments.Add("-kiosk-mode")
-}
-if ($KioskDb) {
-    $arguments.Add("-kiosk-db")
-    $arguments.Add($KioskDb)
-}
-if ($KioskConf) {
-    $arguments.Add("-kiosk-conf")
-    $arguments.Add($KioskConf)
-}
-if ($FastLaunch) {
-    $arguments.Add("-fastlaunch")
-}
-if ($ExitImmediately) {
-    $arguments.Add("-exit")
-} elseif ($TimeLimit -gt 0) {
-    $arguments.Add("-time-limit")
-    $arguments.Add($TimeLimit.ToString())
+if ($Tests) {
+    $arguments.Add("-tests")
+    if ($TestFilter) {
+        $arguments.Add("--gtest_filter=$TestFilter")
+    }
+    $arguments.Add("--gtest_output=xml:$gtestXml")
+    $arguments.Add("-set")
+    $arguments.Add("waitonerror=false")
+    if ($FastLaunch) {
+        $arguments.Add("-fastlaunch")
+    }
+    if ($ExitImmediately) {
+        $arguments.Add("-exit")
+    }
+} else {
+    if ($KioskMode) {
+        $arguments.Add("-kiosk-mode")
+    }
+    if ($KioskDb) {
+        $arguments.Add("-kiosk-db")
+        $arguments.Add($KioskDb)
+    }
+    if ($KioskConf) {
+        $arguments.Add("-kiosk-conf")
+        $arguments.Add($KioskConf)
+    }
+    if ($FastLaunch) {
+        $arguments.Add("-fastlaunch")
+    }
+    if ($ExitImmediately) {
+        $arguments.Add("-exit")
+    } elseif ($TimeLimit -gt 0) {
+        $arguments.Add("-time-limit")
+        $arguments.Add($TimeLimit.ToString())
+    }
 }
 
 foreach ($arg in $AdditionalArgs) {
@@ -102,6 +127,47 @@ Remove-Item $errFile -Force -ErrorAction SilentlyContinue
 Remove-Item $outFile -Force -ErrorAction SilentlyContinue
 
 # 3. Analyze Results
+if ($Tests) {
+    $totalTests = 0
+    $totalFailures = 0
+    $totalErrors = 0
+    if ($gtestXml -and (Test-Path $gtestXml)) {
+        try {
+            $xml = [xml](Get-Content $gtestXml -Raw)
+            $totalTests = [int]$xml.testsuites.tests
+            $totalFailures = [int]$xml.testsuites.failures
+            $totalErrors = [int]$xml.testsuites.errors
+        } catch {
+            Write-Warning "[dosbox-config-tester] Could not parse Google Test XML: $_"
+        }
+        Remove-Item $gtestXml -Force -ErrorAction SilentlyContinue
+    }
+
+    $testsPassed = ($exitCode -eq 0) -and ($totalTests -gt 0) -and ($totalFailures -eq 0) -and ($totalErrors -eq 0)
+    Write-Host "-----------------------------------------------------------------"
+    Write-Host "[dosbox-config-tester] Mode:             Unit Tests (Google Test)"
+    Write-Host "[dosbox-config-tester] Filter:           $TestFilter"
+    Write-Host "[dosbox-config-tester] Tests Executed:   $totalTests"
+    Write-Host "[dosbox-config-tester] Failures:         $totalFailures"
+    Write-Host "[dosbox-config-tester] Errors:           $totalErrors"
+    Write-Host "[dosbox-config-tester] Exit Code:        $exitCode"
+    Write-Host "[dosbox-config-tester] Runtime:          $($sw.Elapsed.TotalSeconds.ToString('F2'))s"
+    Write-Host "-----------------------------------------------------------------"
+    if ($totalTests -eq 0) {
+        Write-Host "[dosbox-config-tester] OVERALL STATUS: FAIL (0 tests executed matching filter: '$TestFilter')" -ForegroundColor Red
+        Write-Host "================================================================="
+        exit 1
+    } elseif ($testsPassed) {
+        Write-Host "[dosbox-config-tester] OVERALL STATUS: PASS (All $totalTests tests passed cleanly)" -ForegroundColor Green
+        Write-Host "================================================================="
+        exit 0
+    } else {
+        Write-Host "[dosbox-config-tester] OVERALL STATUS: FAIL ($totalFailures failure(s), $totalErrors error(s), exit code $exitCode)" -ForegroundColor Red
+        Write-Host "================================================================="
+        exit 1
+    }
+}
+
 $kioskFlagDetected = $allLogs -match "KIOSK: DOSBox-X Kiosk Edition flag detected\."
 $dbOpened = $allLogs -match "KIOSK: Opened SQLite database (.*)"
 $dbMatch = if ($dbOpened) { $Matches[1] } else { "None" }
