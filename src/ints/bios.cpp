@@ -10363,13 +10363,14 @@ private:
         if (BOCHS_PORT_E9) {
             delete BOCHS_PORT_E9;
             BOCHS_PORT_E9=NULL;
-#if defined(C_KIOSK)
         }
+#if defined(C_KIOSK)
         if (BOCHS_PORT_8900) {
             delete BOCHS_PORT_8900;
             BOCHS_PORT_8900=NULL;
-#endif
         }
+#endif
+
         if (ISAPNP_PNP_ADDRESS_PORT) {
             delete ISAPNP_PNP_ADDRESS_PORT;
             ISAPNP_PNP_ADDRESS_PORT=NULL;
@@ -12897,13 +12898,14 @@ public:
         if (BOCHS_PORT_E9) {
             delete BOCHS_PORT_E9;
             BOCHS_PORT_E9=NULL;
-#if defined(C_KIOSK)
         }
+#if defined(C_KIOSK)
         if (BOCHS_PORT_8900) {
             delete BOCHS_PORT_8900;
             BOCHS_PORT_8900=NULL;
-#endif
         }
+#endif
+
         if (ISAPNP_PNP_ADDRESS_PORT) {
             delete ISAPNP_PNP_ADDRESS_PORT;
             ISAPNP_PNP_ADDRESS_PORT=NULL;

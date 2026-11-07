@@ -4115,7 +4115,7 @@ static void GUI_StartUp() {
 	}
 
 #if defined(C_KIOSK) && defined(C_OPENGL)
-    if (KioskManager::GetInstance().IsKioskModeActive() && !control->opt_nogui && (output == "default" || output == "surface")) {
+    if (KioskManager::GetInstance().IsKioskModeActive() && !control->opt_nogui && output.compare(0, 6, "opengl") != 0) {
         output = "openglnb";
     }
 #endif
@@ -7600,6 +7600,7 @@ bool DOSBOX_parse_argv() {
             fprintf(stderr,"  -kiosk-mode                             Launch DOSBox-X directly into Kiosk Mode\n");
             fprintf(stderr,"  -kiosk-db <path>                        Specify database path for Kiosk catalog\n");
             fprintf(stderr,"  -kiosk-conf <path>                      Specify base configuration file for Kiosk\n");
+            fprintf(stderr,"  -kiosk-skip-countdown                   Skip boot countdown and enter Kiosk Shell directly\n");
 #endif
 #if C_DEBUG
             fprintf(stderr,"  -helpdebug                              Show debug-related options\n");

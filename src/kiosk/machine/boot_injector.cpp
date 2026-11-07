@@ -391,8 +391,10 @@ bool BootInjector::EnsureOneTimeAutoexecHook(const std::string& hdd_or_autoexec_
         inspect_dir_sector_buffer(root_buf.data(), root_bytes, root_offset);
     } else {
         uint32_t cur = root_clus;
+        uint32_t last_root_clus = 0;
         size_t safety = 0;
         while (cur >= 2 && !is_eof_cluster(cur) && safety++ < 4096) {
+            last_root_clus = cur;
             uint64_t c_off = cluster_to_offset(cur);
             if (c_off + clus_bytes > file_size) break;
             std::vector<uint8_t> c_buf(clus_bytes, 0);
@@ -401,6 +403,20 @@ bool BootInjector::EnsureOneTimeAutoexecHook(const std::string& hdd_or_autoexec_
             inspect_dir_sector_buffer(c_buf.data(), clus_bytes, c_off);
             if (has_autoexec_entry) break;
             cur = get_fat_entry(cur);
+        }
+        if (!has_autoexec_entry && free_dir_entry_offset == 0 && last_root_clus >= 2) {
+            uint32_t new_root_clus = alloc_free_cluster();
+            if (new_root_clus != 0) {
+                uint64_t new_c_off = cluster_to_offset(new_root_clus);
+                if (new_c_off + clus_bytes <= file_size) {
+                    set_fat_entry(last_root_clus, new_root_clus);
+                    set_fat_entry(new_root_clus, eof_marker());
+                    std::vector<uint8_t> zero_clus(clus_bytes, 0);
+                    f.seekp(static_cast<std::streamoff>(new_c_off), std::ios::beg);
+                    f.write(reinterpret_cast<const char*>(zero_clus.data()), static_cast<std::streamsize>(clus_bytes));
+                    free_dir_entry_offset = new_c_off;
+                }
+            }
         }
     }
 

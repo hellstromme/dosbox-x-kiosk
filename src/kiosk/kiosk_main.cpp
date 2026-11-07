@@ -38,6 +38,11 @@ KioskManager::KioskManager()
       m_exit_requested(false),
       m_last_shutdown_reason(KioskShutdownReason::NONE),
       m_completed_sessions(0) {
+    // Ensure dependent singletons are constructed before KioskManager so their
+    // static lifetimes outlive KioskManager::~KioskManager() at process exit.
+    (void)KioskDatabase::GetInstance();
+    (void)KioskUI::GetInstance();
+    (void)BootInjector::GetInstance();
 }
 
 KioskManager& KioskManager::GetInstance() {
@@ -484,6 +489,15 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
     }
     if (caddy.empty() && !ctx.machine_id.empty()) {
         caddy = db.GetCaddyBindingsForMachine(ctx.machine_id);
+    }
+    if (!ctx.custom_disk_path.empty()) {
+        CaddyBindingRecord custom_floppy;
+        custom_floppy.machine_id = machine.id;
+        custom_floppy.target_drive = "A";
+        custom_floppy.slot_order = 0;
+        custom_floppy.resolved_file_path = ctx.custom_disk_path;
+        custom_floppy.resolved_media_type = "FLOPPY_35_1440K";
+        caddy.insert(caddy.begin(), custom_floppy);
     }
 
     // Phase 3: Ephemeral Boot Injector for REAL_HDD_BOOT machines
