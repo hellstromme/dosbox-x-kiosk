@@ -124,11 +124,11 @@ struct MediaPoolRecord {
     std::string file_path;
     std::string file_sha1;
     std::string media_type;      // matches MediaType enum name
-    std::string physical_style;  // matches MediaPhysicalStyle enum name
+    std::string physical_style = "BEIGE_35";  // matches MediaPhysicalStyle enum name
     std::string volume_label;
     std::string label_title;
     std::string label_subtitle;
-    std::string label_font_style; // matches LabelFontStyle enum name
+    std::string label_font_style = "DOT_MATRIX"; // matches LabelFontStyle enum name
     bool has_redbook_audio = false;
     bool is_write_protected = false;
     bool is_removable_usb = false;
@@ -142,7 +142,7 @@ struct OSDistributionRecord {
     int min_archetype_tier = 1;
     int recommended_hdd_mb = 250;
     std::string filesystem_type;  // "FAT12", "FAT16", "FAT32"
-    std::string install_strategy; // "FLOPPY_SEQUENCE", "BOOTABLE_CD", "WIN9X_CAB_PRECOPY", "PREBUILT_IMAGE"
+    std::string install_strategy = "FLOPPY_SEQUENCE"; // "FLOPPY_SEQUENCE", "BOOTABLE_CD", "WIN9X_CAB_PRECOPY", "PREBUILT_IMAGE"
     std::string boot_floppy_media_id;
     std::string install_cd_media_id;
     std::string unattended_answer_file;
@@ -247,5 +247,31 @@ struct ArchetypeProfile {
     bool umb = false;
     bool dual_ide = false;
 };
+
+enum class KioskShutdownReason {
+    NONE = 0,
+    APM_POWER_OFF,        // INT 15h AX=5307h BX=0001h CX=0003h
+    PORT_8900_SHUTDOWN,   // Bochs / KIOSKEXT.COM "Shutdown" sequence on I/O port 0x8900
+    PNP_POWER_OFF,        // ISA PnP OS power-off (INT 15h AH=41h)
+    SHELL_EXIT,           // Integrated DOS shell EXIT completion
+    USER_OVERLAY_ABORT    // User selected "Quit to Kiosk Hub" in F12+D overlay
+};
+
+struct KioskGuestShutdownException {
+    KioskShutdownReason reason;
+    explicit KioskGuestShutdownException(KioskShutdownReason r = KioskShutdownReason::APM_POWER_OFF)
+        : reason(r) {}
+};
+
+inline const char* KioskShutdownReasonToString(KioskShutdownReason reason) {
+    switch (reason) {
+        case KioskShutdownReason::APM_POWER_OFF:      return "APM_POWER_OFF";
+        case KioskShutdownReason::PORT_8900_SHUTDOWN: return "PORT_8900_SHUTDOWN";
+        case KioskShutdownReason::PNP_POWER_OFF:      return "PNP_POWER_OFF";
+        case KioskShutdownReason::SHELL_EXIT:         return "SHELL_EXIT";
+        case KioskShutdownReason::USER_OVERLAY_ABORT: return "USER_OVERLAY_ABORT";
+        default:                                      return "NONE";
+    }
+}
 
 #endif // DOSBOX_KIOSK_TYPES_H

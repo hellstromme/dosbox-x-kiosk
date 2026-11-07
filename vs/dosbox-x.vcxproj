@@ -1749,6 +1749,9 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\kiosk\machine\config_synthesizer.cpp">
       <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="..\src\kiosk\machine\boot_injector.cpp">
+      <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\src\winres.rc" />
@@ -1767,6 +1770,8 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\src\kiosk\ui\kiosk_ui.h" />
     <ClInclude Include="..\src\kiosk\machine\archetypes.h" />
     <ClInclude Include="..\src\kiosk\machine\config_synthesizer.h" />
+    <ClInclude Include="..\src\kiosk\machine\boot_injector.h" />
+    <ClInclude Include="..\src\kiosk\machine\kioskext_bin.h" />
     <ClInclude Include="..\include\8255.h" />
     <ClInclude Include="..\include\bios.h" />
     <ClInclude Include="..\include\bios_disk.h" />

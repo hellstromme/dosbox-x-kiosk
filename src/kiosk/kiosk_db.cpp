@@ -3,6 +3,7 @@
 #if defined(C_KIOSK)
 
 #include "kiosk_db.h"
+#include "ui/kiosk_ui.h"
 #include "sqlite3.h"
 #include "logging.h"
 #include <cstdio>
@@ -138,12 +139,12 @@ bool KioskDatabase::InitializeSchema() {
         "    id TEXT PRIMARY KEY,\n"
         "    file_path TEXT NOT NULL UNIQUE,\n"
         "    file_sha1 TEXT,\n"
-        "    media_type TEXT NOT NULL,\n"
-        "    physical_style TEXT NOT NULL DEFAULT 'BEIGE_35',\n"
+        "    media_type TEXT NOT NULL CHECK (media_type IN ('FLOPPY_525_360K', 'FLOPPY_525_1200K', 'FLOPPY_35_720K', 'FLOPPY_35_1440K', 'FLOPPY_35_2880K', 'CDROM_ISO', 'CDROM_CUE', 'HDD_IMG')),\n"
+        "    physical_style TEXT NOT NULL DEFAULT 'BEIGE_35' CHECK (physical_style IN ('CHARCOAL_525', 'BEIGE_35', 'BLUE_35', 'BLACK_35', 'JEWEL_CD', 'GOLD_CD')),\n"
         "    volume_label TEXT,\n"
         "    label_title TEXT NOT NULL,\n"
         "    label_subtitle TEXT,\n"
-        "    label_font_style TEXT NOT NULL DEFAULT 'DOT_MATRIX',\n"
+        "    label_font_style TEXT NOT NULL DEFAULT 'DOT_MATRIX' CHECK (label_font_style IN ('DOT_MATRIX', 'HANDWRITTEN', 'PRINTED_OEM')),\n"
         "    has_redbook_audio BOOLEAN NOT NULL DEFAULT 0,\n"
         "    is_write_protected BOOLEAN NOT NULL DEFAULT 0,\n"
         "    is_removable_usb BOOLEAN NOT NULL DEFAULT 0,\n"
@@ -158,7 +159,7 @@ bool KioskDatabase::InitializeSchema() {
         "    min_archetype_tier INTEGER NOT NULL,\n"
         "    recommended_hdd_mb INTEGER NOT NULL,\n"
         "    filesystem_type TEXT NOT NULL CHECK (filesystem_type IN ('FAT12', 'FAT16', 'FAT32')),\n"
-        "    install_strategy TEXT NOT NULL,\n"
+        "    install_strategy TEXT NOT NULL CHECK (install_strategy IN ('FLOPPY_SEQUENCE', 'BOOTABLE_CD', 'WIN9X_CAB_PRECOPY', 'PREBUILT_IMAGE')),\n"
         "    boot_floppy_media_id TEXT REFERENCES media_pool(id),\n"
         "    install_cd_media_id TEXT REFERENCES media_pool(id),\n"
         "    unattended_answer_file TEXT\n"
@@ -168,7 +169,7 @@ bool KioskDatabase::InitializeSchema() {
         "CREATE TABLE IF NOT EXISTS machines (\n"
         "    id TEXT PRIMARY KEY,\n"
         "    display_name TEXT NOT NULL,\n"
-        "    archetype_id TEXT NOT NULL,\n"
+        "    archetype_id TEXT NOT NULL CHECK (archetype_id IN ('ARCH_XT_8088', 'ARCH_AT_286', 'ARCH_386DX', 'ARCH_486DX2', 'ARCH_PENTIUM_3DFX')),\n"
         "    archetype_tier INTEGER NOT NULL,\n"
         "    os_id TEXT REFERENCES os_distributions(id),\n"
         "    os_installed BOOLEAN NOT NULL DEFAULT 0,\n"
@@ -191,7 +192,7 @@ bool KioskDatabase::InitializeSchema() {
         "    release_year INTEGER,\n"
         "    source_origin TEXT NOT NULL DEFAULT 'SCANNED'\n"
         "        CHECK (source_origin IN ('SCANNED', 'GOG_IMPORT', 'STEAM_IMPORT', 'MANUAL')),\n"
-        "    launch_mechanism TEXT NOT NULL DEFAULT 'INTEGRATED_AUTOEXEC',\n"
+        "    launch_mechanism TEXT NOT NULL DEFAULT 'INTEGRATED_AUTOEXEC' CHECK (launch_mechanism IN ('INTEGRATED_AUTOEXEC', 'DOS_AUTOEXEC_INJECT', 'WIN3X_PROGMAN_HOOK', 'WIN9X_RUNONCE_HOOK')),\n"
         "    host_container_dir TEXT,\n"
         "    guest_working_dir TEXT NOT NULL,\n"
         "    guest_executable TEXT NOT NULL,\n"
@@ -327,7 +328,8 @@ bool KioskDatabase::UpdateConfig(const KioskConfigRecord& config) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 // ----------------------------------------------------------------------------
@@ -419,7 +421,8 @@ bool KioskDatabase::InsertMachine(const MachineRecord& machine) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 bool KioskDatabase::UpdateMachine(const MachineRecord& machine) {
@@ -446,7 +449,8 @@ bool KioskDatabase::UpdateMachine(const MachineRecord& machine) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 bool KioskDatabase::DeleteMachine(const std::string& id) {
@@ -460,7 +464,8 @@ bool KioskDatabase::DeleteMachine(const std::string& id) {
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 // ----------------------------------------------------------------------------
@@ -648,7 +653,7 @@ bool KioskDatabase::InsertCatalogItem(const CatalogItemRecord& item) {
     BindTextOrNull(stmt, 5, item.developer);
     sqlite3_bind_int(stmt, 6, item.release_year);
     sqlite3_bind_text(stmt, 7, item.source_origin.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 8, item.launch_mechanism.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, item.launch_mechanism.empty() ? "INTEGRATED_AUTOEXEC" : item.launch_mechanism.c_str(), -1, SQLITE_TRANSIENT);
     BindTextOrNull(stmt, 9, item.host_container_dir);
     sqlite3_bind_text(stmt, 10, item.guest_working_dir.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 11, item.guest_executable.c_str(), -1, SQLITE_TRANSIENT);
@@ -662,7 +667,8 @@ bool KioskDatabase::InsertCatalogItem(const CatalogItemRecord& item) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 bool KioskDatabase::UpdateCatalogItem(const CatalogItemRecord& item) {
@@ -683,7 +689,7 @@ bool KioskDatabase::UpdateCatalogItem(const CatalogItemRecord& item) {
     BindTextOrNull(stmt, 4, item.developer);
     sqlite3_bind_int(stmt, 5, item.release_year);
     sqlite3_bind_text(stmt, 6, item.source_origin.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 7, item.launch_mechanism.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, item.launch_mechanism.empty() ? "INTEGRATED_AUTOEXEC" : item.launch_mechanism.c_str(), -1, SQLITE_TRANSIENT);
     BindTextOrNull(stmt, 8, item.host_container_dir);
     sqlite3_bind_text(stmt, 9, item.guest_working_dir.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 10, item.guest_executable.c_str(), -1, SQLITE_TRANSIENT);
@@ -699,7 +705,8 @@ bool KioskDatabase::UpdateCatalogItem(const CatalogItemRecord& item) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 bool KioskDatabase::DeleteCatalogItem(const std::string& id) {
@@ -713,7 +720,8 @@ bool KioskDatabase::DeleteCatalogItem(const std::string& id) {
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 bool KioskDatabase::IncrementPlayCount(const std::string& id) {
@@ -727,7 +735,8 @@ bool KioskDatabase::IncrementPlayCount(const std::string& id) {
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 // ----------------------------------------------------------------------------
@@ -847,18 +856,19 @@ bool KioskDatabase::InsertMedia(const MediaPoolRecord& media) {
     sqlite3_bind_text(stmt, 2, media.file_path.c_str(), -1, SQLITE_TRANSIENT);
     BindTextOrNull(stmt, 3, media.file_sha1);
     sqlite3_bind_text(stmt, 4, media.media_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 5, media.physical_style.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, media.physical_style.empty() ? "BEIGE_35" : media.physical_style.c_str(), -1, SQLITE_TRANSIENT);
     BindTextOrNull(stmt, 6, media.volume_label);
     sqlite3_bind_text(stmt, 7, media.label_title.c_str(), -1, SQLITE_TRANSIENT);
     BindTextOrNull(stmt, 8, media.label_subtitle);
-    sqlite3_bind_text(stmt, 9, media.label_font_style.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 9, media.label_font_style.empty() ? "DOT_MATRIX" : media.label_font_style.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 10, media.has_redbook_audio ? 1 : 0);
     sqlite3_bind_int(stmt, 11, media.is_write_protected ? 1 : 0);
     sqlite3_bind_int(stmt, 12, media.is_removable_usb ? 1 : 0);
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 bool KioskDatabase::UpdateMedia(const MediaPoolRecord& media) {
@@ -875,11 +885,11 @@ bool KioskDatabase::UpdateMedia(const MediaPoolRecord& media) {
     sqlite3_bind_text(stmt, 1, media.file_path.c_str(), -1, SQLITE_TRANSIENT);
     BindTextOrNull(stmt, 2, media.file_sha1);
     sqlite3_bind_text(stmt, 3, media.media_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, media.physical_style.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, media.physical_style.empty() ? "BEIGE_35" : media.physical_style.c_str(), -1, SQLITE_TRANSIENT);
     BindTextOrNull(stmt, 5, media.volume_label);
     sqlite3_bind_text(stmt, 6, media.label_title.c_str(), -1, SQLITE_TRANSIENT);
     BindTextOrNull(stmt, 7, media.label_subtitle);
-    sqlite3_bind_text(stmt, 8, media.label_font_style.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, media.label_font_style.empty() ? "DOT_MATRIX" : media.label_font_style.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 9, media.has_redbook_audio ? 1 : 0);
     sqlite3_bind_int(stmt, 10, media.is_write_protected ? 1 : 0);
     sqlite3_bind_int(stmt, 11, media.is_removable_usb ? 1 : 0);
@@ -887,7 +897,8 @@ bool KioskDatabase::UpdateMedia(const MediaPoolRecord& media) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 bool KioskDatabase::DeleteMedia(const std::string& id) {
@@ -901,7 +912,8 @@ bool KioskDatabase::DeleteMedia(const std::string& id) {
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 std::vector<MediaPoolRecord> KioskDatabase::GetRemovableUsbMedia() {
@@ -1019,7 +1031,8 @@ bool KioskDatabase::AddCaddyBinding(const CaddyBindingRecord& binding) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 bool KioskDatabase::DeleteCaddyBinding(int id) {
@@ -1033,7 +1046,8 @@ bool KioskDatabase::DeleteCaddyBinding(int id) {
     sqlite3_bind_int(stmt, 1, id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 bool KioskDatabase::ClearCaddyBindingsForMachine(const std::string& machine_id) {
@@ -1047,7 +1061,8 @@ bool KioskDatabase::ClearCaddyBindingsForMachine(const std::string& machine_id) 
     sqlite3_bind_text(stmt, 1, machine_id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 bool KioskDatabase::ClearCaddyBindingsForItem(const std::string& item_id) {
@@ -1061,7 +1076,8 @@ bool KioskDatabase::ClearCaddyBindingsForItem(const std::string& item_id) {
     sqlite3_bind_text(stmt, 1, item_id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 // ----------------------------------------------------------------------------
@@ -1142,14 +1158,15 @@ bool KioskDatabase::InsertOSDistribution(const OSDistributionRecord& os) {
     sqlite3_bind_int(stmt, 4, os.min_archetype_tier);
     sqlite3_bind_int(stmt, 5, os.recommended_hdd_mb);
     sqlite3_bind_text(stmt, 6, os.filesystem_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 7, os.install_strategy.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, os.install_strategy.empty() ? "FLOPPY_SEQUENCE" : os.install_strategy.c_str(), -1, SQLITE_TRANSIENT);
     BindTextOrNull(stmt, 8, os.boot_floppy_media_id);
     BindTextOrNull(stmt, 9, os.install_cd_media_id);
     BindTextOrNull(stmt, 10, os.unattended_answer_file);
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 // ----------------------------------------------------------------------------
@@ -1202,7 +1219,8 @@ bool KioskDatabase::InsertSoftwareSignature(const SoftwareSignatureRecord& sig) 
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
 }
 
 #endif // defined(C_KIOSK)

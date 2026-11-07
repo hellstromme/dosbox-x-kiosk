@@ -2,18 +2,20 @@
 name: msbuild-runner
 description: >-
   Builds DOSBox-X Kiosk Edition on Windows using MSBuild with automated toolchain
-  discovery (vswhere, v145/v143 toolsets, Windows SDK) and token-efficient filtered logging.
-  Use this skill whenever compiling the solution or verifying build changes.
+  discovery (vswhere, v145/v143 toolsets, Windows SDK), token-efficient filtered logging,
+  automated project registration (add-source.ps1), and CRLF-safe line-bounded patching (patch-lines.ps1).
+  Use this skill whenever compiling the solution, registering source files, or patching large CRLF files.
 ---
 
 # MSBuild Runner Skill
 
-This skill automates building the DOSBox-X Kiosk Edition Visual Studio solution (`vs/dosbox-x.sln`) with dynamic toolchain discovery and filtered compiler output to avoid context window pollution.
+This skill automates building the DOSBox-X Kiosk Edition Visual Studio solution (`vs/dosbox-x.sln`) with dynamic toolchain discovery, filtered compiler output, XML-safe `.vcxproj` registration, and CRLF-safe bounded file patching.
 
 ## When to Use This Skill
 - Whenever building or verifying changes in the DOSBox-X codebase on Windows.
 - When performing verification across multiple configurations (`Debug SDL2|x64` and legacy `Debug|x64`).
-- When cleaning and rebuilding after header or dependency changes.
+- When registering new `.cpp` or `.h` files in `vs/dosbox-x.vcxproj` (`scripts/add-source.ps1`).
+- When making multi-line or line-scoped edits to large CRLF upstream files like `src/gui/sdlmain.cpp` or `src/ints/bios.cpp` (`scripts/patch-lines.ps1`).
 
 ## Toolchain Auto-Discovery
 The runner script ([`scripts/build.ps1`](./scripts/build.ps1)) automatically handles:
@@ -50,7 +52,17 @@ Use `scripts/add-source.ps1` to automatically register new C++ files in `vs/dosb
 powershell -ExecutionPolicy Bypass -File .agents/skills/msbuild-runner/scripts/add-source.ps1 -FilePath "src/kiosk/ui/my_new_widget.cpp"
 ```
 
-## Parameter Reference
+### 6. CRLF-Safe Line-Bounded File Patching
+Upstream DOSBox-X files (`src/gui/sdlmain.cpp`, `src/ints/bios.cpp`) use Windows CRLF (`\r\n`) line endings and exceed 10,000 lines. Use `scripts/patch-lines.ps1` to replace a line range `[StartLine..EndLine]` or match a multi-line target inside `[StartLine..EndLine]` while preserving native CRLF/LF line endings:
+```powershell
+# Replace exact 1-indexed line range [StartLine..EndLine] from a replacement file or string:
+powershell -ExecutionPolicy Bypass -File .agents/skills/msbuild-runner/scripts/patch-lines.ps1 -FilePath "src/ints/bios.cpp" -StartLine 10363 -EndLine 10375 -ReplaceEntireRange -ReplacementFile "patch.txt"
+
+# Or match a Target string/file within [StartLine..EndLine]:
+powershell -ExecutionPolicy Bypass -File .agents/skills/msbuild-runner/scripts/patch-lines.ps1 -FilePath "src/gui/sdlmain.cpp" -StartLine 10940 -EndLine 10965 -Target "    SDL_GL_SwapWindow(sdl.window);" -ReplacementFile "swap_patch.txt"
+```
+
+## Parameter Reference (`build.ps1`)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

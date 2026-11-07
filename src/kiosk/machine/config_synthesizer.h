@@ -14,14 +14,16 @@ public:
         const MachineRecord& machine,
         const CatalogItemRecord* item = nullptr,
         const std::vector<CaddyBindingRecord>& caddy = {},
-        const std::string& base_conf_path = ""
+        const std::string& base_conf_path = "",
+        const std::string& dispatch_image_path = ""
     ) const;
 
     // Builds the dynamic [autoexec] section block
     std::string SynthesizeAutoexec(
         const MachineRecord& machine,
         const CatalogItemRecord* item = nullptr,
-        const std::vector<CaddyBindingRecord>& caddy = {}
+        const std::vector<CaddyBindingRecord>& caddy = {},
+        const std::string& dispatch_image_path = ""
     ) const;
 
     // Writes synthesized config content to a target file

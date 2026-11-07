@@ -8,6 +8,7 @@
 #include <sstream>
 #include <map>
 #include <algorithm>
+#include <cctype>
 
 ConfigSynthesizer& ConfigSynthesizer::GetInstance() {
     static ConfigSynthesizer instance;
@@ -45,7 +46,8 @@ std::string ConfigSynthesizer::GetDefaultBaseConfig() const {
 std::string ConfigSynthesizer::SynthesizeAutoexec(
     const MachineRecord& machine,
     const CatalogItemRecord* item,
-    const std::vector<CaddyBindingRecord>& caddy
+    const std::vector<CaddyBindingRecord>& caddy,
+    const std::string& dispatch_image_path
 ) const {
     std::ostringstream ss;
     ss << "[autoexec]\n"
@@ -104,6 +106,9 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
                 ss << " \"" << b.resolved_file_path << "\"";
             }
             ss << " -t floppy -fs none\n";
+        } else if (!dispatch_image_path.empty()) {
+            ss << "# Ephemeral Kiosk Dispatch Floppy (Drive B:)\n"
+               << "IMGMOUNT 1 \"" << dispatch_image_path << "\" -t floppy -fs none\n";
         }
 
         // 3. Mount optical caddy (Drive D on Secondary IDE Master, Drive E on Secondary IDE Slave)
@@ -179,9 +184,17 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
 
         // 4. Dispatch executable
         if (item != nullptr && !item->guest_executable.empty()) {
-            ss << "C:\n";
-            if (!item->guest_working_dir.empty()) {
-                ss << "CD " << item->guest_working_dir << "\n";
+            std::string work_dir = item->guest_working_dir;
+            char drive_letter = 'C';
+            if (work_dir.size() >= 2 &&
+                std::isalpha(static_cast<unsigned char>(work_dir[0])) &&
+                work_dir[1] == ':') {
+                drive_letter = static_cast<char>(std::toupper(static_cast<unsigned char>(work_dir[0])));
+                work_dir = work_dir.substr(2);
+            }
+            ss << drive_letter << ":\n";
+            if (!work_dir.empty()) {
+                ss << "CD " << work_dir << "\n";
             }
             bool needs_quotes = item->guest_executable.find(' ') != std::string::npos;
             if (needs_quotes) {
@@ -206,7 +219,8 @@ std::string ConfigSynthesizer::SynthesizeConfig(
     const MachineRecord& machine,
     const CatalogItemRecord* item,
     const std::vector<CaddyBindingRecord>& caddy,
-    const std::string& base_conf_path
+    const std::string& base_conf_path,
+    const std::string& dispatch_image_path
 ) const {
     std::ostringstream ss;
 
@@ -238,7 +252,7 @@ std::string ConfigSynthesizer::SynthesizeConfig(
     }
 
     // 4. Layer 4: Dynamic [autoexec]
-    ss << SynthesizeAutoexec(machine, item, caddy) << "\n";
+    ss << SynthesizeAutoexec(machine, item, caddy, dispatch_image_path) << "\n";
 
     return ss.str();
 }

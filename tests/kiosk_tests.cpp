@@ -6,7 +6,18 @@
 #include "kiosk_db.h"
 #include "machine/archetypes.h"
 #include "machine/config_synthesizer.h"
+#include "machine/kioskext_bin.h"
+#include "machine/boot_injector.h"
+#include "ui/kiosk_ui.h"
+#include "kiosk_main.h"
+#include <cstdio>
+#include <fstream>
+#include "dosbox.h"
+#include "SDL.h"
 #include "sqlite3.h"
+
+extern void Kiosk_ResetPort8900State(void);
+extern void bochs_port_8900_write(Bitu port, Bitu val, Bitu iolen);
 
 #include <gtest/gtest.h>
 #include <string>
@@ -412,6 +423,630 @@ TEST(KioskSynthesizerTest, CustomOverridesMerge) {
     std::string conf = ConfigSynthesizer::GetInstance().SynthesizeConfig(m, nullptr, {});
     EXPECT_NE(std::string::npos, conf.find("[custom_section]"));
     EXPECT_NE(std::string::npos, conf.find("my_key=my_value"));
+}
+
+// ----------------------------------------------------------------------------
+// Phase 2: Kiosk Lifecycle State Machine & Emulation Trapping Tests
+// ----------------------------------------------------------------------------
+
+class KioskLifecycleTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        KioskManager::GetInstance().SetKioskModeActive(true);
+        ASSERT_TRUE(KioskManager::GetInstance().Initialize(":memory:", ""));
+    }
+
+    void TearDown() override {
+        KioskManager::GetInstance().Shutdown();
+    }
+};
+
+TEST_F(KioskLifecycleTest, BootToCountdownAndWatchdogExpiration) {
+    auto& mgr = KioskManager::GetInstance();
+    EXPECT_EQ(KioskState::STATE_COUNTDOWN_IDLE, mgr.GetState());
+    EXPECT_FLOAT_EQ(30.0f, mgr.GetWatchdogRemainingSec());
+
+    // Advance 10 seconds -> still in countdown
+    mgr.UpdateWatchdog(10.0f);
+    EXPECT_EQ(KioskState::STATE_COUNTDOWN_IDLE, mgr.GetState());
+    EXPECT_FLOAT_EQ(20.0f, mgr.GetWatchdogRemainingSec());
+
+    // Advance remaining 20 seconds -> triggers DEFAULT_DOSBOX -> STATE_SYNTHESIZE_LAUNCH
+    mgr.UpdateWatchdog(20.0f);
+    EXPECT_FLOAT_EQ(0.0f, mgr.GetWatchdogRemainingSec());
+    EXPECT_EQ(KioskState::STATE_SYNTHESIZE_LAUNCH, mgr.GetState());
+}
+
+TEST_F(KioskLifecycleTest, WatchdogCancellationOnIntentionalInput) {
+    auto& mgr = KioskManager::GetInstance();
+    ASSERT_EQ(KioskState::STATE_COUNTDOWN_IDLE, mgr.GetState());
+
+    // Small mouse jitter (< 5px) should be ignored
+    SDL_Event jitter;
+    memset(&jitter, 0, sizeof(jitter));
+    jitter.type = SDL_MOUSEMOTION;
+    jitter.motion.xrel = 2;
+    jitter.motion.yrel = -3;
+    EXPECT_FALSE(KioskManager::IsIntentionalUserInput(jitter));
+    EXPECT_FALSE(mgr.HandlePreBootInputEvent(jitter));
+    EXPECT_EQ(KioskState::STATE_COUNTDOWN_IDLE, mgr.GetState());
+
+    // Small controller axis deadzone (<= 8000) should be ignored
+    SDL_Event stick_noise;
+    memset(&stick_noise, 0, sizeof(stick_noise));
+    stick_noise.type = SDL_CONTROLLERAXISMOTION;
+    stick_noise.caxis.value = 4000;
+    EXPECT_FALSE(KioskManager::IsIntentionalUserInput(stick_noise));
+    EXPECT_FALSE(mgr.HandlePreBootInputEvent(stick_noise));
+    EXPECT_EQ(KioskState::STATE_COUNTDOWN_IDLE, mgr.GetState());
+
+    // Intentional keydown cancels watchdog and transitions to STATE_SHELL_INTERACTIVE
+    SDL_Event keydown;
+    memset(&keydown, 0, sizeof(keydown));
+    keydown.type = SDL_KEYDOWN;
+    keydown.key.keysym.sym = SDLK_SPACE;
+    EXPECT_TRUE(KioskManager::IsIntentionalUserInput(keydown));
+    EXPECT_TRUE(mgr.HandlePreBootInputEvent(keydown));
+    EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, mgr.GetState());
+}
+
+TEST_F(KioskLifecycleTest, ResolveDefaultBootActions) {
+    auto& db = KioskDatabase::GetInstance();
+    auto& mgr = KioskManager::GetInstance();
+
+    MachineRecord m1;
+    m1.id = "mach-boot-1";
+    m1.display_name = "486 Gaming PC";
+    m1.archetype_id = KioskArchetypes::DX2_486;
+    m1.archetype_tier = 4;
+    m1.boot_mode = "REAL_HDD_BOOT";
+    m1.primary_hdd_path = "C:\\kiosk\\hdd.img";
+    m1.primary_hdd_chs = "520,16,63";
+    m1.last_booted_at = "2026-01-01 12:00:00";
+    ASSERT_TRUE(db.InsertMachine(m1));
+
+    CatalogItemRecord item1;
+    item1.id = "item-boot-1";
+    item1.machine_id = "mach-boot-1";
+    item1.item_type = "GAME";
+    item1.title = "Heretic";
+    item1.host_container_dir = "C:\\games\\heretic";
+    item1.guest_working_dir = "\\HERETIC";
+    item1.guest_executable = "HERETIC.EXE";
+    item1.last_launched_at = "2026-01-02 15:30:00";
+    ASSERT_TRUE(db.InsertCatalogItem(item1));
+
+    // 1. SPECIFIC_MACHINE
+    KioskConfigRecord cfg;
+    ASSERT_TRUE(db.GetConfig(cfg));
+    cfg.default_boot_action = "SPECIFIC_MACHINE";
+    cfg.default_target_uuid = "mach-boot-1";
+    ASSERT_TRUE(db.UpdateConfig(cfg));
+    LaunchContext ctx1 = mgr.ResolveDefaultBootContext();
+    EXPECT_STREQ("mach-boot-1", ctx1.machine_id.c_str());
+    EXPECT_TRUE(ctx1.catalog_item_id.empty());
+    EXPECT_TRUE(ctx1.is_real_hdd_boot);
+
+    // 2. SPECIFIC_ITEM
+    cfg.default_boot_action = "SPECIFIC_ITEM";
+    cfg.default_target_uuid = "item-boot-1";
+    ASSERT_TRUE(db.UpdateConfig(cfg));
+    LaunchContext ctx2 = mgr.ResolveDefaultBootContext();
+    EXPECT_STREQ("mach-boot-1", ctx2.machine_id.c_str());
+    EXPECT_STREQ("item-boot-1", ctx2.catalog_item_id.c_str());
+    EXPECT_TRUE(ctx2.is_real_hdd_boot);
+
+    // 3. LAST_PLAYED
+    cfg.default_boot_action = "LAST_PLAYED";
+    cfg.default_target_uuid.clear();
+    ASSERT_TRUE(db.UpdateConfig(cfg));
+    LaunchContext ctx3 = mgr.ResolveDefaultBootContext();
+    EXPECT_STREQ("item-boot-1", ctx3.catalog_item_id.c_str());
+    EXPECT_STREQ("mach-boot-1", ctx3.machine_id.c_str());
+
+    // 4. Missing target falls back to DEFAULT_DOSBOX
+    cfg.default_boot_action = "SPECIFIC_MACHINE";
+    cfg.default_target_uuid = "nonexistent-machine-uuid";
+    ASSERT_TRUE(db.UpdateConfig(cfg));
+    LaunchContext ctx4 = mgr.ResolveDefaultBootContext();
+    EXPECT_TRUE(ctx4.machine_id.empty());
+    EXPECT_TRUE(ctx4.catalog_item_id.empty());
+    EXPECT_FALSE(ctx4.is_real_hdd_boot);
+}
+
+TEST_F(KioskLifecycleTest, SynthesizeLaunchAndTelemetryUpdate) {
+    auto& db = KioskDatabase::GetInstance();
+    auto& mgr = KioskManager::GetInstance();
+
+    MachineRecord m;
+    m.id = "mach-synth-1";
+    m.display_name = "386 Test Rig";
+    m.archetype_id = KioskArchetypes::DX_386;
+    m.archetype_tier = 3;
+    m.boot_mode = "INTEGRATED_DOS";
+    ASSERT_TRUE(db.InsertMachine(m));
+
+    CatalogItemRecord item;
+    item.id = "item-synth-1";
+    item.machine_id = "mach-synth-1";
+    item.item_type = "GAME";
+    item.title = "Wolfenstein 3D";
+    item.host_container_dir = "C:\\games\\wolf3d";
+    item.guest_working_dir = "\\WOLF3D";
+    item.guest_executable = "WOLF3D.EXE";
+    item.return_on_exit = true;
+    ASSERT_TRUE(db.InsertCatalogItem(item));
+
+    mgr.CancelWatchdog();
+    EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, mgr.GetState());
+
+    ASSERT_TRUE(mgr.RequestLaunchItem("item-synth-1"));
+    EXPECT_EQ(KioskState::STATE_SYNTHESIZE_LAUNCH, mgr.GetState());
+
+    std::string synthesized_conf;
+    ASSERT_TRUE(mgr.SynthesizeAndPrepareLaunch(synthesized_conf));
+    EXPECT_EQ(KioskState::STATE_EMULATION_RUNNING, mgr.GetState());
+    EXPECT_NE(std::string::npos, synthesized_conf.find("WOLF3D.EXE"));
+    EXPECT_NE(std::string::npos, synthesized_conf.find("EXIT"));
+
+    // Verify play_count was incremented
+    CatalogItemRecord updated;
+    ASSERT_TRUE(db.GetItem("item-synth-1", updated));
+    EXPECT_EQ(1, updated.play_count);
+}
+
+TEST_F(KioskLifecycleTest, RuntimeOverlayStateTransitions) {
+    auto& mgr = KioskManager::GetInstance();
+
+    ASSERT_TRUE(mgr.RequestDefaultDosboxLaunch());
+    std::string conf;
+    ASSERT_TRUE(mgr.SynthesizeAndPrepareLaunch(conf));
+    EXPECT_EQ(KioskState::STATE_EMULATION_RUNNING, mgr.GetState());
+
+    // Enter runtime overlay (F12+D / Guide button)
+    mgr.EnterRuntimeOverlay();
+    EXPECT_EQ(KioskState::STATE_RUNTIME_OVERLAY, mgr.GetState());
+
+    // Resume emulation
+    mgr.ResumeEmulation();
+    EXPECT_EQ(KioskState::STATE_EMULATION_RUNNING, mgr.GetState());
+
+    // Re-enter overlay and abort session back to Kiosk Shell
+    mgr.EnterRuntimeOverlay();
+    EXPECT_EQ(KioskState::STATE_RUNTIME_OVERLAY, mgr.GetState());
+    mgr.AbortSessionToShell();
+    EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, mgr.GetState());
+    EXPECT_EQ(KioskShutdownReason::USER_OVERLAY_ABORT, mgr.GetLastShutdownReason());
+    EXPECT_EQ(1, mgr.GetCompletedSessionCount());
+}
+
+TEST_F(KioskLifecycleTest, Port8900ShutdownSequenceAndGuestTrap) {
+    auto& mgr = KioskManager::GetInstance();
+    ASSERT_TRUE(mgr.RequestDefaultDosboxLaunch());
+    std::string conf;
+    ASSERT_TRUE(mgr.SynthesizeAndPrepareLaunch(conf));
+    EXPECT_EQ(KioskState::STATE_EMULATION_RUNNING, mgr.GetState());
+
+    Kiosk_ResetPort8900State();
+
+    // Partial or mismatched write should not throw
+    EXPECT_NO_THROW({
+        bochs_port_8900_write(0x8900, 'S', 1);
+        bochs_port_8900_write(0x8900, 'h', 1);
+        bochs_port_8900_write(0x8900, 'X', 1);
+    });
+
+    // Complete "Shutdown" sequence on port 0x8900 throws KioskGuestShutdownException
+    const char* seq = "Shutdown";
+    bool caught_shutdown = false;
+    try {
+        for (size_t i = 0; seq[i] != '\0'; ++i) {
+            bochs_port_8900_write(0x8900, static_cast<Bitu>(seq[i]), 1);
+        }
+    } catch (const KioskGuestShutdownException& ex) {
+        caught_shutdown = true;
+        EXPECT_EQ(KioskShutdownReason::PORT_8900_SHUTDOWN, ex.reason);
+        mgr.OnGuestShutdown(ex.reason);
+    }
+
+    EXPECT_TRUE(caught_shutdown);
+    EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, mgr.GetState());
+    EXPECT_EQ(KioskShutdownReason::PORT_8900_SHUTDOWN, mgr.GetLastShutdownReason());
+    EXPECT_EQ(1, mgr.GetCompletedSessionCount());
+}
+
+TEST_F(KioskDatabaseFixture, SchemaCheckConstraintsRejectInvalidEnums) {
+    auto& db = KioskDatabase::GetInstance();
+
+    // 1. Invalid machine archetype_id should fail CHECK constraint
+    MachineRecord bad_mach;
+    bad_mach.id = "mach-bad-arch";
+    bad_mach.display_name = "Bad Archetype Machine";
+    bad_mach.archetype_id = "INVALID_ARCHETYPE_XYZ";
+    bad_mach.archetype_tier = 3;
+    EXPECT_FALSE(db.InsertMachine(bad_mach));
+
+    // Insert a valid machine for FK tests
+    MachineRecord valid_mach;
+    valid_mach.id = "mach-valid-arch";
+    valid_mach.display_name = "Valid 486";
+    valid_mach.archetype_id = KioskArchetypes::DX2_486;
+    valid_mach.archetype_tier = 4;
+    ASSERT_TRUE(db.InsertMachine(valid_mach));
+
+    // 2. Invalid catalog_items.launch_mechanism should fail CHECK constraint
+    CatalogItemRecord bad_item;
+    bad_item.id = "item-bad-launch";
+    bad_item.machine_id = "mach-valid-arch";
+    bad_item.item_type = "GAME";
+    bad_item.title = "Bad Launch Game";
+    bad_item.guest_working_dir = "\\GAME";
+    bad_item.guest_executable = "GAME.EXE";
+    bad_item.launch_mechanism = "INVALID_MECHANISM";
+    EXPECT_FALSE(db.InsertCatalogItem(bad_item));
+
+    // 3. Invalid media_pool.media_type / physical_style / label_font_style should fail CHECK constraint
+    MediaPoolRecord bad_media = {};
+    bad_media.id = "media-bad-type";
+    bad_media.file_path = "/storage/bad.img";
+    bad_media.media_type = "LASERDISC_12INCH";
+    bad_media.physical_style = "BEIGE_35";
+    bad_media.label_font_style = "DOT_MATRIX";
+    bad_media.label_title = "Bad Media";
+    EXPECT_FALSE(db.InsertMedia(bad_media));
+
+    bad_media.media_type = "FLOPPY_35_1440K";
+    bad_media.physical_style = "NEON_PINK";
+    EXPECT_FALSE(db.InsertMedia(bad_media));
+
+    bad_media.physical_style = "BEIGE_35";
+    bad_media.label_font_style = "COMIC_SANS";
+    EXPECT_FALSE(db.InsertMedia(bad_media));
+}
+
+TEST(KioskSkipCountdownTest, SkipCountdownTransitionsDirectlyToShellInteractive) {
+    auto& mgr = KioskManager::GetInstance();
+    mgr.SetKioskModeActive(true);
+    mgr.SetSkipCountdown(true);
+    ASSERT_TRUE(mgr.Initialize(":memory:", ""));
+
+    EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, mgr.GetState());
+    EXPECT_FLOAT_EQ(0.0f, mgr.GetWatchdogRemainingSec());
+
+    mgr.Shutdown();
+}
+
+// ----------------------------------------------------------------------------
+// Phase 3: Ephemeral Boot Injector & Guest Return Mechanism Tests
+// ----------------------------------------------------------------------------
+
+TEST(KioskBootInjectorTest, KioskExtComBinaryLayoutAndPort8900Execution) {
+    EXPECT_EQ(57U, KIOSKEXT_COM_SIZE);
+
+    // 1. Stage 1: DOS Disk Reset (Flush File Buffers): MOV AH, 0Dh; INT 21h
+    EXPECT_EQ(0xB4, KIOSKEXT_COM_BYTES[0]);
+    EXPECT_EQ(0x0D, KIOSKEXT_COM_BYTES[1]);
+    EXPECT_EQ(0xCD, KIOSKEXT_COM_BYTES[2]);
+    EXPECT_EQ(0x21, KIOSKEXT_COM_BYTES[3]);
+
+    // 2. Stage 2: APM Real-Mode Connect (0x0104) & JC +0x15 (0x010B -> 0x0122 / index 34)
+    EXPECT_EQ(0xB8, KIOSKEXT_COM_BYTES[4]);
+    EXPECT_EQ(0x01, KIOSKEXT_COM_BYTES[5]);
+    EXPECT_EQ(0x53, KIOSKEXT_COM_BYTES[6]);
+    EXPECT_EQ(0x72, KIOSKEXT_COM_BYTES[11]);
+    EXPECT_EQ(0x15, KIOSKEXT_COM_BYTES[12]); // Next IP 0x010D + 0x15 = 0x0122 (index 34)
+
+    // 3. Stage 3: Fallback at offset 0x22 (index 34): MOV DX, 8900h; MOV SI, 0131h ("Shutdown"); MOV CX, 8
+    EXPECT_EQ(0xBA, KIOSKEXT_COM_BYTES[34]);
+    EXPECT_EQ(0x00, KIOSKEXT_COM_BYTES[35]);
+    EXPECT_EQ(0x89, KIOSKEXT_COM_BYTES[36]);
+    EXPECT_EQ(0xBE, KIOSKEXT_COM_BYTES[37]);
+    EXPECT_EQ(0x31, KIOSKEXT_COM_BYTES[38]);
+    EXPECT_EQ(0x01, KIOSKEXT_COM_BYTES[39]);
+    EXPECT_EQ(0xB9, KIOSKEXT_COM_BYTES[40]);
+    EXPECT_EQ(0x08, KIOSKEXT_COM_BYTES[41]);
+    EXPECT_EQ(0x00, KIOSKEXT_COM_BYTES[42]);
+
+    // 4. RET at offset 48 (0x0130) and "Shutdown" (8 bytes) at offset 49..56 (0x0131..0x0138)
+    EXPECT_EQ(0xC3, KIOSKEXT_COM_BYTES[48]);
+    EXPECT_EQ(0, memcmp(&KIOSKEXT_COM_BYTES[49], "Shutdown", 8));
+
+    // 4. Simulate the fallback OUT DX, AL loop feeding bytes from offset 49..56 to port 0x8900
+    auto& mgr = KioskManager::GetInstance();
+    mgr.SetKioskModeActive(true);
+    ASSERT_TRUE(mgr.Initialize(":memory:", ""));
+    ASSERT_TRUE(mgr.RequestDefaultDosboxLaunch());
+    std::string conf;
+    ASSERT_TRUE(mgr.SynthesizeAndPrepareLaunch(conf));
+
+    Kiosk_ResetPort8900State();
+    bool trapped = false;
+    try {
+        for (size_t i = 0; i < 8; ++i) {
+            bochs_port_8900_write(0x8900, KIOSKEXT_COM_BYTES[49 + i], 1);
+        }
+    } catch (const KioskGuestShutdownException& ex) {
+        trapped = true;
+        EXPECT_EQ(KioskShutdownReason::PORT_8900_SHUTDOWN, ex.reason);
+    }
+    EXPECT_TRUE(trapped);
+    mgr.Shutdown();
+}
+
+TEST(KioskBootInjectorTest, OneTimeAutoexecHookIdempotency) {
+    // 1. In-memory string helper idempotency
+    std::string original = "@ECHO OFF\r\nPATH C:\\DOS;C:\\UTILS\r\n";
+    std::string first_pass = BootInjector::InjectAutoexecHookToString(original);
+    EXPECT_NE(std::string::npos, first_pass.find("IF EXIST B:\\KIOSKGO.BAT CALL B:\\KIOSKGO.BAT\r\n"));
+
+    std::string second_pass = BootInjector::InjectAutoexecHookToString(first_pass);
+    EXPECT_EQ(first_pass, second_pass);
+
+    // 2. Raw FAT12 disk image inspection & mutation via EnsureOneTimeAutoexecHook
+    std::vector<DispatchFileEntry> seed_files;
+    DispatchFileEntry autoexec_entry;
+    autoexec_entry.filename_8_3 = "AUTOEXEC.BAT";
+    const std::string seed_autoexec = "@ECHO OFF\r\nPROMPT $P$G\r\n";
+    autoexec_entry.data.assign(seed_autoexec.begin(), seed_autoexec.end());
+    seed_files.push_back(autoexec_entry);
+
+    std::vector<uint8_t> disk_img;
+    ASSERT_TRUE(BootInjector::GetInstance().BuildFat12ImageInMemory(seed_files, disk_img));
+
+    const std::string temp_hdd_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".autoexec_test.img";
+    {
+        std::ofstream ofs(temp_hdd_path.c_str(), std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(ofs.is_open());
+        ofs.write(reinterpret_cast<const char*>(disk_img.data()), static_cast<std::streamsize>(disk_img.size()));
+    }
+
+    // First call injects the hook into AUTOEXEC.BAT inside the raw FAT12 image
+    EXPECT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(temp_hdd_path));
+
+    // Read image back and verify AUTOEXEC.BAT contains the hook
+    std::vector<uint8_t> modified_img;
+    {
+        std::ifstream ifs(temp_hdd_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(ifs.is_open());
+        modified_img.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    }
+    std::vector<uint8_t> autoexec_after_first;
+    ASSERT_TRUE(BootInjector::GetInstance().ReadFileFromFat12Image(modified_img, "AUTOEXEC.BAT", autoexec_after_first));
+    std::string content_first(autoexec_after_first.begin(), autoexec_after_first.end());
+    EXPECT_NE(std::string::npos, content_first.find("IF EXIST B:\\KIOSKGO.BAT CALL B:\\KIOSKGO.BAT\r\n"));
+
+    // Second call is a no-op and produces identical AUTOEXEC.BAT content
+    EXPECT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(temp_hdd_path));
+    {
+        std::ifstream ifs(temp_hdd_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(ifs.is_open());
+        modified_img.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    }
+    std::vector<uint8_t> autoexec_after_second;
+    ASSERT_TRUE(BootInjector::GetInstance().ReadFileFromFat12Image(modified_img, "AUTOEXEC.BAT", autoexec_after_second));
+    std::string content_second(autoexec_after_second.begin(), autoexec_after_second.end());
+    EXPECT_EQ(content_first, content_second);
+
+    std::remove(temp_hdd_path.c_str());
+}
+
+TEST(KioskBootInjectorTest, SynthesizeKioskGoBatForDosAndWin9x) {
+    MachineRecord m;
+    m.id = "mach-go";
+    m.archetype_id = KioskArchetypes::DX2_486;
+    m.archetype_tier = 4;
+    m.boot_mode = "REAL_HDD_BOOT";
+
+    // 1. Standard DOS game on C: with return_on_exit = true
+    CatalogItemRecord dos_game;
+    dos_game.guest_working_dir = "\\DOOM2";
+    dos_game.guest_executable = "DOOM2.EXE";
+    dos_game.guest_arguments = "-skill 4";
+    dos_game.launch_mechanism = "DOS_AUTOEXEC_INJECT";
+    dos_game.return_on_exit = true;
+
+    std::string bat_dos = BootInjector::GetInstance().SynthesizeKioskGoBat(m, dos_game);
+    EXPECT_NE(std::string::npos, bat_dos.find("C:\r\n"));
+    EXPECT_NE(std::string::npos, bat_dos.find("CD \\DOOM2\r\n"));
+    EXPECT_NE(std::string::npos, bat_dos.find("DOOM2.EXE -skill 4\r\n"));
+    EXPECT_NE(std::string::npos, bat_dos.find("B:\\KIOSKEXT.COM\r\n"));
+
+    // 2. Game located on CD-ROM drive D: with return_on_exit = false
+    CatalogItemRecord cd_game;
+    cd_game.guest_working_dir = "D:\\MYST";
+    cd_game.guest_executable = "MYST.EXE";
+    cd_game.launch_mechanism = "DOS_AUTOEXEC_INJECT";
+    cd_game.return_on_exit = false;
+
+    std::string bat_cd = BootInjector::GetInstance().SynthesizeKioskGoBat(m, cd_game);
+    EXPECT_NE(std::string::npos, bat_cd.find("D:\r\n"));
+    EXPECT_NE(std::string::npos, bat_cd.find("CD \\MYST\r\n"));
+    EXPECT_EQ(std::string::npos, bat_cd.find("KIOSKEXT.COM"));
+
+    // 3. Windows 3.x / Windows 9x hook uses C:\WINDOWS\WIN.COM without mutating SYSTEM.INI
+    CatalogItemRecord win_app;
+    win_app.guest_working_dir = "C:\\WINAPPS\\OFFICE";
+    win_app.guest_executable = "WINWORD.EXE";
+    win_app.guest_arguments = "README.DOC";
+    win_app.launch_mechanism = "WIN3X_PROGMAN_HOOK";
+    win_app.return_on_exit = true;
+
+    std::string bat_win = BootInjector::GetInstance().SynthesizeKioskGoBat(m, win_app);
+    EXPECT_NE(std::string::npos, bat_win.find("C:\r\n"));
+    EXPECT_NE(std::string::npos, bat_win.find("CD \\WINAPPS\\OFFICE\r\n"));
+    EXPECT_NE(std::string::npos, bat_win.find("C:\\WINDOWS\\WIN.COM WINWORD.EXE README.DOC\r\n"));
+    EXPECT_NE(std::string::npos, bat_win.find("B:\\KIOSKEXT.COM\r\n"));
+}
+
+TEST(KioskBootInjectorTest, Fat12DispatchImageSynthesisAndFileReadback) {
+    MachineRecord m;
+    m.id = "mach-fat12";
+    m.archetype_id = KioskArchetypes::DX2_486;
+    m.archetype_tier = 4;
+    m.boot_mode = "REAL_HDD_BOOT";
+
+    CatalogItemRecord item;
+    item.id = "item-fat12";
+    item.machine_id = "mach-fat12";
+    item.title = "Descent";
+    item.guest_working_dir = "\\DESCENT";
+    item.guest_executable = "DESCENT.EXE";
+    item.launch_mechanism = "DOS_AUTOEXEC_INJECT";
+    item.return_on_exit = true;
+
+    const std::string img_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fat12_test.img";
+    ASSERT_TRUE(BootInjector::GetInstance().BuildDispatchVolume(img_path, m, item));
+
+    std::vector<uint8_t> image_bytes;
+    {
+        std::ifstream ifs(img_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(ifs.is_open());
+        image_bytes.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    }
+
+    // Verify 1.44 MB floppy size (2880 sectors * 512 bytes = 1,474,560 bytes) and boot signature 0x55 0xAA
+    ASSERT_EQ(1474560U, image_bytes.size());
+    EXPECT_EQ(0x55, image_bytes[510]);
+    EXPECT_EQ(0xAA, image_bytes[511]);
+
+    // Verify KIOSKEXT.COM readback matches KIOSKEXT_COM_BYTES byte-for-byte
+    std::vector<uint8_t> ext_bytes;
+    ASSERT_TRUE(BootInjector::GetInstance().ReadFileFromFat12Image(image_bytes, "KIOSKEXT.COM", ext_bytes));
+    ASSERT_EQ(KIOSKEXT_COM_SIZE, ext_bytes.size());
+    EXPECT_EQ(0, memcmp(ext_bytes.data(), KIOSKEXT_COM_BYTES, KIOSKEXT_COM_SIZE));
+
+    // Verify KIOSKGO.BAT readback contains synthesized launch commands
+    std::vector<uint8_t> bat_bytes;
+    ASSERT_TRUE(BootInjector::GetInstance().ReadFileFromFat12Image(image_bytes, "KIOSKGO.BAT", bat_bytes));
+    std::string bat_str(bat_bytes.begin(), bat_bytes.end());
+    EXPECT_NE(std::string::npos, bat_str.find("CD \\DESCENT\r\n"));
+    EXPECT_NE(std::string::npos, bat_str.find("DESCENT.EXE\r\n"));
+    EXPECT_NE(std::string::npos, bat_str.find("B:\\KIOSKEXT.COM\r\n"));
+
+    BootInjector::GetInstance().CleanupDispatchVolume(img_path);
+}
+
+TEST(KioskBootInjectorTest, RealHddCarouselLaunchMountsDispatchOnFloppyBAndPreservesCdRomD) {
+    auto& db = KioskDatabase::GetInstance();
+    auto& mgr = KioskManager::GetInstance();
+    mgr.SetKioskModeActive(true);
+    ASSERT_TRUE(mgr.Initialize(":memory:", ""));
+
+    // Create a minimal valid FAT12 HDD image so EnsureOneTimeAutoexecHook succeeds
+    std::vector<DispatchFileEntry> hdd_files;
+    DispatchFileEntry autoexec_file;
+    autoexec_file.filename_8_3 = "AUTOEXEC.BAT";
+    const std::string autoexec_init = "@ECHO OFF\r\n";
+    autoexec_file.data.assign(autoexec_init.begin(), autoexec_init.end());
+    hdd_files.push_back(autoexec_file);
+
+    std::vector<uint8_t> hdd_img;
+    ASSERT_TRUE(BootInjector::GetInstance().BuildFat12ImageInMemory(hdd_files, hdd_img));
+    const std::string temp_hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".mode_a_hdd.img";
+    {
+        std::ofstream ofs(temp_hdd.c_str(), std::ios::binary | std::ios::trunc);
+        ofs.write(reinterpret_cast<const char*>(hdd_img.data()), static_cast<std::streamsize>(hdd_img.size()));
+    }
+
+    MachineRecord m;
+    m.id = "mach-mode-a";
+    m.display_name = "486 CD-ROM Rig";
+    m.archetype_id = KioskArchetypes::DX2_486;
+    m.archetype_tier = 4;
+    m.boot_mode = "REAL_HDD_BOOT";
+    m.primary_hdd_path = temp_hdd;
+    m.primary_hdd_chs = "520,16,63";
+    ASSERT_TRUE(db.InsertMachine(m));
+
+    MediaPoolRecord iso;
+    iso.id = "media-mode-a-iso";
+    iso.file_path = "C:\\kiosk\\game_cd.iso";
+    iso.media_type = "CDROM_ISO";
+    iso.physical_style = "JEWEL_CD";
+    iso.label_font_style = "PRINTED_OEM";
+    iso.label_title = "Game CD";
+    ASSERT_TRUE(db.InsertMedia(iso));
+
+    CaddyBindingRecord binding;
+    binding.machine_id = "mach-mode-a";
+    binding.media_id = "media-mode-a-iso";
+    binding.target_drive = "D";
+    binding.slot_order = 1;
+    ASSERT_TRUE(db.AddCaddyBinding(binding));
+
+    CatalogItemRecord item;
+    item.id = "item-mode-a";
+    item.machine_id = "mach-mode-a";
+    item.item_type = "GAME";
+    item.title = "Command & Conquer";
+    item.guest_working_dir = "\\C&C";
+    item.guest_executable = "C&C.EXE";
+    item.launch_mechanism = "DOS_AUTOEXEC_INJECT";
+    item.return_on_exit = true;
+    ASSERT_TRUE(db.InsertCatalogItem(item));
+
+    ASSERT_TRUE(mgr.RequestLaunchItem("item-mode-a"));
+    std::string conf;
+    ASSERT_TRUE(mgr.SynthesizeAndPrepareLaunch(conf));
+
+    // Verify Floppy B (drive index 1) mounts kiosk_dispatch.img and CD-ROM D mounts game_cd.iso before BOOT -l c
+    size_t pos_b = conf.find("IMGMOUNT 1 \"");
+    size_t pos_d = conf.find("IMGMOUNT D \"C:\\kiosk\\game_cd.iso\" -t iso -fs iso -ide 2m");
+    size_t pos_boot = conf.find("BOOT -l c");
+    EXPECT_NE(std::string::npos, pos_b);
+    EXPECT_NE(std::string::npos, conf.find("kiosk_dispatch.img\" -t floppy -fs none"));
+    EXPECT_NE(std::string::npos, pos_d);
+    EXPECT_NE(std::string::npos, pos_boot);
+    EXPECT_LT(pos_b, pos_boot);
+    EXPECT_LT(pos_d, pos_boot);
+
+    mgr.Shutdown();
+    std::remove(temp_hdd.c_str());
+}
+
+TEST(KioskBootInjectorTest, RealHddMachineOnlyBootMountsIdleDispatchVolumeWithoutKioskGoBat) {
+    auto& db = KioskDatabase::GetInstance();
+    auto& mgr = KioskManager::GetInstance();
+    mgr.SetKioskModeActive(true);
+    ASSERT_TRUE(mgr.Initialize(":memory:", ""));
+
+    MachineRecord m;
+    m.id = "mach-mode-b";
+    m.display_name = "Pure DOS 6.22 Workstation";
+    m.archetype_id = KioskArchetypes::DX_386;
+    m.archetype_tier = 3;
+    m.boot_mode = "REAL_HDD_BOOT";
+    m.primary_hdd_path = "C:\\kiosk\\dos622_c.img";
+    m.primary_hdd_chs = "520,16,63";
+    ASSERT_TRUE(db.InsertMachine(m));
+
+    ASSERT_TRUE(mgr.RequestLaunchMachine("mach-mode-b"));
+    std::string conf;
+    ASSERT_TRUE(mgr.SynthesizeAndPrepareLaunch(conf));
+
+    // Verify Floppy B mounts kiosk_dispatch.img
+    EXPECT_NE(std::string::npos, conf.find("IMGMOUNT 1 \""));
+    EXPECT_NE(std::string::npos, conf.find("kiosk_dispatch.img\" -t floppy -fs none"));
+
+    const std::string dispatch_path = mgr.GetActiveDispatchImagePath();
+    ASSERT_FALSE(dispatch_path.empty());
+
+    std::vector<uint8_t> image_bytes;
+    {
+        std::ifstream ifs(dispatch_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(ifs.is_open());
+        image_bytes.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    }
+
+    // Idle dispatch volume contains KIOSKEXT.COM (for manual shutdown) but NO KIOSKGO.BAT
+    std::vector<uint8_t> ext_bytes;
+    EXPECT_TRUE(BootInjector::GetInstance().ReadFileFromFat12Image(image_bytes, "KIOSKEXT.COM", ext_bytes));
+    EXPECT_EQ(KIOSKEXT_COM_SIZE, ext_bytes.size());
+
+    std::vector<uint8_t> bat_bytes;
+    EXPECT_FALSE(BootInjector::GetInstance().ReadFileFromFat12Image(image_bytes, "KIOSKGO.BAT", bat_bytes));
+
+    mgr.Shutdown();
 }
 
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

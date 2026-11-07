@@ -71,6 +71,7 @@ public:
 #endif
 #if defined(C_KIOSK)
     bool opt_kiosk_mode = false;
+    bool opt_kiosk_skip_countdown = false;
     std::string opt_kiosk_db;
     std::string opt_kiosk_conf;
 #endif

@@ -5,4 +5,5 @@ libkiosk_a_SOURCES = kiosk_main.cpp kiosk_main.h kiosk_types.h \
                      kiosk_db.cpp kiosk_db.h \
                      ui/kiosk_ui.cpp ui/kiosk_ui.h \
                      machine/archetypes.cpp machine/archetypes.h \
-                     machine/config_synthesizer.cpp machine/config_synthesizer.h
+                     machine/config_synthesizer.cpp machine/config_synthesizer.h \
+                     machine/boot_injector.cpp machine/boot_injector.h machine/kioskext_bin.h
