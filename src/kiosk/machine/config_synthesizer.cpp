@@ -8,6 +8,7 @@
 #include <sstream>
 #include <map>
 #include <algorithm>
+#include <cctype>
 
 ConfigSynthesizer& ConfigSynthesizer::GetInstance() {
     static ConfigSynthesizer instance;
@@ -45,7 +46,8 @@ std::string ConfigSynthesizer::GetDefaultBaseConfig() const {
 std::string ConfigSynthesizer::SynthesizeAutoexec(
     const MachineRecord& machine,
     const CatalogItemRecord* item,
-    const std::vector<CaddyBindingRecord>& caddy
+    const std::vector<CaddyBindingRecord>& caddy,
+    const std::string& dispatch_image_path
 ) const {
     std::ostringstream ss;
     ss << "[autoexec]\n"
@@ -88,22 +90,39 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
         }
 
         // 2. Mount floppy caddy (Drive A = 0, Drive B = 1)
-        if (drive_bindings.find("A") != drive_bindings.end() && !drive_bindings["A"].empty()) {
+        // In Mode A (Carousel Item launch on REAL_HDD_BOOT), Drive B: (IMGMOUNT 1) is
+        // reserved exclusively for the ephemeral dispatch floppy (B:\KIOSKGO.BAT + B:\KIOSKEXT.COM)
+        // so the boot hook and post-exit return script are never shadowed or ejected.
+        // Any B: caddy bindings are coalesced into Drive A:'s multi-disk swap queue.
+        const bool reserve_b_for_dispatch = (item != nullptr && !dispatch_image_path.empty());
+        std::vector<CaddyBindingRecord> floppy_a_queue = drive_bindings["A"];
+        if (reserve_b_for_dispatch && !drive_bindings["B"].empty()) {
+            const auto& b_list = drive_bindings["B"];
+            floppy_a_queue.insert(floppy_a_queue.end(), b_list.begin(), b_list.end());
+        }
+
+        if (!floppy_a_queue.empty()) {
             ss << "# Floppy Drive A: Session Caddy\n"
                << "IMGMOUNT 0";
-            for (const auto& b : drive_bindings["A"]) {
+            for (const auto& b : floppy_a_queue) {
                 ss << " \"" << b.resolved_file_path << "\"";
             }
             ss << " -t floppy -fs none\n";
         }
 
-        if (drive_bindings.find("B") != drive_bindings.end() && !drive_bindings["B"].empty()) {
+        if (reserve_b_for_dispatch) {
+            ss << "# Ephemeral Kiosk Dispatch Floppy (Drive B:)\n"
+               << "IMGMOUNT 1 \"" << dispatch_image_path << "\" -t floppy -fs none\n";
+        } else if (drive_bindings.find("B") != drive_bindings.end() && !drive_bindings["B"].empty()) {
             ss << "# Floppy Drive B: Session Caddy\n"
                << "IMGMOUNT 1";
             for (const auto& b : drive_bindings["B"]) {
                 ss << " \"" << b.resolved_file_path << "\"";
             }
             ss << " -t floppy -fs none\n";
+        } else if (!dispatch_image_path.empty()) {
+            ss << "# Ephemeral Kiosk Dispatch Floppy (Drive B:)\n"
+               << "IMGMOUNT 1 \"" << dispatch_image_path << "\" -t floppy -fs none\n";
         }
 
         // 3. Mount optical caddy (Drive D on Secondary IDE Master, Drive E on Secondary IDE Slave)
@@ -179,9 +198,17 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
 
         // 4. Dispatch executable
         if (item != nullptr && !item->guest_executable.empty()) {
-            ss << "C:\n";
-            if (!item->guest_working_dir.empty()) {
-                ss << "CD " << item->guest_working_dir << "\n";
+            std::string work_dir = item->guest_working_dir;
+            char drive_letter = 'C';
+            if (work_dir.size() >= 2 &&
+                std::isalpha(static_cast<unsigned char>(work_dir[0])) &&
+                work_dir[1] == ':') {
+                drive_letter = static_cast<char>(std::toupper(static_cast<unsigned char>(work_dir[0])));
+                work_dir = work_dir.substr(2);
+            }
+            ss << drive_letter << ":\n";
+            if (!work_dir.empty()) {
+                ss << "CD " << work_dir << "\n";
             }
             bool needs_quotes = item->guest_executable.find(' ') != std::string::npos;
             if (needs_quotes) {
@@ -206,7 +233,8 @@ std::string ConfigSynthesizer::SynthesizeConfig(
     const MachineRecord& machine,
     const CatalogItemRecord* item,
     const std::vector<CaddyBindingRecord>& caddy,
-    const std::string& base_conf_path
+    const std::string& base_conf_path,
+    const std::string& dispatch_image_path
 ) const {
     std::ostringstream ss;
 
@@ -238,7 +266,7 @@ std::string ConfigSynthesizer::SynthesizeConfig(
     }
 
     // 4. Layer 4: Dynamic [autoexec]
-    ss << SynthesizeAutoexec(machine, item, caddy) << "\n";
+    ss << SynthesizeAutoexec(machine, item, caddy, dispatch_image_path) << "\n";
 
     return ss.str();
 }

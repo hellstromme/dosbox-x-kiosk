@@ -137,6 +137,7 @@ if ($Tests) {
             $totalTests = [int]$xml.testsuites.tests
             $totalFailures = [int]$xml.testsuites.failures
             $totalErrors = [int]$xml.testsuites.errors
+            foreach ($ts in $xml.testsuites.testsuite) { foreach ($tc in $ts.testcase) { if ($tc.failure) { Write-Host "[FAILED TEST] $($ts.name).$($tc.name): $($tc.failure.message)" -ForegroundColor Yellow } } }
         } catch {
             Write-Warning "[dosbox-config-tester] Could not parse Google Test XML: $_"
         }

@@ -16,6 +16,7 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
+#include "config.h"
 #include <assert.h>
 #include "control.h"
 #include "dosbox.h"
@@ -55,6 +56,9 @@ extern bool PS1AudioCard;
 #include <time.h>
 #include <sys/stat.h>
 #include "version_string.h"
+#if defined(C_KIOSK)
+#include "kiosk/kiosk_main.h"
+#endif
 
 #define DOSBOX_INCLUDE
 #include "iglib.h"
@@ -1594,6 +1598,34 @@ static IO_ReadHandleObject *ISAPNP_PNP_READ_PORT = NULL;        /* 0x200-0x3FF r
 static IO_WriteHandleObject *ISAPNP_PNP_ADDRESS_PORT = NULL;        /* 0x279 */
 static IO_WriteHandleObject *ISAPNP_PNP_DATA_PORT = NULL;       /* 0xA79 */
 static IO_WriteHandleObject *BOCHS_PORT_E9 = NULL;
+#if defined(C_KIOSK)
+static IO_WriteHandleObject *BOCHS_PORT_8900 = NULL;
+static size_t bochs_port_8900_idx = 0;
+static const char bochs_port_8900_seq[9] = "Shutdown";
+
+void Kiosk_ResetPort8900State(void) {
+    bochs_port_8900_idx = 0;
+}
+
+void bochs_port_8900_write(Bitu /*port*/, Bitu val, Bitu /*iolen*/) {
+    const char c = static_cast<char>(val & 0xFFu);
+    if (c == bochs_port_8900_seq[bochs_port_8900_idx]) {
+        bochs_port_8900_idx++;
+        if (bochs_port_8900_idx == 8) {
+            bochs_port_8900_idx = 0;
+            LOG_MSG("KIOSK: Caught Port 0x8900 ('Shutdown') hardware power-off signal.");
+            if (KioskManager::GetInstance().IsKioskModeActive()) {
+                throw KioskGuestShutdownException(KioskShutdownReason::PORT_8900_SHUTDOWN);
+            }
+            throw int(0);
+        }
+    } else if (c == bochs_port_8900_seq[0]) {
+        bochs_port_8900_idx = 1;
+    } else {
+        bochs_port_8900_idx = 0;
+    }
+}
+#endif
 //static unsigned char ISA_PNP_CUR_CSN = 0;
 static unsigned char ISA_PNP_CUR_ADDR = 0;
 static unsigned char ISA_PNP_CUR_STATE = 0;
@@ -2713,6 +2745,11 @@ static Bitu ISAPNP_Handler(bool protmode /* called from protected mode interface
                 case 0x41:  /* POWER_OFF */
                     LOG_MSG("Plug & Play OS requested power off.\n");
                     reg_ax = 0;
+#if defined(C_KIOSK)
+                    if (KioskManager::GetInstance().IsKioskModeActive()) {
+                        throw KioskGuestShutdownException(KioskShutdownReason::PNP_POWER_OFF);
+                    }
+#endif
                     throw 1;    /* NTS: Based on the Reboot handler code, causes DOSBox-X to cleanly shutdown and exit */
                     break;
                 case 0x42:  /* PNP_OS_ACTIVE */
@@ -7546,6 +7583,12 @@ static Bitu INT15_Handler(void) {
                             APM_ResumeNotificationFromSuspend = true;
                             break;
                         case 0x3: // power off
+#if defined(C_KIOSK)
+                            if (KioskManager::GetInstance().IsKioskModeActive()) {
+                                LOG_MSG("KIOSK: Caught Guest OS APM Power-Off Request (INT 15h AX=5307h CX=0003h).");
+                                throw KioskGuestShutdownException(KioskShutdownReason::APM_POWER_OFF);
+                            }
+#endif
                             throw 0;
                         case 0x4: // last request processing notification (used by Windows ME)
                             LOG(LOG_MISC,LOG_DEBUG)("Guest is considering whether to accept the last returned APM event");
@@ -10322,6 +10365,13 @@ private:
             delete BOCHS_PORT_E9;
             BOCHS_PORT_E9=NULL;
         }
+#if defined(C_KIOSK)
+        if (BOCHS_PORT_8900) {
+            delete BOCHS_PORT_8900;
+            BOCHS_PORT_8900=NULL;
+        }
+#endif
+
         if (ISAPNP_PNP_ADDRESS_PORT) {
             delete ISAPNP_PNP_ADDRESS_PORT;
             ISAPNP_PNP_ADDRESS_PORT=NULL;
@@ -10348,6 +10398,17 @@ private:
                 BOCHS_PORT_E9 = NULL;
             }
         }
+
+#if defined(C_KIOSK)
+        if (KioskManager::GetInstance().IsKioskModeActive()) {
+            Kiosk_ResetPort8900State();
+            if (BOCHS_PORT_8900 == NULL) {
+                BOCHS_PORT_8900 = new IO_WriteHandleObject;
+                BOCHS_PORT_8900->Install(0x8900, bochs_port_8900_write, IO_MB);
+            }
+            LOG(LOG_MISC,LOG_DEBUG)("Kiosk Bochs port 8900h shutdown trap is active");
+        }
+#endif
 
         extern Bitu call_default;
 
@@ -12839,6 +12900,13 @@ public:
             delete BOCHS_PORT_E9;
             BOCHS_PORT_E9=NULL;
         }
+#if defined(C_KIOSK)
+        if (BOCHS_PORT_8900) {
+            delete BOCHS_PORT_8900;
+            BOCHS_PORT_8900=NULL;
+        }
+#endif
+
         if (ISAPNP_PNP_ADDRESS_PORT) {
             delete ISAPNP_PNP_ADDRESS_PORT;
             ISAPNP_PNP_ADDRESS_PORT=NULL;

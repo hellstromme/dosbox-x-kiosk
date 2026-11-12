@@ -1824,6 +1824,9 @@
     <ClCompile Include="..\src\kiosk\machine\config_synthesizer.cpp">
       <Filter>Sources\kiosk\machine</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\kiosk\machine\boot_injector.cpp">
+      <Filter>Sources\kiosk\machine</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\kiosk\ui\kiosk_ui.cpp">
       <Filter>Sources\kiosk\ui</Filter>
     </ClCompile>
@@ -2883,6 +2886,12 @@
       <Filter>Sources\kiosk\machine</Filter>
     </ClInclude>
     <ClInclude Include="..\src\kiosk\machine\config_synthesizer.h">
+      <Filter>Sources\kiosk\machine</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\kiosk\machine\boot_injector.h">
+      <Filter>Sources\kiosk\machine</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\kiosk\machine\kioskext_bin.h">
       <Filter>Sources\kiosk\machine</Filter>
     </ClInclude>
     <ClInclude Include="..\src\kiosk\ui\kiosk_ui.h">

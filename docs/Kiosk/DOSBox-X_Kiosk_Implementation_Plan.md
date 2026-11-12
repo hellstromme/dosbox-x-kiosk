@@ -12,11 +12,11 @@
 The **DOSBox-X Kiosk Edition** project transforms standard DOSBox-X into a dedicated, appliance-grade retro computing console. Instead of wrapping DOSBox-X in an external frontend (such as LaunchBox, Pegasus, or EmulationStation) which forfeits control once a guest OS boots raw disk images (`BOOT` / `IMGMOUNT`), this project embeds:
 1. An **In-Process Pre-Boot Kiosk Shell** with a 30-second watchdog countdown, Big-Picture Carousels, and Machine Creation Wizard.
 2. A **Skeuomorphic Runtime Overlay (F12+D)** for visual, non-breaking floppy and CD-ROM swapping directly hooked into DOSBox-X's Floppy Controller (`0x3F7`) and ATAPI CD-ROM emulation.
-3. A **Non-Destructive Ephemeral Boot Injector** using a RAM-backed secondary dispatch disk (`D:`) and an embedded 48-byte shutdown binary (`KIOSKEXT.COM`) to launch software directly inside real MS-DOS / Windows 9x machines and return cleanly to the shell upon exit.
+3. A **Non-Destructive Ephemeral Boot Injector** using an ephemeral FAT12 dispatch floppy (`B:` via `IMGMOUNT 1`) and an embedded 57-byte shutdown binary (`KIOSKEXT.COM`) to launch software directly inside real MS-DOS / Windows 9x machines without shifting `D:` CD-ROM drive letters, returning cleanly to the shell upon exit.
 4. An **In-Process FAT12/16/32 Crawler & GOG/Steam Ingestion Engine** to index installed software and convert commercial digital game releases into standardized Kiosk Archetypes.
-5. A **Minimal Linux Appliance Host** with KMSDRM rendering, systemd watchdog supervision, read-only OverlayFS, and udisks2 DBus auto-mounting.
+5. **Dual-Target Execution (Desktop "Big Picture" Mode & Buildroot Old-Laptop Appliance)** supporting both on-demand desktop/fullscreen gaming on Windows and Linux (`dosbox-x -kiosk-mode`) and turn-key embedded Buildroot appliances (`BR2_PACKAGE_DOSBOX_X_KIOSK=y`) with direct SDL2 KMSDRM rendering, BusyBox `init` supervision, read-only SquashFS/OverlayFS, and zero-daemon USB/optical hotplug detection (`eudev`/`inotify` on Linux and `GetLogicalDrives()` on Windows).
 
-To maintain upstream maintainability with `joncampbell123/dosbox-x`, all new code will reside in a dedicated directory (`src/kiosk/`) protected behind a build-time toggle (`ENABLE_KIOSK`) and runtime command-line switch (`--kiosk-mode`).
+To maintain upstream maintainability with `joncampbell123/dosbox-x`, all new code will reside in a dedicated directory (`src/kiosk/`) protected behind a build-time toggle (`C_KIOSK` / `--enable-kiosk`) and runtime command-line switch (`--kiosk-mode`).
 
 ---
 
@@ -24,9 +24,10 @@ To maintain upstream maintainability with `joncampbell123/dosbox-x`, all new cod
 
 ```
 +-----------------------------------------------------------------------------------+
-|                        MINIMAL LINUX APPLIANCE HOST                               |
-|  [systemd auto-login] ---> [SDL2 KMSDRM / libseat] ---> [udisks2 DBus Monitor]    |
+|         HOST LAYER: DESKTOP "BIG PICTURE" (Win32/Linux) OR BUILDROOT APPLIANCE    |
+|  [BusyBox init / Desktop Launch] -> [SDL2 KMSDRM or Desktop GL] -> [USB Watcher]  |
 +-----------------------------------------------------------------------------------+
+```
                                          |
                                          v
 +-----------------------------------------------------------------------------------+
@@ -36,7 +37,7 @@ To maintain upstream maintainability with `joncampbell123/dosbox-x`, all new cod
 |  |     STAGE 1: PRE-BOOT SHELL       |     |    STAGE 2: EMULATION RUNTIME     |  |
 |  |  - 30s Countdown Watchdog         |     |  - Guest OS Execution (Real/PM)   |  |
 |  |  - Games / Apps Carousels         | ==> |  - In-Memory Config Synthesis     |  |
-|  |  - Hardware Archetype Wizard      |     |  - Ephemeral Dispatch Drive (D:)  |  |
+|  |  - Hardware Archetype Wizard      |     |  - Ephemeral Dispatch Floppy (B:) |  |
 |  |  - OS Installer & Ingest Engine   |     |  - Caught APM / Port 0x8900 Exit  |  |
 |  +-----------------------------------+     +-----------------------------------+  |
 |                    ^                                         |                    |
@@ -63,8 +64,8 @@ src/
 │   ├── machine/                         # Virtual Machine & Execution Synthesis
 │   │   ├── archetypes.h / .cpp          # 5 Hardware Archetypes (XT -> Pentium 3dfx)
 │   │   ├── config_synthesizer.h / .cpp  # Multi-layer in-memory DOSBox-X .conf synthesis
-│   │   ├── boot_injector.h / .cpp       # Ephemeral RAM disk (D:) & AUTOEXEC / SYSTEM.INI hooks
-│   │   └── kioskext_bin.h               # 48-byte compiled KIOSKEXT.COM payload
+│   │   ├── boot_injector.h / .cpp       # Ephemeral FAT12 floppy (B:) & AUTOEXEC hooks
+│   │   └── kioskext_bin.h               # 57-byte compiled KIOSKEXT.COM payload
 │   │
 │   ├── ui/                              # Unified Rendering & Input
 │   │   ├── kiosk_ui.h / .cpp            # ImGui / OpenGL compositing engine
@@ -80,11 +81,10 @@ src/
 │       ├── signature_matcher.h / .cpp   # Extender-stub-stripping LE/LX CRC32 fingerprinter
 │       ├── archive_importer.h / .cpp    # GOG (innoextract) & Steam (.zip) pipeline
 │       ├── conf_translator.h / .cpp     # dosbox.conf AST parser to Kiosk Archetypes
-│       └── usb_bridge.h / .cpp          # udisks2 / sd-bus hotplug listener
+│       └── usb_bridge.h / .cpp          # Cross-platform removable storage watcher (inotify / Win32)
 │
-├── dosbox.cpp                           # Hook Point 1: CLI parse & kiosk loop intercept
-├── gui/sdlmain.cpp                      # Hook Point 2: Input routing, GFX_EndUpdate overlay, F12+D
-├── ints/bios.cpp                        # Hook Point 3: INT 15h APM & Port 0x8900 shutdown catch
+├── gui/sdlmain.cpp                      # Hook Point 1 & 2: CLI parse, pre-boot shell, GFX_EndUpdate overlay, F12+D
+├── ints/bios.cpp                        # Hook Point 3: INT 15h APM/PnP & Port 0x8900 shutdown catch
 └── hardware/floppy.cpp, ide.cpp         # Hook Point 4: Direct FDC & ATAPI media change signals
 ```
 
@@ -104,7 +104,7 @@ flowchart TD
     P5["Phase 5: Pre-Boot Shell & Big-Picture UI"]
     P6["Phase 6: Non-Destructive FAT Disk Crawler & Metadata Extractor"]
     P7["Phase 7: GOG & Steam Ingestion Engine"]
-    P8["Phase 8: Minimal Linux Appliance Host & Storage Bridge"]
+    P8["Phase 8: Dual-Target Host Layer (Buildroot Old-Laptop Appliance & Desktop Big-Picture)"]
     P9["Phase 9: End-to-End Verification, Hardening & Upstream Merge Readiness"]
 
     P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7 --> P8 --> P9
@@ -117,8 +117,8 @@ flowchart TD
 **Goal:** Integrate required third-party libraries and build-time flags into DOSBox-X without disturbing standard builds.
 
 - **0.1 Build System Flags:**
-  - Introduce `ENABLE_KIOSK` preprocessor definition in `configure.ac`, `Makefile.am`, and `vs/dosbox-x.vcxproj`.
-  - Default `ENABLE_KIOSK=no` on generic builds; enable explicitly via `./configure --enable-kiosk`.
+  - Introduce `C_KIOSK` preprocessor definition in `configure.ac`, `Makefile.am`, and `vs/dosbox-x.vcxproj`.
+  - Default `--enable-kiosk=no` on generic builds; enable explicitly via `./configure --enable-kiosk` (and `Debug SDL2` / `Release SDL2` in MSVC).
 - **0.2 Third-Party Library Integration:**
   - **SQLite 3.4x (Amalgamation):** Add `sqlite3.c` and `sqlite3.h` to `src/libs/sqlite3/`.
   - **Dear ImGui (Docking/Current Branch):** Add core ImGui files with SDL2 and OpenGL3 backends into `src/libs/imgui/`.
@@ -151,17 +151,19 @@ flowchart TD
 
 ### Phase 2: Kiosk Lifecycle State Machine & Emulation Trapping
 
-**Goal:** Enable DOSBox-X to boot into the Kiosk lifecycle, run emulation sessions inside a trap block, and return to the Kiosk without process termination.
+**Goal:** Enable DOSBox-X to boot into the Kiosk Pre-Boot Shell before hardware subsystem initialization (for zero-flicker in-process launch), run emulation sessions inside a trap block, and return cleanly to the Kiosk Carousel upon guest shutdown via a fast process re-exec with a 100% fresh hardware state.
 
-- **2.1 CLI Argument Parsing & Boot Intercept (`src/dosbox.cpp`):**
-  - Add `--kiosk-mode`, `--kiosk-db <path>`, and `--kiosk-conf <path>` options.
-  - When `--kiosk-mode` is active, bypass normal shell startup and branch into `KioskManager::GetInstance().RunMainLoop()`.
+- **2.1 CLI Argument Parsing & Pre-Hardware-Init Hook (`src/gui/sdlmain.cpp`):**
+  - Add `--kiosk-mode`, `--kiosk-skip-countdown`, `--kiosk-db <path>`, and `--kiosk-conf <path>` options.
+  - When `--kiosk-mode` is active, invoke `KioskManager::GetInstance().RunMainLoop()` right after SDL2/OpenGL window creation (`GUI_StartUp`) and *before* one-time hardware subsystem initialization (`Init_RAM`, `VGA_Init`, `VOODOO_Init`, `DOS_Init`, `AUTOEXEC_Init`, `VM_PowerOn`).
+  - Once `STATE_SYNTHESIZE_LAUNCH` writes `kiosk_session.conf` and `kiosk_dispatch.img`, call `control->ParseConfigFile("kiosk_session.conf")` so all 45+ DOSBox-X hardware subsystems initialize natively in-process with zero window flicker.
 - **2.2 Lifecycle State Machine (`src/kiosk/kiosk_main.cpp`):**
   - Implement the 6 runtime states: `STATE_KIOSK_BOOT`, `STATE_COUNTDOWN_IDLE`, `STATE_SHELL_INTERACTIVE`, `STATE_SYNTHESIZE_LAUNCH`, `STATE_EMULATION_RUNNING`, `STATE_RUNTIME_OVERLAY`.
-- **2.3 Emulation Session Runner & Hardware Teardown:**
+  - When `--kiosk-skip-countdown` is passed on post-session re-exec, transition directly from `STATE_KIOSK_BOOT` to `STATE_SHELL_INTERACTIVE`.
+- **2.3 Emulation Session Runner, Hardware Teardown & Clean Re-Exec:**
   - Wrap `DOSBOX_RunMachine()` in a try/catch block for `KioskGuestShutdownException`.
-  - In `src/gui/sdlmain.cpp`, update the exception handler: when `x == 0` (or `KioskGuestShutdownException`), instead of exiting the process, cleanly tear down guest disk/DMA state and transition to `STATE_SHELL_INTERACTIVE`.
-  - Intercept INT 15h AX=5307h CX=0003h (APM Power Off) in `src/ints/bios.cpp` to signal Kiosk shutdown.
+  - In `src/gui/sdlmain.cpp`, when `KioskGuestShutdownException` (or DOS shell exit) occurs, flush virtual drives (`DOS_ShutdownDrives()`, `FreeBIOSDiskList()`), remove the temporary `kiosk_dispatch.img` volume, and re-exec the binary with `--kiosk-mode --kiosk-skip-countdown` to return to `STATE_SHELL_INTERACTIVE` with zero hardware state bleed across archetypes.
+  - Intercept INT 15h AX=5307h CX=0003h (APM Power Off) and INT 15h AH=41h (PnP Power Off) in `src/ints/bios.cpp` to signal Kiosk shutdown.
   - Implement I/O Port `0x8900` ("Shutdown") write-handler fallback for XT/8088 machines without APM.
 
 ---
@@ -170,21 +172,20 @@ flowchart TD
 
 **Goal:** Launch specific games/applications inside real MS-DOS and Windows 9x machines without mutating or corrupting the guest hard disk.
 
-- **3.1 The 48-Byte `KIOSKEXT.COM` Payload:**
+- **3.1 The 57-Byte `KIOSKEXT.COM` Payload:**
   - Assemble and test `kioskext.asm`:
     - Stage 1: Commit FAT caches via INT 21h AH=0Dh.
     - Stage 2: APM 1.1/1.2 power-off via INT 15h AX=5307h.
     - Stage 3: Port 0x8900 Bochs power-off fallback.
   - Embed payload as a `constexpr` byte array in `src/kiosk/machine/kioskext_bin.h`.
-- **3.2 Ephemeral RAM Dispatch Drive (`src/kiosk/machine/boot_injector.cpp`):**
-  - Synthesize a 1.44MB FAT12 disk image in memory (`/run/user/1000/kiosk/dispatch.img` or Windows `%TEMP%`).
-  - Populate with target-specific `KIOSKGO.BAT`, `KIOSKEXT.COM`, and `KIOSKWIN.EXE`.
-  - Mount dispatch image on Primary IDE Slave (`-ide 1s`), guaranteeing deterministic assignment as drive `D:`.
-- **3.3 One-Time Guest Boot Hooking:**
-  - Provide helper to append `IF EXIST D:\KIOSKGO.BAT CALL D:\KIOSKGO.BAT` to guest `C:\AUTOEXEC.BAT`.
-  - For Windows 3.1 / 95 / 98 targets:
-    - Pre-patch `SYSTEM.INI` `[boot] shell=D:\KIOSKWIN.EXE`.
-    - Provide `KIOSKWIN.EXE` (small Win32 stub) that restores `SYSTEM.INI`, spawns target application, tracks process exit, and triggers `ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCE, 0)`.
+- **3.2 Ephemeral FAT12 Dispatch Floppy (`src/kiosk/machine/boot_injector.cpp`):**
+  - Synthesize a 1.44MB FAT12 floppy image in memory (`/run/user/1000/kiosk/dispatch.img` or Windows `%TEMP%`).
+  - Populate with target-specific `KIOSKGO.BAT` and `KIOSKEXT.COM` (or an idle dispatch floppy with `KIOSKEXT.COM` only during Machine-Only boots so BIOS `INT 11h` reports 2 floppy drives and suppresses phantom-drive `B:` prompts).
+  - Mount dispatch image on Floppy Drive `B:` (`IMGMOUNT 1 "<path>" -t floppy -fs none`), guaranteeing deterministic assignment as `B:` while preserving `C:` (Primary HDD) and `D:` (Primary CD-ROM).
+- **3.3 One-Time Guest Boot Hooking & Zero-Mutation Windows Launch:**
+  - Provide helper to append `IF EXIST B:\KIOSKGO.BAT CALL B:\KIOSKGO.BAT` to guest `C:\AUTOEXEC.BAT`.
+  - For Windows 3.1x (`WIN3X_PROGMAN_HOOK`) and Windows 95/98 (`WIN9X_RUNONCE_HOOK`) targets:
+    - Invoke `C:\WINDOWS\WIN.COM <guest_executable> [guest_arguments]` directly inside `B:\KIOSKGO.BAT` (followed by `B:\KIOSKEXT.COM` when `return_on_exit == true`), leaving `C:\WINDOWS\SYSTEM.INI` 100% untouched on the guest hard drive.
 
 ---
 
@@ -275,26 +276,26 @@ flowchart TD
 
 ---
 
-### Phase 8: Minimal Linux Appliance Host & Storage Bridge
+### Phase 8: Dual-Target Host Layer (Buildroot Old-Laptop Appliance & Desktop Big-Picture)
 
-**Goal:** Build the appliance firmware layer and OS storage integration for kiosk hardware.
+**Goal:** Support both lightweight Buildroot appliance deployment on repurposed old laptops (`BR2_PACKAGE_DOSBOX_X_KIOSK=y`) and on-demand "Big Picture" desktop execution on Windows and Linux.
 
-- **8.1 Linux Appliance Base Configuration:**
-  - Minimal root filesystem configuration (Arch Linux / Buildroot).
+- **8.1 Buildroot Old-Laptop Appliance Configuration:**
+  - Minimal Buildroot root filesystem (`< 15 MB` host OS RAM footprint, no X11/Wayland/PulseAudio/`udisks2`/`polkit` bloat).
   - Kernel boot flags for silent, splash-free instant boot (`quiet loglevel=0 consoleblank=0`).
-  - SDL2 KMSDRM video output configuration (direct DRM master without X11 or Wayland overhead).
-  - Low-latency audio configuration (PipeWire / ALSA dmix).
-- **8.2 systemd Watchdog Service (`dosbox-kiosk.service`):**
-  - Auto-start service on `tty1` with `Restart=always` and `WatchdogSec=10s`.
-  - Implement `sd_notify("WATCHDOG=1")` heartbeat ping in DOSBox-X `GFX_Events()`.
+  - SDL2 `KMSDRM` video output configuration (direct DRM master) and direct `ALSA` audio (`SDL_AUDIODRIVER=alsa`, using DOSBox-X's internal FluidSynth mixer).
+- **8.2 Appliance Supervision & Desktop Exit Flow:**
+  - Primary Buildroot profile: BusyBox `/etc/inittab` (`tty1::respawn:/usr/bin/kiosk-session-wrapper.sh`).
+  - Optional `systemd` profile (`dosbox-kiosk.service`) with `#ifdef HAVE_LIBSYSTEMD` `sd_notify("WATCHDOG=1")` support.
+  - Desktop "Big Picture" profile: Clean exit to host desktop OS when the user selects **"Exit Kiosk"** (`RequestApplianceExit()`).
 - **8.3 OverlayFS Root & Storage Hierarchy:**
-  - Read-only SquashFS root with tmpfs upper overlay.
-  - Dedicated writable data partition at `/var/lib/dosbox-kiosk/` mounted with `commit=5,data=ordered`.
-- **8.4 udisks2 DBus Storage Bridge (`src/kiosk/ingest/usb_bridge.cpp`):**
-  - Subscribe to System DBus via `sd-bus` for `org.freedesktop.UDisks2.Block` events.
-  - Auto-mount USB drives to `/run/media/kiosk/<LABEL>` with `flush` mount option.
-  - Scan inserted drives for disk images and archives, populating `media_pool (is_removable_usb = 1)` and triggering UI toast notifications.
-  - Safely close handles and purge temporary media records on drive removal.
+  - Appliance mode: Read-only SquashFS root with tmpfs upper overlay and dedicated writable Ext4 data partition at `/var/lib/dosbox-kiosk/` (`commit=5,data=ordered`).
+  - Desktop mode: Self-contained user data folder (`%LOCALAPPDATA%\DOSBox-Kiosk` on Windows or `~/.local/share/dosbox-kiosk` on Linux).
+- **8.4 Cross-Platform Removable Storage Bridge (`src/kiosk/ingest/usb_bridge.cpp`):**
+  - **Buildroot Appliance:** Lightweight `/etc/udev/rules.d/99-kiosk-automount.rules` (`eudev`/`mdev`) auto-mounts USB drives to `/run/media/kiosk/<LABEL>` with `rw,flush`, watched via non-blocking Linux `inotify`.
+  - **Desktop Linux:** Watches `/run/media/$USER/<LABEL>` / `/media/$USER/<LABEL>` via `inotify`.
+  - **Windows ("Big Picture" Mode):** Detects removable USB and optical drives via Win32 `GetLogicalDrives()` + `GetDriveTypeW()` (`DRIVE_REMOVABLE` / `DRIVE_CDROM`).
+  - Scans inserted drives for disk images and archives, populating `media_pool (is_removable_usb = 1)` and triggering UI toast notifications; safely closes handles and purges temporary records on drive removal.
 
 ---
 
@@ -318,7 +319,7 @@ flowchart TD
 | Architectural Decision | Rationale | Alternatives Considered & Rejected |
 | :--- | :--- | :--- |
 | **In-Process Fork vs External Wrapper** | Allows zero-context-switch runtime overlays, direct FDC/ATAPI hardware manipulation, and guest APM power-off trapping without losing video context. | External frontend (LaunchBox/EmulationStation): loses all control when booting raw hard disk images. |
-| **RAM Dispatch Drive (D:) for Injections** | Eliminates risk of corrupting guest `C:\AUTOEXEC.BAT` or Windows registry if power is lost mid-game. | Direct mutation of `hdd_c.img` files: causes persistent corruption if emulation aborts prematurely. |
+| **Ephemeral Dispatch Floppy (B: via IMGMOUNT 1) for Injections** | Installs a one-time idempotent `B:\KIOSKGO.BAT` hook in `C:\AUTOEXEC.BAT` via `BootInjector::EnsureOneTimeAutoexecHook()`, eliminating per-launch HDD edits and avoiding guest `C:\AUTOEXEC.BAT` or `SYSTEM.INI` corruption if power is lost mid-game while keeping `C:` (HDD) and `D:` (CD-ROM) drive letters unshifted. | Per-launch mutation of `hdd_c.img` files (causes persistent corruption if emulation aborts) or Primary IDE Slave `-ide 1s` (shifts CD-ROM from `D:` to `E:`). |
 | **Dear ImGui over Custom GUI Toolkit** | Provides immediate-mode rendering over OpenGL with full controller/keyboard navigation and existing shading pipeline integration. | DOSBox-X built-in `gui_tk`: lacks modern animation, touch/gamepad navigation, and skeuomorphic rendering capabilities. |
 | **Direct KMSDRM over Wayland/X11** | Achieves lowest possible input latency, sub-3-second boot times, and eliminates window focus stealing. | Cage / Sway Wayland compositors: introduces unnecessary composition overhead and dependency bloat. |
 | **Userspace FAT Crawler over Loopback Mount** | Runs without root privileges, operates in-process across all host OS platforms, and guarantees zero write hazards. | `mount -o loop` / `libguestfs`: requires sudo permissions, kernel module support, and has host platform dependencies. |

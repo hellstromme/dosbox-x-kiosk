@@ -1839,6 +1839,9 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
 
 #if C_OPENGL
     if (sdl_opengl.context) {
+#if defined(C_KIOSK)
+        KioskUI::GetInstance().ShutdownBackend();
+#endif
         SDL_GL_DeleteContext(sdl_opengl.context);
         sdl_opengl.context = nullptr;
     }
@@ -1904,6 +1907,11 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
             sdl_opengl.context = SDL_GL_CreateContext(sdl.window);
             if (sdl_opengl.context == NULL) LOG_MSG("WARNING: SDL2 unable to create GL context");
             if (SDL_GL_MakeCurrent(sdl.window, sdl_opengl.context) != 0) LOG_MSG("WARNING: SDL2 unable to make current GL context");
+#if defined(C_KIOSK)
+        if (KioskManager::GetInstance().IsKioskModeActive() && sdl_opengl.context != NULL) {
+            KioskUI::GetInstance().InitializeBackend(sdl.window, sdl_opengl.context);
+        }
+#endif
         }
 #endif
 
@@ -1961,6 +1969,11 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
         sdl_opengl.context = SDL_GL_CreateContext(sdl.window);
         if (sdl_opengl.context == NULL) LOG_MSG("WARNING: SDL2 unable to create GL context");
         if (SDL_GL_MakeCurrent(sdl.window, sdl_opengl.context) != 0) LOG_MSG("WARNING: SDL2 unable to make current GL context");
+#if defined(C_KIOSK)
+        if (KioskManager::GetInstance().IsKioskModeActive() && sdl_opengl.context != NULL) {
+            KioskUI::GetInstance().InitializeBackend(sdl.window, sdl_opengl.context);
+        }
+#endif
     }
 #endif
 
@@ -4101,6 +4114,11 @@ static void GUI_StartUp() {
 		LOG_MSG("The default output for the video system: %s", output.c_str());
 	}
 
+#if defined(C_KIOSK) && defined(C_OPENGL)
+    if (KioskManager::GetInstance().IsKioskModeActive() && !control->opt_nogui && output.compare(0, 6, "opengl") != 0) {
+        output = "openglnb";
+    }
+#endif
     const std::string emulation = section->Get_string("mouse_emulation");
     if (emulation == "always")
         sdl.mouse.emulation = MOUSE_EMULATION_ALWAYS;
@@ -4816,7 +4834,7 @@ static void HandleMouseMotion(SDL_MouseMotionEvent * motion) {
             GFX_OpenGLRedrawScreen();
             GFX_DrawSDLMenu(mainMenu,mainMenu.display_list);
 # if defined(C_SDL2)
-            SDL_GL_SwapWindow(sdl.window);
+        SDL_GL_SwapWindow(sdl.window);
 # else
             SDL_GL_SwapBuffers();
 # endif
@@ -4836,7 +4854,7 @@ static void HandleMouseMotion(SDL_MouseMotionEvent * motion) {
             GFX_OpenGLRedrawScreen();
             GFX_DrawSDLMenu(mainMenu,mainMenu.display_list);
 # if defined(C_SDL2)
-            SDL_GL_SwapWindow(sdl.window);
+        SDL_GL_SwapWindow(sdl.window);
 # else
             SDL_GL_SwapBuffers();
 # endif
@@ -5068,7 +5086,7 @@ static void HandleMouseButton(SDL_MouseButtonEvent * button, SDL_MouseMotionEven
                     }
 
 # if defined(C_SDL2)
-                    SDL_GL_SwapWindow(sdl.window);
+                SDL_GL_SwapWindow(sdl.window);
 # else
                     SDL_GL_SwapBuffers();
 # endif
@@ -5394,7 +5412,7 @@ static void HandleMouseButton(SDL_MouseButtonEvent * button, SDL_MouseMotionEven
 #if C_OPENGL
                         if (OpenGL_using()) {
 # if defined(C_SDL2)
-                            SDL_GL_SwapWindow(sdl.window);
+                        SDL_GL_SwapWindow(sdl.window);
 # else
                             SDL_GL_SwapBuffers();
 # endif
@@ -5445,7 +5463,7 @@ static void HandleMouseButton(SDL_MouseButtonEvent * button, SDL_MouseMotionEven
                     GFX_DrawSDLMenu(mainMenu,mainMenu.display_list);
 
 # if defined(C_SDL2)
-                    SDL_GL_SwapWindow(sdl.window);
+                SDL_GL_SwapWindow(sdl.window);
 # else
                     SDL_GL_SwapBuffers();
 # endif
@@ -5910,6 +5928,83 @@ bool gfx_in_mapper = false;
 #define DB_POLLSKIP 1
 #endif
 
+#if defined(C_KIOSK) && defined(C_SDL2)
+extern SDL_AudioDeviceID SDL2_AudioDevice;
+void CPU_Reset_AutoAdjust(void);
+
+static void Kiosk_RunRuntimeOverlayLoop(void) {
+    KioskManager::GetInstance().EnterRuntimeOverlay();
+    MAPPER_ReleaseAllKeys();
+
+    if (SDL2_AudioDevice != 0) {
+        SDL_PauseAudioDevice(SDL2_AudioDevice, 1);
+    }
+
+    const bool was_mouse_locked = sdl.mouse.locked;
+    if (was_mouse_locked) {
+        SDL_SetRelativeMouseMode(SDL_FALSE);
+    }
+    SDL_ShowCursor(SDL_ENABLE);
+
+    SDL_Event overlay_event;
+    while (KioskManager::GetInstance().GetState() == KioskState::STATE_RUNTIME_OVERLAY &&
+           !KioskManager::GetInstance().IsExitRequested()) {
+        while (SDL_PollEvent(&overlay_event)) {
+            if (overlay_event.type == SDL_QUIT) {
+                KioskManager::GetInstance().RequestApplianceExit();
+                break;
+            }
+            if (overlay_event.type == SDL_WINDOWEVENT &&
+                overlay_event.window.event == SDL_WINDOWEVENT_RESIZED) {
+                GFX_HandleVideoResize(overlay_event.window.data1, overlay_event.window.data2);
+                continue;
+            }
+
+            const Uint8* kb_state = SDL_GetKeyboardState(NULL);
+            const bool is_toggle_or_esc =
+                (overlay_event.type == SDL_KEYDOWN && overlay_event.key.keysym.sym == SDLK_ESCAPE) ||
+                (overlay_event.type == SDL_KEYDOWN && overlay_event.key.keysym.sym == SDLK_d &&
+                 kb_state != NULL && kb_state[SDL_SCANCODE_F12]) ||
+                (overlay_event.type == SDL_CONTROLLERBUTTONDOWN &&
+                 overlay_event.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE);
+            if (is_toggle_or_esc) {
+                KioskManager::GetInstance().ResumeEmulation();
+                break;
+            }
+
+            KioskUI::GetInstance().ProcessEvent(&overlay_event);
+        }
+
+#if C_OPENGL
+        if (OpenGL_using() && sdl.window != NULL) {
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            GFX_OpenGLRedrawScreen();
+            SDL_GL_SwapBuffers();
+        }
+#endif
+        SDL_Delay(16);
+    }
+
+    if (SDL2_AudioDevice != 0) {
+        SDL_PauseAudioDevice(SDL2_AudioDevice, 0);
+    }
+
+    MAPPER_ReleaseAllKeys();
+    CPU_Reset_AutoAdjust();
+
+    if (KioskManager::GetInstance().IsExitRequested() ||
+        KioskManager::GetInstance().GetState() != KioskState::STATE_EMULATION_RUNNING) {
+        throw KioskGuestShutdownException(KioskShutdownReason::USER_OVERLAY_ABORT);
+    }
+
+    if (was_mouse_locked) {
+        SDL_SetRelativeMouseMode(SDL_TRUE);
+        SDL_ShowCursor(SDL_DISABLE);
+    }
+}
+#endif
+
 void GFX_Events() {
     CheckMapperKeyboardLayout();
 #if defined(C_SDL2) /* SDL 2.x---------------------------------- */
@@ -5970,6 +6065,37 @@ void GFX_Events() {
         else {
             eatRestoredWindow = false;
         }
+#if defined(C_KIOSK)
+        if (KioskManager::GetInstance().IsKioskModeActive()) {
+            const Uint8* kb_state = SDL_GetKeyboardState(NULL);
+            const bool is_overlay_hotkey =
+                (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_d && kb_state != NULL && kb_state[SDL_SCANCODE_F12]) ||
+                (event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE);
+            KioskState kstate = KioskManager::GetInstance().GetState();
+            if (is_overlay_hotkey) {
+                if (kstate == KioskState::STATE_EMULATION_RUNNING) {
+                    Kiosk_RunRuntimeOverlayLoop();
+                    continue;
+                } else if (kstate == KioskState::STATE_RUNTIME_OVERLAY) {
+                    KioskManager::GetInstance().ResumeEmulation();
+                    continue;
+                }
+            }
+            if (kstate == KioskState::STATE_COUNTDOWN_IDLE) {
+                KioskManager::GetInstance().HandlePreBootInputEvent(event);
+            } else if (kstate == KioskState::STATE_SHELL_INTERACTIVE || kstate == KioskState::STATE_RUNTIME_OVERLAY) {
+                if (event.type == SDL_QUIT) {
+                    KioskManager::GetInstance().RequestApplianceExit();
+                    continue;
+                }
+                KioskUI::GetInstance().ProcessEvent(&event);
+                if (event.type != SDL_WINDOWEVENT) {
+                    continue;
+                }
+            }
+        }
+#endif
+
 #endif
 
         switch (event.type) {
@@ -7474,6 +7600,7 @@ bool DOSBOX_parse_argv() {
             fprintf(stderr,"  -kiosk-mode                             Launch DOSBox-X directly into Kiosk Mode\n");
             fprintf(stderr,"  -kiosk-db <path>                        Specify database path for Kiosk catalog\n");
             fprintf(stderr,"  -kiosk-conf <path>                      Specify base configuration file for Kiosk\n");
+            fprintf(stderr,"  -kiosk-skip-countdown                   Skip boot countdown and enter Kiosk Shell directly\n");
 #endif
 #if C_DEBUG
             fprintf(stderr,"  -helpdebug                              Show debug-related options\n");
@@ -7544,6 +7671,9 @@ bool DOSBOX_parse_argv() {
 #if defined(C_KIOSK)
         else if (optname == "kiosk-mode") {
             control->opt_kiosk_mode = true;
+        }
+        else if (optname == "kiosk-skip-countdown") {
+            control->opt_kiosk_skip_countdown = true;
         }
         else if (optname == "kiosk-db") {
             if (!control->cmdline->NextOptArgv(control->opt_kiosk_db)) return false;
@@ -8473,6 +8603,11 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
     CommandLine com_line(argc,argv);
     Config myconf(&com_line);
     bool saved_opt_test;
+#if defined(C_KIOSK)
+    bool kiosk_reexec_to_shell = false;
+    std::string saved_kiosk_db;
+    std::string saved_kiosk_conf;
+#endif
 #if defined(C_DOSBOX_AGENT)
     dosbox_agent::AgentServer agent_server;
 #endif
@@ -8538,7 +8673,10 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
     if (control->opt_kiosk_mode) {
         fprintf(stderr, "KIOSK: DOSBox-X Kiosk Edition flag detected.\n");
         LOG_MSG("KIOSK: DOSBox-X Kiosk Edition flag detected.");
+        saved_kiosk_db = control->opt_kiosk_db;
+        saved_kiosk_conf = control->opt_kiosk_conf;
         KioskManager::GetInstance().SetKioskModeActive(true);
+        KioskManager::GetInstance().SetSkipCountdown(control->opt_kiosk_skip_countdown);
         if (KioskManager::GetInstance().Initialize(control->opt_kiosk_db, control->opt_kiosk_conf)) {
             fprintf(stderr, "KIOSK: Subsystems initialized successfully (SQLite %s, ImGui %s).\n",
                     KioskDatabase::GetInstance().GetSQLiteVersion().c_str(),
@@ -9809,6 +9947,22 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 
             menu.showrt = control->opt_showrt||sdl_sec->Get_bool("showdetails");
             menu.hidecycles = (control->opt_showcycles||sdl_sec->Get_bool("showdetails") ? false : true);
+#if defined(C_KIOSK)
+            if (KioskManager::GetInstance().IsKioskModeActive()) {
+                KioskManager::GetInstance().RunMainLoop();
+                if (KioskManager::GetInstance().IsExitRequested()) {
+                    GFX_ShutDown();
+                    KioskManager::GetInstance().Shutdown();
+                    SDL_Quit();
+                    control = NULL;
+                    return 0;
+                }
+                const std::string session_conf = KioskManager::GetInstance().GetSessionConfPath();
+                if (!session_conf.empty()) {
+                    control->ParseConfigFile(session_conf.c_str());
+                }
+            }
+#endif
         }
 
         /* Start up main machine */
@@ -10341,6 +10495,22 @@ fresh_boot:
             if (control->opt_break_start) DEBUG_EnableDebugger();
 #endif
             DOSBOX_RunMachine();
+#if defined(C_KIOSK)
+            if (KioskManager::GetInstance().IsKioskModeActive() && !control->opt_exit && !control->opt_test && !KioskManager::GetInstance().IsExitRequested()) {
+                KioskManager::GetInstance().OnGuestShutdown(KioskShutdownReason::SHELL_EXIT);
+                kiosk_reexec_to_shell = true;
+            }
+#endif
+#if defined(C_KIOSK)
+        } catch (const KioskGuestShutdownException& e) {
+            LOG_MSG("KIOSK: Caught guest shutdown exception (%s)", KioskShutdownReasonToString(e.reason));
+            KioskManager::GetInstance().OnGuestShutdown(e.reason);
+            run_machine = false;
+            dos_kernel_shutdown = !dos_kernel_disabled;
+            if (!control->opt_exit && !control->opt_test && !KioskManager::GetInstance().IsExitRequested()) {
+                kiosk_reexec_to_shell = true;
+            }
+#endif
         } catch (int x) {
             if (x == 2) { /* booting a guest OS. "boot" has already done the work to load the image and setup CPU registers */
                 LOG(LOG_MISC,LOG_DEBUG)("Emulation threw a signal to boot guest OS");
@@ -10826,6 +10996,11 @@ fresh_boot:
          * freed resources. */
         control = NULL; /* any deref past this point and you deserve to segfault */
     }
+#if defined(C_KIOSK)
+    if (kiosk_reexec_to_shell) {
+        if (!KioskManager::RelaunchIntoInteractiveShell(argv[0], saved_kiosk_db, saved_kiosk_conf)) return 1;
+    }
+#endif
     return saved_opt_test&&testerr?1:0;
 }
 
@@ -10923,7 +11098,26 @@ bool MOUSE_IsLocked()
 
 #if defined(C_SDL2) && defined(C_OPENGL)/*HACK*/
 void SDL_GL_SwapBuffers(void) {
+#if defined(C_KIOSK)
+    if (KioskManager::GetInstance().IsKioskModeActive()) {
+        KioskUI::GetInstance().CompositeActiveState();
+    }
+#endif
     SDL_GL_SwapWindow(sdl.window);
+}
+#endif
+
+#if defined(C_KIOSK)
+void Kiosk_PumpPreBootFrame(void) {
+    GFX_Events();
+#if defined(C_SDL2) && defined(C_OPENGL)
+    if (OpenGL_using() && sdl.window != NULL) {
+        glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        SDL_GL_SwapBuffers();
+    }
+#endif
+    SDL_Delay(16);
 }
 #endif
 
