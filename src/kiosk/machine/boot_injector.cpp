@@ -185,14 +185,24 @@ bool BootInjector::EnsureOneTimeAutoexecHook(const std::string& hdd_or_autoexec_
     if (file_size >= 512) {
         f.seekg(0, std::ios::beg);
         f.read(reinterpret_cast<char*>(sec0), 512);
+        if (!f.good() || f.gcount() != 512) {
+            return false;
+        }
     }
 
-    // Mode 1: Plain text host-side AUTOEXEC.BAT file (< 64 KB or no 0x55AA boot signature)
-    if (file_size < 65536 || sec0[510] != 0x55 || sec0[511] != 0xAA) {
+    // Mode 1: Plain text host-side AUTOEXEC.BAT file (< 64 KB without a 0x55AA boot signature)
+    if (file_size < 65536 && (file_size < 512 || sec0[510] != 0x55 || sec0[511] != 0xAA)) {
+        f.clear();
         f.seekg(0, std::ios::beg);
+        if (!f.good()) {
+            return false;
+        }
         std::string content(static_cast<size_t>(file_size), '\0');
         if (file_size > 0) {
             f.read(&content[0], static_cast<std::streamsize>(file_size));
+            if (f.fail() || static_cast<uint64_t>(f.gcount()) != file_size) {
+                return false;
+            }
         }
         f.close();
 
@@ -205,6 +215,10 @@ bool BootInjector::EnsureOneTimeAutoexecHook(const std::string& hdd_or_autoexec_
         if (!out.is_open()) return false;
         out.write(updated.data(), static_cast<std::streamsize>(updated.size()));
         return out.good();
+    }
+
+    if (file_size < 512 || sec0[510] != 0x55 || sec0[511] != 0xAA) {
+        return false;
     }
 
     // Mode 2: Raw Disk Image (FAT12 / FAT16 / FAT32, Superfloppy or MBR-partitioned)
@@ -439,15 +453,22 @@ bool BootInjector::EnsureOneTimeAutoexecHook(const std::string& hdd_or_autoexec_
             if (bytes_left > 0) {
                 uint64_t c_off = cluster_to_offset(cur);
                 size_t to_read = (bytes_left < clus_bytes) ? bytes_left : clus_bytes;
-                if (c_off + to_read <= file_size) {
-                    std::vector<char> chunk(to_read, 0);
-                    f.seekg(static_cast<std::streamoff>(c_off), std::ios::beg);
-                    f.read(chunk.data(), static_cast<std::streamsize>(to_read));
-                    existing_str.append(chunk.data(), to_read);
+                if (c_off + to_read > file_size) {
+                    return false;
                 }
+                std::vector<char> chunk(to_read, 0);
+                f.seekg(static_cast<std::streamoff>(c_off), std::ios::beg);
+                f.read(chunk.data(), static_cast<std::streamsize>(to_read));
+                if (f.fail() || static_cast<size_t>(f.gcount()) != to_read) {
+                    return false;
+                }
+                existing_str.append(chunk.data(), to_read);
                 bytes_left -= to_read;
             }
             cur = get_fat_entry(cur);
+        }
+        if (bytes_left != 0 || existing_str.size() != existing_file_size) {
+            return false;
         }
 
         if (HasAutoexecHook(existing_str)) {

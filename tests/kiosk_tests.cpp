@@ -1049,4 +1049,134 @@ TEST(KioskBootInjectorTest, RealHddMachineOnlyBootMountsIdleDispatchVolumeWithou
     mgr.Shutdown();
 }
 
+TEST(KioskBootInjectorTest, RealHddCarouselLaunchReservesDriveBForDispatchAndQueuesDriveBCaddyOnDriveA) {
+    auto& db = KioskDatabase::GetInstance();
+    auto& mgr = KioskManager::GetInstance();
+    mgr.SetKioskModeActive(true);
+    ASSERT_TRUE(mgr.Initialize(":memory:", ""));
+
+    MachineRecord m;
+    m.id = "mach-b-conflict";
+    m.display_name = "486 Dual Floppy Rig";
+    m.archetype_id = KioskArchetypes::DX2_486;
+    m.archetype_tier = 4;
+    m.boot_mode = "REAL_HDD_BOOT";
+    m.primary_hdd_path = "C:\\kiosk\\hdd_conflict.img";
+    m.primary_hdd_chs = "520,16,63";
+    ASSERT_TRUE(db.InsertMachine(m));
+
+    MediaPoolRecord flop_a;
+    flop_a.id = "media-flop-a";
+    flop_a.file_path = "C:\\kiosk\\disk1.img";
+    flop_a.media_type = "FLOPPY_35_1440K";
+    flop_a.physical_style = "BEIGE_35";
+    flop_a.label_font_style = "PRINTED_OEM";
+    flop_a.label_title = "Disk 1";
+    ASSERT_TRUE(db.InsertMedia(flop_a));
+
+    MediaPoolRecord flop_b;
+    flop_b.id = "media-flop-b";
+    flop_b.file_path = "C:\\kiosk\\disk2_on_b.img";
+    flop_b.media_type = "FLOPPY_35_1440K";
+    flop_b.physical_style = "BLUE_35";
+    flop_b.label_font_style = "PRINTED_OEM";
+    flop_b.label_title = "Disk 2";
+    ASSERT_TRUE(db.InsertMedia(flop_b));
+
+    CatalogItemRecord item;
+    item.id = "item-b-conflict";
+    item.machine_id = "mach-b-conflict";
+    item.item_type = "GAME";
+    item.title = "Ultima VII";
+    item.guest_working_dir = "\\ULTIMA7";
+    item.guest_executable = "ULTIMA7.COM";
+    item.launch_mechanism = "DOS_AUTOEXEC_INJECT";
+    item.return_on_exit = true;
+    ASSERT_TRUE(db.InsertCatalogItem(item));
+
+    CaddyBindingRecord bind_a;
+    bind_a.catalog_item_id = "item-b-conflict";
+    bind_a.media_id = "media-flop-a";
+    bind_a.target_drive = "A";
+    bind_a.slot_order = 1;
+    ASSERT_TRUE(db.AddCaddyBinding(bind_a));
+
+    CaddyBindingRecord bind_b;
+    bind_b.catalog_item_id = "item-b-conflict";
+    bind_b.media_id = "media-flop-b";
+    bind_b.target_drive = "B";
+    bind_b.slot_order = 1;
+    ASSERT_TRUE(db.AddCaddyBinding(bind_b));
+
+    // Mode A (Carousel Item Launch): B: must mount kiosk_dispatch.img, while B: caddy floppy is queued on A: (IMGMOUNT 0)
+    ASSERT_TRUE(mgr.RequestLaunchItem("item-b-conflict"));
+    std::string conf_item;
+    ASSERT_TRUE(mgr.SynthesizeAndPrepareLaunch(conf_item));
+
+    EXPECT_NE(std::string::npos, conf_item.find("IMGMOUNT 0 \"C:\\kiosk\\disk1.img\" \"C:\\kiosk\\disk2_on_b.img\" -t floppy -fs none"));
+    EXPECT_NE(std::string::npos, conf_item.find("IMGMOUNT 1 \""));
+    EXPECT_NE(std::string::npos, conf_item.find("kiosk_dispatch.img\" -t floppy -fs none"));
+    EXPECT_EQ(std::string::npos, conf_item.find("IMGMOUNT 1 \"C:\\kiosk\\disk2_on_b.img\""));
+
+    // Mode B (Machine-Only Boot): An explicit machine B: caddy binding is honored on IMGMOUNT 1
+    CaddyBindingRecord mach_bind_b;
+    mach_bind_b.machine_id = "mach-b-conflict";
+    mach_bind_b.media_id = "media-flop-b";
+    mach_bind_b.target_drive = "B";
+    mach_bind_b.slot_order = 1;
+    ASSERT_TRUE(db.AddCaddyBinding(mach_bind_b));
+
+    ASSERT_TRUE(mgr.RequestLaunchMachine("mach-b-conflict"));
+    std::string conf_mach;
+    ASSERT_TRUE(mgr.SynthesizeAndPrepareLaunch(conf_mach));
+
+    EXPECT_NE(std::string::npos, conf_mach.find("IMGMOUNT 1 \"C:\\kiosk\\disk2_on_b.img\" -t floppy -fs none"));
+
+    mgr.Shutdown();
+}
+
+TEST(KioskBootInjectorTest, HostAutoexecPreservesExistingCommandsAndRejectsCorruptImage) {
+    // 1. Verify plain-text host AUTOEXEC.BAT preserves all existing lines and appends hook
+    const std::string host_autoexec_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".host_autoexec.bat";
+    const std::string initial_commands = "@ECHO OFF\r\nSET BLASTER=A220 I7 D1 H5 T6\r\nLH C:\\DOS\\SMARTDRV.EXE\r\n";
+    {
+        std::ofstream out(host_autoexec_path.c_str(), std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open());
+        out.write(initial_commands.data(), static_cast<std::streamsize>(initial_commands.size()));
+    }
+
+    EXPECT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(host_autoexec_path));
+
+    std::string result_content;
+    {
+        std::ifstream in(host_autoexec_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(in.is_open());
+        result_content.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+    EXPECT_EQ(0U, result_content.find(initial_commands));
+    EXPECT_NE(std::string::npos, result_content.find("IF EXIST B:\\KIOSKGO.BAT CALL B:\\KIOSKGO.BAT\r\n"));
+    EXPECT_EQ(std::string::npos, result_content.find('\0'));
+    std::remove(host_autoexec_path.c_str());
+
+    // 2. Verify a >= 64 KB file without a 0x55AA signature is rejected without modifying its contents
+    const std::string bad_img_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".bad_raw.img";
+    std::vector<char> raw_pattern(70000, 'X');
+    {
+        std::ofstream out(bad_img_path.c_str(), std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open());
+        out.write(raw_pattern.data(), static_cast<std::streamsize>(raw_pattern.size()));
+    }
+
+    EXPECT_FALSE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(bad_img_path));
+
+    std::vector<char> after_bytes;
+    {
+        std::ifstream in(bad_img_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(in.is_open());
+        after_bytes.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+    EXPECT_EQ(raw_pattern, after_bytes);
+    std::remove(bad_img_path.c_str());
+}
+
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

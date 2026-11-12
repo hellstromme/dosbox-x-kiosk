@@ -328,8 +328,8 @@ Update [`ConfigSynthesizer`](file:///C:/code/dosbox-x-kiosk/src/kiosk/machine/co
   ) const;
   ```
 - In `SynthesizeAutoexec()` when `machine.boot_mode == "REAL_HDD_BOOT"`:
-  - If `!dispatch_image_path.empty()` and no explicit `B` drive caddy binding overrides slot 1:
-    - Mount the ephemeral dispatch floppy exclusively on Floppy Drive `B:` (`IMGMOUNT 1`) while user multi-floppy sets remain on Floppy Drive `A:` (`IMGMOUNT 0`), ensuring `F12+D` floppy swaps never eject `B:\KIOSKGO.BAT` / `B:\KIOSKEXT.COM`:
+  - **Mode A (`item != nullptr && !dispatch_image_path.empty()`)**: Unconditionally reserve Floppy Drive `B:` (`IMGMOUNT 1`) for `dispatch_image_path` so `B:\KIOSKGO.BAT` and `B:\KIOSKEXT.COM` are never shadowed at boot or ejected mid-session. Coalesce any `B:` caddy bindings into Floppy Drive `A:` (`IMGMOUNT 0`) after existing `A:` bindings so multi-disk sets remain accessible via the `F12+D` swap queue.
+  - **Mode B (`item == nullptr`, Machine-Only Boot)**: If `!dispatch_image_path.empty()` and no explicit `B` drive caddy binding overrides slot 1, mount the idle dispatch floppy on `IMGMOUNT 1`:
       ```ini
       # Ephemeral Kiosk Dispatch Floppy (Drive B:)
       IMGMOUNT 1 "<dispatch_image_path>" -t floppy -fs none

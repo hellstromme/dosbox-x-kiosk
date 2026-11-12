@@ -90,16 +90,30 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
         }
 
         // 2. Mount floppy caddy (Drive A = 0, Drive B = 1)
-        if (drive_bindings.find("A") != drive_bindings.end() && !drive_bindings["A"].empty()) {
+        // In Mode A (Carousel Item launch on REAL_HDD_BOOT), Drive B: (IMGMOUNT 1) is
+        // reserved exclusively for the ephemeral dispatch floppy (B:\KIOSKGO.BAT + B:\KIOSKEXT.COM)
+        // so the boot hook and post-exit return script are never shadowed or ejected.
+        // Any B: caddy bindings are coalesced into Drive A:'s multi-disk swap queue.
+        const bool reserve_b_for_dispatch = (item != nullptr && !dispatch_image_path.empty());
+        std::vector<CaddyBindingRecord> floppy_a_queue = drive_bindings["A"];
+        if (reserve_b_for_dispatch && !drive_bindings["B"].empty()) {
+            const auto& b_list = drive_bindings["B"];
+            floppy_a_queue.insert(floppy_a_queue.end(), b_list.begin(), b_list.end());
+        }
+
+        if (!floppy_a_queue.empty()) {
             ss << "# Floppy Drive A: Session Caddy\n"
                << "IMGMOUNT 0";
-            for (const auto& b : drive_bindings["A"]) {
+            for (const auto& b : floppy_a_queue) {
                 ss << " \"" << b.resolved_file_path << "\"";
             }
             ss << " -t floppy -fs none\n";
         }
 
-        if (drive_bindings.find("B") != drive_bindings.end() && !drive_bindings["B"].empty()) {
+        if (reserve_b_for_dispatch) {
+            ss << "# Ephemeral Kiosk Dispatch Floppy (Drive B:)\n"
+               << "IMGMOUNT 1 \"" << dispatch_image_path << "\" -t floppy -fs none\n";
+        } else if (drive_bindings.find("B") != drive_bindings.end() && !drive_bindings["B"].empty()) {
             ss << "# Floppy Drive B: Session Caddy\n"
                << "IMGMOUNT 1";
             for (const auto& b : drive_bindings["B"]) {
