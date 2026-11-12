@@ -173,10 +173,13 @@ void KioskUI::RenderInteractiveShellPlaceholder() {
             m_cache_loaded = true;
         }
         const std::vector<CatalogItemRecord>& items = m_cached_items;
+        const std::vector<MachineRecord>& profiles = m_cached_machines;
+        const float list_height = (!items.empty() && !profiles.empty()) ? 100.0f : 180.0f;
+
         if (!items.empty()) {
             ImGui::Spacing();
             ImGui::Text("Catalog Titles:");
-            ImGui::BeginChild("##CatalogItemsList", ImVec2(0.0f, 180.0f), true);
+            ImGui::BeginChild("##CatalogItemsList", ImVec2(0.0f, list_height), true);
             for (size_t i = 0; i < items.size(); ++i) {
                 const CatalogItemRecord& item = items[i];
                 std::string label = item.title + "##item_" + item.id;
@@ -185,21 +188,20 @@ void KioskUI::RenderInteractiveShellPlaceholder() {
                 }
             }
             ImGui::EndChild();
-        } else {
-            const std::vector<MachineRecord>& profiles = m_cached_machines;
-            if (!profiles.empty()) {
-                ImGui::Spacing();
-                ImGui::Text("Machine Profiles:");
-                ImGui::BeginChild("##MachineProfilesList", ImVec2(0.0f, 180.0f), true);
-                for (size_t i = 0; i < profiles.size(); ++i) {
-                    const MachineRecord& prof = profiles[i];
-                    std::string label = prof.display_name + "##prof_" + prof.id;
-                    if (ImGui::Button(label.c_str(), ImVec2(-1.0f, 28.0f))) {
-                        KioskManager::GetInstance().RequestLaunchMachine(prof.id);
-                    }
+        }
+
+        if (!profiles.empty()) {
+            ImGui::Spacing();
+            ImGui::Text("Machine Profiles:");
+            ImGui::BeginChild("##MachineProfilesList", ImVec2(0.0f, list_height), true);
+            for (size_t i = 0; i < profiles.size(); ++i) {
+                const MachineRecord& prof = profiles[i];
+                std::string label = prof.display_name + "##prof_" + prof.id;
+                if (ImGui::Button(label.c_str(), ImVec2(-1.0f, 28.0f))) {
+                    KioskManager::GetInstance().RequestLaunchMachine(prof.id);
                 }
-                ImGui::EndChild();
             }
+            ImGui::EndChild();
         }
     }
     ImGui::End();

@@ -138,10 +138,21 @@ void KioskManager::RunMainLoop() {
         if (cur == KioskState::STATE_COUNTDOWN_IDLE || cur == KioskState::STATE_SHELL_INTERACTIVE) {
             TriggerDefaultBootAction();
         }
+        if (m_state.load() == KioskState::STATE_SYNTHESIZE_LAUNCH && !m_exit_requested.load()) {
+            std::string conf;
+            SynthesizeAndPrepareLaunch(conf);
+        }
     } else {
         uint32_t last_ticks = SDL_GetTicks();
         while (!m_exit_requested.load()) {
             KioskState cur = m_state.load();
+            if (cur == KioskState::STATE_SYNTHESIZE_LAUNCH) {
+                std::string conf;
+                if (SynthesizeAndPrepareLaunch(conf)) {
+                    break;
+                }
+                cur = m_state.load();
+            }
             if (cur != KioskState::STATE_COUNTDOWN_IDLE && cur != KioskState::STATE_SHELL_INTERACTIVE) {
                 break;
             }
@@ -158,11 +169,6 @@ void KioskManager::RunMainLoop() {
 
             Kiosk_PumpPreBootFrame();
         }
-    }
-
-    if (m_state.load() == KioskState::STATE_SYNTHESIZE_LAUNCH && !m_exit_requested.load()) {
-        std::string conf;
-        SynthesizeAndPrepareLaunch(conf);
     }
 }
 
@@ -503,8 +509,12 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
     // Phase 3: Ephemeral Boot Injector for REAL_HDD_BOOT machines
     std::string active_dispatch_path;
     if (machine.boot_mode == "REAL_HDD_BOOT") {
-        if (!machine.primary_hdd_path.empty()) {
-            BootInjector::GetInstance().EnsureOneTimeAutoexecHook(machine.primary_hdd_path);
+        if (machine.primary_hdd_path.empty() ||
+            !BootInjector::GetInstance().EnsureOneTimeAutoexecHook(machine.primary_hdd_path)) {
+            LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to prepare primary HDD image '%s'.",
+                    machine.primary_hdd_path.c_str());
+            m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+            return false;
         }
 
         std::string dispatch_path = BootInjector::GetInstance().GetDefaultDispatchImagePath();
@@ -516,14 +526,22 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
                             b.resolved_file_path.c_str());
                 }
             }
-            if (BootInjector::GetInstance().BuildDispatchVolume(dispatch_path, machine, *item_ptr)) {
-                active_dispatch_path = dispatch_path;
+            if (!BootInjector::GetInstance().BuildDispatchVolume(dispatch_path, machine, *item_ptr)) {
+                LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to build dispatch volume '%s'.",
+                        dispatch_path.c_str());
+                m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+                return false;
             }
+            active_dispatch_path = dispatch_path;
         } else {
             // Mode B: Machine-Only Boot -> Idle floppy (KIOSKEXT.COM only, no KIOSKGO.BAT)
-            if (BootInjector::GetInstance().BuildIdleDispatchVolume(dispatch_path)) {
-                active_dispatch_path = dispatch_path;
+            if (!BootInjector::GetInstance().BuildIdleDispatchVolume(dispatch_path)) {
+                LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to build idle dispatch volume '%s'.",
+                        dispatch_path.c_str());
+                m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+                return false;
             }
+            active_dispatch_path = dispatch_path;
         }
     }
 
@@ -534,9 +552,16 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
     std::string session_conf_path;
     if (!ctx.machine_id.empty() || !ctx.catalog_item_id.empty() || !base_conf.empty()) {
         std::string candidate_conf = GetDefaultSessionConfPath();
-        if (ConfigSynthesizer::GetInstance().WriteConfigFile(out_synthesized_conf, candidate_conf)) {
-            session_conf_path = candidate_conf;
+        if (!ConfigSynthesizer::GetInstance().WriteConfigFile(out_synthesized_conf, candidate_conf)) {
+            LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to write session configuration to '%s'.",
+                    candidate_conf.c_str());
+            if (!active_dispatch_path.empty()) {
+                BootInjector::GetInstance().CleanupDispatchVolume(active_dispatch_path);
+            }
+            m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+            return false;
         }
+        session_conf_path = candidate_conf;
     }
 
     {
@@ -593,6 +618,10 @@ void KioskManager::AbortSessionToShell() {
 }
 
 void KioskManager::OnGuestShutdown(KioskShutdownReason reason) {
+    if (m_state.load() == KioskState::STATE_SHELL_INTERACTIVE &&
+        m_last_shutdown_reason.load() == reason) {
+        return; // Already processed this session shutdown (e.g., via AbortSessionToShell)
+    }
     LOG_MSG("KIOSK: Guest session ended (Reason: %s). Returning to STATE_SHELL_INTERACTIVE.",
             KioskShutdownReasonToString(reason));
     m_last_shutdown_reason.store(reason);
@@ -656,9 +685,20 @@ bool KioskManager::RelaunchIntoInteractiveShell(
     CloseHandle(pi.hThread);
     return true;
 #else
-    if (!argv0 || !*argv0) return false;
+    std::string resolved_exe;
+    char self_buf[4096];
+    ssize_t self_len = ::readlink("/proc/self/exe", self_buf, sizeof(self_buf) - 1);
+    if (self_len > 0) {
+        self_buf[self_len] = '\0';
+        resolved_exe.assign(self_buf, static_cast<size_t>(self_len));
+    } else if (argv0 && *argv0) {
+        resolved_exe = argv0;
+    } else {
+        return false;
+    }
+
     std::vector<std::string> arg_strings;
-    arg_strings.push_back(argv0);
+    arg_strings.push_back(resolved_exe);
     arg_strings.push_back("-kiosk-mode");
     arg_strings.push_back("-kiosk-skip-countdown");
     if (!db_path.empty()) {
@@ -676,7 +716,10 @@ bool KioskManager::RelaunchIntoInteractiveShell(
     }
     argv_ptrs.push_back(nullptr);
 
-    execv(argv0, argv_ptrs.data());
+    execv(resolved_exe.c_str(), argv_ptrs.data());
+    if (argv0 && *argv0) {
+        execvp(argv0, argv_ptrs.data());
+    }
     return false;
 #endif
 }

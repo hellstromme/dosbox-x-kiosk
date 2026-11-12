@@ -22,7 +22,7 @@ Phase 2 transformed the Kiosk subsystem from a passive database/synthesizer libr
 ## 2. What Worked Well
 
 ### 2.1 Upfront Ambiguity Resolution (`ask_question`)
-- During initial planning, a discrepancy was identified between the Master Roadmap ([`DOSBox-X_Kiosk_Implementation_Plan.md`](./DOSBox-X_Kiosk_Implementation_Plan.md), which defines Phase 2 as *Kiosk Lifecycle State Machine & Emulation Trapping*) and the Phase 1 notes in [`continue.md`](./continue.md) (which referred to Phase 2 as *ImGui Carousel Frontend & Skeuomorphic Caddy UI*).
+- During initial planning, a discrepancy was identified between the Master Roadmap ([`DOSBox-X_Kiosk_Implementation_Plan.md`](./DOSBox-X_Kiosk_Implementation_Plan.md), which defines Phase 2 as *Kiosk Lifecycle State Machine & Emulation Trapping*) and the historical Phase 1 notes in `continue.md` (which referred to Phase 2 as *ImGui Carousel Frontend & Skeuomorphic Caddy UI*).
 - Asking a targeted multiple-choice question before writing the plan prevented building the wrong milestone and aligned the implementation with the architectural dependency order (the Carousel UI in Phase 3 depends on the Phase 2 state machine and guest return trap).
 
 ### 2.2 Zero-Warning Builds & Automated Google Test Execution
@@ -139,4 +139,4 @@ Document the exact functions and line neighborhoods in `src/gui/sdlmain.cpp` and
 
 1. Clean up the 5 extra `SDL_GL_SwapWindow(sdl.window)` replacements in [`src/gui/sdlmain.cpp`](../../src/gui/sdlmain.cpp) and the `if (false) {}` scaffolding in [`src/ints/bios.cpp`](../../src/ints/bios.cpp) and [`src/gui/sdlmain.cpp`](../../src/gui/sdlmain.cpp).
 2. Commit Phase 2 on `feature/kiosk-phase-2` using Conventional Commits (`feat(kiosk): implement phase 2 lifecycle state machine and guest shutdown traps`).
-3. Proceed to **Phase 3: ImGui Carousel Frontend & Skeuomorphic Caddy UI**.
+3. Proceed to **Phase 3: Non-Destructive Ephemeral Boot Injector & Guest Return Mechanism** ([`Phase3_Ephemeral_Boot_Injector_Plan.md`](./Phase3_Ephemeral_Boot_Injector_Plan.md)).

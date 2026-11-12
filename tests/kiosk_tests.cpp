@@ -618,6 +618,10 @@ TEST_F(KioskLifecycleTest, RuntimeOverlayStateTransitions) {
     EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, mgr.GetState());
     EXPECT_EQ(KioskShutdownReason::USER_OVERLAY_ABORT, mgr.GetLastShutdownReason());
     EXPECT_EQ(1, mgr.GetCompletedSessionCount());
+
+    // Subsequent OnGuestShutdown(USER_OVERLAY_ABORT) from the SDL exception catch handler is a no-op
+    mgr.OnGuestShutdown(KioskShutdownReason::USER_OVERLAY_ABORT);
+    EXPECT_EQ(1, mgr.GetCompletedSessionCount());
 }
 
 TEST_F(KioskLifecycleTest, Port8900ShutdownSequenceAndGuestTrap) {
@@ -1010,13 +1014,23 @@ TEST(KioskBootInjectorTest, RealHddMachineOnlyBootMountsIdleDispatchVolumeWithou
     mgr.SetKioskModeActive(true);
     ASSERT_TRUE(mgr.Initialize(":memory:", ""));
 
+    // Create a valid temporary FAT12 HDD image for Machine-Only boot
+    std::vector<DispatchFileEntry> hdd_files;
+    std::vector<uint8_t> hdd_img;
+    ASSERT_TRUE(BootInjector::GetInstance().BuildFat12ImageInMemory(hdd_files, hdd_img));
+    const std::string temp_hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".mode_b_hdd.img";
+    {
+        std::ofstream ofs(temp_hdd.c_str(), std::ios::binary | std::ios::trunc);
+        ofs.write(reinterpret_cast<const char*>(hdd_img.data()), static_cast<std::streamsize>(hdd_img.size()));
+    }
+
     MachineRecord m;
     m.id = "mach-mode-b";
     m.display_name = "Pure DOS 6.22 Workstation";
     m.archetype_id = KioskArchetypes::DX_386;
     m.archetype_tier = 3;
     m.boot_mode = "REAL_HDD_BOOT";
-    m.primary_hdd_path = "C:\\kiosk\\dos622_c.img";
+    m.primary_hdd_path = temp_hdd;
     m.primary_hdd_chs = "520,16,63";
     ASSERT_TRUE(db.InsertMachine(m));
 
@@ -1046,7 +1060,23 @@ TEST(KioskBootInjectorTest, RealHddMachineOnlyBootMountsIdleDispatchVolumeWithou
     std::vector<uint8_t> bat_bytes;
     EXPECT_FALSE(BootInjector::GetInstance().ReadFileFromFat12Image(image_bytes, "KIOSKGO.BAT", bat_bytes));
 
+    // Verify missing primary_hdd_path fails SynthesizeAndPrepareLaunch and recovers to STATE_SHELL_INTERACTIVE
+    MachineRecord m_missing;
+    m_missing.id = "mach-missing-hdd";
+    m_missing.display_name = "Missing HDD Rig";
+    m_missing.archetype_id = KioskArchetypes::DX_386;
+    m_missing.archetype_tier = 3;
+    m_missing.boot_mode = "REAL_HDD_BOOT";
+    m_missing.primary_hdd_path = "C:\\kiosk\\nonexistent_hdd_image_12345.img";
+    ASSERT_TRUE(db.InsertMachine(m_missing));
+
+    ASSERT_TRUE(mgr.RequestLaunchMachine("mach-missing-hdd"));
+    std::string conf_failed;
+    EXPECT_FALSE(mgr.SynthesizeAndPrepareLaunch(conf_failed));
+    EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, mgr.GetState());
+
     mgr.Shutdown();
+    std::remove(temp_hdd.c_str());
 }
 
 TEST(KioskBootInjectorTest, RealHddCarouselLaunchReservesDriveBForDispatchAndQueuesDriveBCaddyOnDriveA) {
@@ -1055,13 +1085,22 @@ TEST(KioskBootInjectorTest, RealHddCarouselLaunchReservesDriveBForDispatchAndQue
     mgr.SetKioskModeActive(true);
     ASSERT_TRUE(mgr.Initialize(":memory:", ""));
 
+    std::vector<DispatchFileEntry> hdd_files;
+    std::vector<uint8_t> hdd_img;
+    ASSERT_TRUE(BootInjector::GetInstance().BuildFat12ImageInMemory(hdd_files, hdd_img));
+    const std::string temp_hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".conflict_hdd.img";
+    {
+        std::ofstream ofs(temp_hdd.c_str(), std::ios::binary | std::ios::trunc);
+        ofs.write(reinterpret_cast<const char*>(hdd_img.data()), static_cast<std::streamsize>(hdd_img.size()));
+    }
+
     MachineRecord m;
     m.id = "mach-b-conflict";
     m.display_name = "486 Dual Floppy Rig";
     m.archetype_id = KioskArchetypes::DX2_486;
     m.archetype_tier = 4;
     m.boot_mode = "REAL_HDD_BOOT";
-    m.primary_hdd_path = "C:\\kiosk\\hdd_conflict.img";
+    m.primary_hdd_path = temp_hdd;
     m.primary_hdd_chs = "520,16,63";
     ASSERT_TRUE(db.InsertMachine(m));
 
@@ -1133,6 +1172,7 @@ TEST(KioskBootInjectorTest, RealHddCarouselLaunchReservesDriveBForDispatchAndQue
     EXPECT_NE(std::string::npos, conf_mach.find("IMGMOUNT 1 \"C:\\kiosk\\disk2_on_b.img\" -t floppy -fs none"));
 
     mgr.Shutdown();
+    std::remove(temp_hdd.c_str());
 }
 
 TEST(KioskBootInjectorTest, HostAutoexecPreservesExistingCommandsAndRejectsCorruptImage) {
@@ -1158,9 +1198,18 @@ TEST(KioskBootInjectorTest, HostAutoexecPreservesExistingCommandsAndRejectsCorru
     EXPECT_EQ(std::string::npos, result_content.find('\0'));
     std::remove(host_autoexec_path.c_str());
 
-    // 2. Verify a >= 64 KB file without a 0x55AA signature is rejected without modifying its contents
+    // 2. Verify hook is inserted BEFORE a trailing WIN / C:\WINDOWS\WIN.COM startup line
+    const std::string win_autoexec = "@ECHO OFF\r\nPATH C:\\WINDOWS;C:\\DOS\r\nC:\\WINDOWS\\WIN.COM\r\n";
+    const std::string injected_win = BootInjector::InjectAutoexecHookToString(win_autoexec);
+    size_t hook_pos = injected_win.find("IF EXIST B:\\KIOSKGO.BAT CALL B:\\KIOSKGO.BAT");
+    size_t win_pos = injected_win.find("C:\\WINDOWS\\WIN.COM");
+    ASSERT_NE(std::string::npos, hook_pos);
+    ASSERT_NE(std::string::npos, win_pos);
+    EXPECT_LT(hook_pos, win_pos);
+
+    // 3. Verify a small (< 64 KB) or large (>= 64 KB) .img file without a 0x55AA signature is rejected untouched
     const std::string bad_img_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".bad_raw.img";
-    std::vector<char> raw_pattern(70000, 'X');
+    std::vector<char> raw_pattern(4096, 'X');
     {
         std::ofstream out(bad_img_path.c_str(), std::ios::binary | std::ios::trunc);
         ASSERT_TRUE(out.is_open());

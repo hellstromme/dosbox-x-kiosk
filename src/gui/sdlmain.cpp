@@ -10998,7 +10998,7 @@ fresh_boot:
     }
 #if defined(C_KIOSK)
     if (kiosk_reexec_to_shell) {
-        KioskManager::RelaunchIntoInteractiveShell(argv[0], saved_kiosk_db, saved_kiosk_conf);
+        if (!KioskManager::RelaunchIntoInteractiveShell(argv[0], saved_kiosk_db, saved_kiosk_conf)) return 1;
     }
 #endif
     return saved_opt_test&&testerr?1:0;

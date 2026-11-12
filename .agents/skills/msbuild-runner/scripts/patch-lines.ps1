@@ -35,7 +35,7 @@ if (-not (Test-Path $FilePath -PathType Leaf)) {
 $resolvedPath = (Resolve-Path $FilePath).Path
 $rawBytes = [System.IO.File]::ReadAllBytes($resolvedPath)
 $hasUtf8Bom = ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF)
-$encoding = [System.Text.UTF8Encoding]::new($hasUtf8Bom)
+$encoding = [System.Text.UTF8Encoding]::new($hasUtf8Bom, $true)
 $rawText = $encoding.GetString($rawBytes)
 if ($hasUtf8Bom -and $rawText.Length -gt 0 -and [int]$rawText[0] -eq 0xFEFF) {
     $rawText = $rawText.Substring(1)
@@ -93,6 +93,9 @@ $rangeText = $rangeLines -join "`n"
 
 if ($ReplaceEntireRange) {
     $updatedRangeText = $normReplacement
+    if ($updatedRangeText.EndsWith("`n")) {
+        $updatedRangeText = $updatedRangeText.Substring(0, $updatedRangeText.Length - 1)
+    }
 } else {
     if ([string]::IsNullOrEmpty($normTarget)) {
         Write-Error "[patch-lines] Either -Target/-TargetFile or -ReplaceEntireRange must be specified."

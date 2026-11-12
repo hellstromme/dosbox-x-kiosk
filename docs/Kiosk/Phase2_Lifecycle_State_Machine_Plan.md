@@ -6,15 +6,15 @@
 **Document Status:** Detailed Phase Execution Plan  
 **Date:** October 31, 2026  
 **Reference Documents:**
-- [`docs/Kiosk/DOSBox-X_Kiosk_Implementation_Plan.md`](file:///C:/code/dosbox-x-kiosk/docs/Kiosk/DOSBox-X_Kiosk_Implementation_Plan.md#L151-L166)
-- [`docs/Kiosk/DOSBox-X Kiosk Launcher Design.md`](file:///C:/code/dosbox-x-kiosk/docs/Kiosk/DOSBox-X%20Kiosk%20Launcher%20Design.md#L72-L84)
-- [`docs/Kiosk/Phase1_Retrospective.md`](file:///C:/code/dosbox-x-kiosk/docs/Kiosk/Phase1_Retrospective.md)
+- [`docs/Kiosk/DOSBox-X_Kiosk_Implementation_Plan.md`](./DOSBox-X_Kiosk_Implementation_Plan.md#L151-L166)
+- [`docs/Kiosk/DOSBox-X Kiosk Launcher Design.md`](./DOSBox-X%20Kiosk%20Launcher%20Design.md#L72-L84)
+- [`docs/Kiosk/Phase1_Retrospective.md`](./Phase1_Retrospective.md)
 
 ---
 
 ## 1. Objective & Scope of Phase 2
 
-Phase 2 transforms the skeleton [`KioskManager`](file:///C:/code/dosbox-x-kiosk/src/kiosk/kiosk_main.h#L9-L37) created in Phase 0 and the SQLite/Archetype/Synthesizer engine from Phase 1 into a functioning **6-state in-process lifecycle controller** with **non-terminating guest emulation trapping**.
+Phase 2 transforms the skeleton [`KioskManager`](../../src/kiosk/kiosk_main.h#L9-L37) created in Phase 0 and the SQLite/Archetype/Synthesizer engine from Phase 1 into a functioning **6-state in-process lifecycle controller** with **non-terminating guest emulation trapping**.
 
 In upstream DOSBox-X, hardware subsystems (`Init_RAM`, `VGA_Init`, `VOODOO_Init`, `SBLASTER_Init`, `IDE_Init`, `DOS_Init`, `AUTOEXEC_Init`, `VM_PowerOn`) are initialized **once** per process before `fresh_boot:`, and when a guest OS powers off via APM (`INT 15h AX=5307h CX=0003h`), ISA PnP (`INT 15h AH=41h`), or exits the integrated DOS shell, the emulator throws `int(0)` or `int(1)`, tears down SDL, and terminates the host OS process. In Kiosk mode, DOSBox-X uses a **Hybrid Lifecycle Architecture (Option 3)**:
 1. Boot into the Kiosk state machine (`STATE_KIOSK_BOOT` &rarr; `STATE_COUNTDOWN_IDLE`, or directly to `STATE_SHELL_INTERACTIVE` when `--kiosk-skip-countdown` is passed after a session).
@@ -86,7 +86,7 @@ sequenceDiagram
 
 ### Step 2.1: Core Kiosk Types & Shutdown Exception (`src/kiosk/kiosk_types.h`)
 
-Add structured shutdown reason enums and `KioskGuestShutdownException` to [`src/kiosk/kiosk_types.h`](file:///C:/code/dosbox-x-kiosk/src/kiosk/kiosk_types.h):
+Add structured shutdown reason enums and `KioskGuestShutdownException` to [`src/kiosk/kiosk_types.h`](../../src/kiosk/kiosk_types.h):
 
 ```cpp
 enum class KioskShutdownReason {
@@ -109,7 +109,7 @@ struct KioskGuestShutdownException {
 
 ### Step 2.2: Kiosk Lifecycle State Machine (`src/kiosk/kiosk_main.h` & `src/kiosk/kiosk_main.cpp`)
 
-Expand [`KioskManager`](file:///C:/code/dosbox-x-kiosk/src/kiosk/kiosk_main.h#L9-L37) from a Phase 0 stub into the complete 6-state controller:
+Expand [`KioskManager`](../../src/kiosk/kiosk_main.h#L9-L37) from a Phase 0 stub into the complete 6-state controller:
 
 - **Configuration & Watchdog Accessors**:
   - `float GetWatchdogRemainingSec() const`
@@ -138,7 +138,7 @@ Expand [`KioskManager`](file:///C:/code/dosbox-x-kiosk/src/kiosk/kiosk_main.h#L9
 
 #### Implementation Details (`src/kiosk/kiosk_main.cpp`)
 - **`Initialize(db_path, base_conf)`**:
-  - Opens [`KioskDatabase`](file:///C:/code/dosbox-x-kiosk/src/kiosk/kiosk_db.h) (with `:memory:` fallback), loads `KioskConfigRecord` via `GetConfig(m_config)`, initializes `m_watchdog_timer = static_cast<float>(m_config.boot_timeout_sec)`, and initializes [`KioskUI::InitializeContext()`](file:///C:/code/dosbox-x-kiosk/src/kiosk/ui/kiosk_ui.cpp#L21-L34).
+  - Opens [`KioskDatabase`](../../src/kiosk/kiosk_db.h) (with `:memory:` fallback), loads `KioskConfigRecord` via `GetConfig(m_config)`, initializes `m_watchdog_timer = static_cast<float>(m_config.boot_timeout_sec)`, and initializes [`KioskUI::InitializeContext()`](../../src/kiosk/ui/kiosk_ui.cpp#L21-L34).
   - Transitions from `STATE_KIOSK_BOOT` to `STATE_COUNTDOWN_IDLE` (if `m_config.boot_timeout_sec > 0`) or directly calls `TriggerDefaultBootAction()` (`STATE_SYNTHESIZE_LAUNCH`) if `boot_timeout_sec <= 0`.
 - **`IsIntentionalUserInput(const SDL_Event& ev)`**:
   - Returns `true` on `SDL_KEYDOWN`, `SDL_MOUSEBUTTONDOWN`, `SDL_MOUSEWHEEL`, `SDL_CONTROLLERBUTTONDOWN`, `SDL_JOYBUTTONDOWN`.
@@ -166,7 +166,7 @@ Expand [`KioskManager`](file:///C:/code/dosbox-x-kiosk/src/kiosk/kiosk_main.h#L9
 
 ### Step 2.3: BIOS APM & Port `0x8900` Shutdown Interception (`src/ints/bios.cpp`)
 
-Hook DOSBox-X's APM BIOS, ISA PnP BIOS, and Bochs Port `0x8900` in [`src/ints/bios.cpp`](file:///C:/code/dosbox-x-kiosk/src/ints/bios.cpp) to throw `KioskGuestShutdownException` when Kiosk mode is active:
+Hook DOSBox-X's APM BIOS, ISA PnP BIOS, and Bochs Port `0x8900` in [`src/ints/bios.cpp`](../../src/ints/bios.cpp) to throw `KioskGuestShutdownException` when Kiosk mode is active:
 
 1. **Include Kiosk Header**:
    ```cpp
@@ -175,7 +175,7 @@ Hook DOSBox-X's APM BIOS, ISA PnP BIOS, and Bochs Port `0x8900` in [`src/ints/bi
    #endif
    ```
 2. **Port `0x8900` ("Shutdown") Hardware Handler**:
-   - Follow the existing `BOCHS_PORT_E9` pattern ([`src/ints/bios.cpp:448-467`](file:///C:/code/dosbox-x-kiosk/src/ints/bios.cpp#L448-L467), [`1596`](file:///C:/code/dosbox-x-kiosk/src/ints/bios.cpp#L1596), [`10338-10350`](file:///C:/code/dosbox-x-kiosk/src/ints/bios.cpp#L10338-L10350), [`12838-12841`](file:///C:/code/dosbox-x-kiosk/src/ints/bios.cpp#L12838-L12841)):
+   - Follow the existing `BOCHS_PORT_E9` pattern ([`src/ints/bios.cpp:448-467`](../../src/ints/bios.cpp#L448-L467), [`1596`](../../src/ints/bios.cpp#L1596), [`10338-10350`](../../src/ints/bios.cpp#L10338-L10350), [`12838-12841`](../../src/ints/bios.cpp#L12838-L12841)):
    ```cpp
    #if defined(C_KIOSK)
    static IO_WriteHandleObject *BOCHS_PORT_8900 = NULL;
@@ -207,7 +207,7 @@ Hook DOSBox-X's APM BIOS, ISA PnP BIOS, and Bochs Port `0x8900` in [`src/ints/bi
    #endif
    ```
    - Install `BOCHS_PORT_8900` on port `0x8900` (`IO_MB`) in `BIOS` setup alongside `BOCHS_PORT_E9`, and free it in `~BIOS()`.
-3. **APM BIOS `INT 15h AX=5307h CX=0003h` Interception ([`src/ints/bios.cpp:7548`](file:///C:/code/dosbox-x-kiosk/src/ints/bios.cpp#L7548))**:
+3. **APM BIOS `INT 15h AX=5307h CX=0003h` Interception ([`src/ints/bios.cpp:7548`](../../src/ints/bios.cpp#L7548))**:
    ```cpp
    case 0x3: // power off
    #if defined(C_KIOSK)
@@ -218,7 +218,7 @@ Hook DOSBox-X's APM BIOS, ISA PnP BIOS, and Bochs Port `0x8900` in [`src/ints/bi
    #endif
        throw 0;
    ```
-4. **ISA PnP Power-Off Interception ([`src/ints/bios.cpp:2714`](file:///C:/code/dosbox-x-kiosk/src/ints/bios.cpp#L2714))**:
+4. **ISA PnP Power-Off Interception ([`src/ints/bios.cpp:2714`](../../src/ints/bios.cpp#L2714))**:
    ```cpp
    case 0x41:
        LOG_MSG("Plug & Play OS requested power off.\n");
@@ -243,17 +243,17 @@ Connect `KioskUI` and `KioskManager` to the SDL2/OpenGL window lifecycle and wra
      - `void RenderInteractiveShellPlaceholder()`
      - `void RenderRuntimeOverlayPlaceholder()`
      - `void CompositeActiveState()`: If `m_backend_initialized`, calls `NewFrame()`, dispatches to the active state renderer (`STATE_COUNTDOWN_IDLE`, `STATE_SHELL_INTERACTIVE`, or `STATE_RUNTIME_OVERLAY`), and calls `RenderFrame()`.
-2. **Deferred OpenGL Backend Initialization ([`src/gui/sdlmain.cpp:1904`](file:///C:/code/dosbox-x-kiosk/src/gui/sdlmain.cpp#L1904) & [`1961`](file:///C:/code/dosbox-x-kiosk/src/gui/sdlmain.cpp#L1961))**:
+2. **Deferred OpenGL Backend Initialization ([`src/gui/sdlmain.cpp:1904`](../../src/gui/sdlmain.cpp#L1904) & [`1961`](../../src/gui/sdlmain.cpp#L1961))**:
    - When `sdl_opengl.context` is created and made current in `GFX_SetSize()`, if `KioskManager::GetInstance().IsKioskModeActive() && !KioskUI::GetInstance().IsBackendInitialized()`, call `KioskUI::GetInstance().InitializeBackend(sdl.window, sdl_opengl.context)`.
-3. **Hotkey (`F12+D` / Guide Button) & Event Routing in `GFX_Events()` ([`src/gui/sdlmain.cpp:5962`](file:///C:/code/dosbox-x-kiosk/src/gui/sdlmain.cpp#L5962))**:
+3. **Hotkey (`F12+D` / Guide Button) & Event Routing in `GFX_Events()` ([`src/gui/sdlmain.cpp:5962`](../../src/gui/sdlmain.cpp#L5962))**:
    - When `KioskManager::GetInstance().IsKioskModeActive()`:
      - Handle `SDL_QUIT` by calling `KioskManager::GetInstance().RequestApplianceExit()`.
      - Detect `F12+D` (`event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_d && SDL_GetKeyboardState(NULL)[SDL_SCANCODE_F12]`) or `SDL_CONTROLLERBUTTONDOWN` (`SDL_CONTROLLER_BUTTON_GUIDE`):
        - Toggle between `STATE_EMULATION_RUNNING` (`EnterRuntimeOverlay()`) and `STATE_RUNTIME_OVERLAY` (`ResumeEmulation()`).
      - When in `STATE_COUNTDOWN_IDLE`, `STATE_SHELL_INTERACTIVE`, or `STATE_RUNTIME_OVERLAY`, pass events to `KioskUI::GetInstance().ProcessEvent(&event)` and `KioskManager::GetInstance().HandlePreBootInputEvent(event)`.
-4. **OpenGL Frame Compositing ([`src/gui/sdlmain.cpp:10925`](file:///C:/code/dosbox-x-kiosk/src/gui/sdlmain.cpp#L10925))**:
+4. **OpenGL Frame Compositing ([`src/gui/sdlmain.cpp:10925`](../../src/gui/sdlmain.cpp#L10925))**:
    - In `SDL_GL_SwapBuffers()`, prior to `SDL_GL_SwapWindow(sdl.window)`, if `KioskManager::GetInstance().IsKioskModeActive()`, invoke `KioskUI::GetInstance().CompositeActiveState()` when the state is `STATE_COUNTDOWN_IDLE`, `STATE_SHELL_INTERACTIVE`, or `STATE_RUNTIME_OVERLAY`.
-5. **Pre-Hardware-Init Shell Hook, Emulation Trap Block & Post-Session Re-Exec ([`src/gui/sdlmain.cpp`](file:///C:/code/dosbox-x-kiosk/src/gui/sdlmain.cpp))**:
+5. **Pre-Hardware-Init Shell Hook, Emulation Trap Block & Post-Session Re-Exec ([`src/gui/sdlmain.cpp`](../../src/gui/sdlmain.cpp))**:
    - **Pre-Boot Shell Hook (Before Line 9855 Hardware Init)**: Right after `GUI_StartUp()` creates the SDL2/OpenGL window, run `KioskManager::GetInstance().RunMainLoop()` to pump `STATE_COUNTDOWN_IDLE` / `STATE_SHELL_INTERACTIVE` until a launch target is selected (`STATE_SYNTHESIZE_LAUNCH`), then call `control->ParseConfigFile(session_conf_path)` so all 45+ hardware subsystems initialize in-process with zero display flicker.
    - **Emulation Trap & Clean Re-Exec (Lines 10339–10830)**:
      - Catch `const KioskGuestShutdownException& e`:
@@ -265,7 +265,7 @@ Connect `KioskUI` and `KioskManager` to the SDL2/OpenGL window lifecycle and wra
 
 ### Step 2.5: Unit Tests (`tests/kiosk_tests.cpp`)
 
-Extend [`tests/kiosk_tests.cpp`](file:///C:/code/dosbox-x-kiosk/tests/kiosk_tests.cpp) with 6 new Google Test suites verifying Phase 2 functionality in isolation:
+Extend [`tests/kiosk_tests.cpp`](../../tests/kiosk_tests.cpp) with 6 new Google Test suites verifying Phase 2 functionality in isolation:
 
 1. `KioskLifecycleTest.BootToCountdownAndWatchdogExpiration`:
    - Configures `boot_timeout_sec = 15`, initializes `KioskManager`, verifies initial state is `STATE_COUNTDOWN_IDLE` with `15.0f` remaining.

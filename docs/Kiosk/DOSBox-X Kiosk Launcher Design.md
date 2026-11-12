@@ -1656,7 +1656,7 @@ When the user selects a new floppy or CD in the overlay and presses Enter:
 | **Kiosk Lifecycle & Watchdog** | src/kiosk/kiosk\_main.cpp | Manages the 6-state machine, 30s countdown watchdog, and intercepts guest APM/Port 0x8900 shutdown signals. |
 | **SQLite Catalog Layer** | src/kiosk/kiosk\_db.cpp | Thread-safe WAL queries against catalog.db for Machines, Games, Apps, Media Pool, and Session Caddies. |
 | **Hardware Archetype Engine** | src/kiosk/machine/archetypes.cpp | Synthesizes layered DOSBox-X .conf profiles (ARCH\_XT\_8088 through ARCH\_PENTIUM\_3DFX). |
-| **Ephemeral Boot Injector** | src/kiosk/machine/boot\_injector.cpp | Generates FAT12 B:\\ (kiosk\_dispatch.img) containing KIOSKGO.BAT, KIOSKWIN.EXE, and the 57-byte KIOSKEXT.COM. |
+| **Ephemeral Boot Injector** | src/kiosk/machine/boot\_injector.cpp | Generates FAT12 B:\\ (kiosk\_dispatch.img) containing KIOSKGO.BAT and the 57-byte KIOSKEXT.COM. |
 | **FAT12/16/32 Image Crawler** | src/kiosk/ingest/image\_crawler.cpp | Userspace read-only disk parser, .GRP/.LNK shortcut resolver, DOS stub-stripping fingerprinter, and NE/PE icon extractor. |
 | **GOG & Steam Ingest Engine** | src/kiosk/ingest/archive\_importer.cpp | Unpacks innoextract/.zip payloads, converts .gog/.inst to .bin/.cue, and maps vendor .conf files to Archetypes. |
 | **Skeuomorphic UI & Overlay** | src/kiosk/ui/view\_disk\_caddy.cpp | Renders procedural 5.25", 3.5", and CD-ROM media and executes safe DMA-paused hot-swaps via F12+D. |

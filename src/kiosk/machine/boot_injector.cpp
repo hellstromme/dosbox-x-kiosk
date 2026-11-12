@@ -14,6 +14,13 @@
 #include <fstream>
 #include <sstream>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 constexpr size_t FAT12_1440K_SECTORS = 2880;
@@ -126,6 +133,69 @@ std::string TrimWhitespace(const std::string& s) {
     return s.substr(start, end - start + 1);
 }
 
+bool HasBatchFileExtension(const std::string& path) {
+    if (path.size() < 4) return false;
+    std::string ext = ToUpperAscii(path.substr(path.size() - 4));
+    return ext == ".BAT";
+}
+
+bool IsWinStartupCommandLine(const std::string& raw_line) {
+    std::string s = TrimWhitespace(raw_line);
+    if (s.empty()) return false;
+    if (s[0] == '@') {
+        s = TrimWhitespace(s.substr(1));
+    }
+    if (s.empty()) return false;
+    if (s.size() >= 2 && s[0] == ':' && s[1] == ':') return false;
+
+    size_t tok_end = s.find_first_of(" \t/");
+    std::string first_tok = (tok_end == std::string::npos) ? s : s.substr(0, tok_end);
+    if (!first_tok.empty() && first_tok.front() == '"' && first_tok.back() == '"' && first_tok.size() >= 2) {
+        first_tok = first_tok.substr(1, first_tok.size() - 2);
+    }
+
+    std::string upper_tok = ToUpperAscii(first_tok);
+    if (upper_tok == "REM") return false;
+
+    size_t sep = upper_tok.find_last_of("\\/:");
+    std::string base_cmd = (sep == std::string::npos) ? upper_tok : upper_tok.substr(sep + 1);
+    return (base_cmd == "WIN" || base_cmd == "WIN.COM");
+}
+
+bool WriteBinaryFileExclusive(const std::string& path, const std::vector<uint8_t>& bytes) {
+    std::remove(path.c_str());
+#if !defined(_WIN32)
+    int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = ::open(path.c_str(), flags, 0600);
+    if (fd < 0) {
+        return false;
+    }
+    size_t total = 0;
+    while (total < bytes.size()) {
+        ssize_t n = ::write(fd, bytes.data() + total, bytes.size() - total);
+        if (n <= 0) {
+            ::close(fd);
+            std::remove(path.c_str());
+            return false;
+        }
+        total += static_cast<size_t>(n);
+    }
+    int rc = ::close(fd);
+    return (rc == 0);
+#else
+    std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc | std::ios::binary);
+    if (!out.is_open()) {
+        return false;
+    }
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    out.close();
+    return !out.fail();
+#endif
+}
+
 } // anonymous namespace
 
 BootInjector& BootInjector::GetInstance() {
@@ -160,6 +230,24 @@ std::string BootInjector::InjectAutoexecHookToString(const std::string& existing
         cleaned.pop_back();
     }
 
+    // If AUTOEXEC.BAT invokes WIN / WIN.COM at startup, insert the Kiosk dispatch hook
+    // immediately before that line so B:\KIOSKGO.BAT intercepts execution prior to booting
+    // the default Windows desktop.
+    size_t pos = 0;
+    while (pos < cleaned.size()) {
+        size_t line_end = cleaned.find('\n', pos);
+        size_t next_pos = (line_end == std::string::npos) ? cleaned.size() : (line_end + 1);
+        std::string line = cleaned.substr(pos, next_pos - pos);
+        if (IsWinStartupCommandLine(line)) {
+            std::string prefix = cleaned.substr(0, pos);
+            if (!prefix.empty() && prefix.back() != '\n') {
+                prefix += "\r\n";
+            }
+            return prefix + GetAutoexecHookBlock() + cleaned.substr(pos);
+        }
+        pos = next_pos;
+    }
+
     if (!cleaned.empty() && cleaned.back() != '\n') {
         cleaned += "\r\n";
     }
@@ -190,8 +278,9 @@ bool BootInjector::EnsureOneTimeAutoexecHook(const std::string& hdd_or_autoexec_
         }
     }
 
-    // Mode 1: Plain text host-side AUTOEXEC.BAT file (< 64 KB without a 0x55AA boot signature)
-    if (file_size < 65536 && (file_size < 512 || sec0[510] != 0x55 || sec0[511] != 0xAA)) {
+    // Mode 1: Plain text host-side AUTOEXEC.BAT file (requires explicit .BAT extension and < 64 KB without 0x55AA)
+    if (file_size < 65536 && HasBatchFileExtension(hdd_or_autoexec_path) &&
+        (file_size < 512 || sec0[510] != 0x55 || sec0[511] != 0xAA)) {
         f.clear();
         f.seekg(0, std::ios::beg);
         if (!f.good()) {
@@ -434,6 +523,11 @@ bool BootInjector::EnsureOneTimeAutoexecHook(const std::string& hdd_or_autoexec_
         }
     }
 
+    uint64_t part_end_offset = part_offset + static_cast<uint64_t>(tot_sec) * 512ULL;
+    if (part_end_offset > file_size) {
+        part_end_offset = file_size;
+    }
+
     std::string target_content;
     std::vector<uint32_t> chain;
 
@@ -449,11 +543,14 @@ bool BootInjector::EnsureOneTimeAutoexecHook(const std::string& hdd_or_autoexec_
         uint32_t cur = fst_clus;
         size_t bytes_left = existing_file_size;
         while (cur >= 2 && !is_eof_cluster(cur) && chain.size() < 65536) {
+            if (cur > count_of_clusters + 1U) {
+                return false;
+            }
             chain.push_back(cur);
             if (bytes_left > 0) {
                 uint64_t c_off = cluster_to_offset(cur);
                 size_t to_read = (bytes_left < clus_bytes) ? bytes_left : clus_bytes;
-                if (c_off + to_read > file_size) {
+                if (c_off + to_read > part_end_offset) {
                     return false;
                 }
                 std::vector<char> chunk(to_read, 0);
@@ -502,11 +599,21 @@ bool BootInjector::EnsureOneTimeAutoexecHook(const std::string& hdd_or_autoexec_
         chain.push_back(new_c);
     }
 
+    // Validate all clusters in chain and partition bounds before mutating disk image
+    for (size_t i = 0; i < chain.size(); ++i) {
+        if (chain[i] < 2U || chain[i] > count_of_clusters + 1U) {
+            return false;
+        }
+        uint64_t c_off = cluster_to_offset(chain[i]);
+        if (c_off + clus_bytes > part_end_offset) {
+            return false;
+        }
+    }
+
     // Write target_content across allocated cluster chain
     size_t written = 0;
     for (size_t i = 0; i < chain.size(); ++i) {
         uint64_t c_off = cluster_to_offset(chain[i]);
-        if (c_off + clus_bytes > file_size) return false;
         std::vector<uint8_t> c_buf(clus_bytes, 0);
         if (written < target_content.size()) {
             size_t chunk = target_content.size() - written;
@@ -791,14 +898,11 @@ bool BootInjector::BuildDispatchVolume(
         return false;
     }
 
-    std::ofstream out(output_image_path.c_str(), std::ios::out | std::ios::trunc | std::ios::binary);
-    if (!out.is_open()) {
+    if (!WriteBinaryFileExclusive(output_image_path, image_bytes)) {
         LOG_MSG("KIOSK: Failed to write dispatch floppy image to '%s'", output_image_path.c_str());
         return false;
     }
-    out.write(reinterpret_cast<const char*>(image_bytes.data()), static_cast<std::streamsize>(image_bytes.size()));
-    out.close();
-    return !out.fail();
+    return true;
 }
 
 bool BootInjector::BuildIdleDispatchVolume(
@@ -818,14 +922,11 @@ bool BootInjector::BuildIdleDispatchVolume(
         return false;
     }
 
-    std::ofstream out(output_image_path.c_str(), std::ios::out | std::ios::trunc | std::ios::binary);
-    if (!out.is_open()) {
+    if (!WriteBinaryFileExclusive(output_image_path, image_bytes)) {
         LOG_MSG("KIOSK: Failed to write idle dispatch floppy image to '%s'", output_image_path.c_str());
         return false;
     }
-    out.write(reinterpret_cast<const char*>(image_bytes.data()), static_cast<std::streamsize>(image_bytes.size()));
-    out.close();
-    return !out.fail();
+    return true;
 }
 
 std::string BootInjector::GetDefaultDispatchImagePath() const {
@@ -847,15 +948,32 @@ std::string BootInjector::GetDefaultDispatchImagePath() const {
     if (xdg_dir && *xdg_dir) {
         std::string path(xdg_dir);
         if (path.back() != '/') path += '/';
-        return path + "kiosk_dispatch.img";
+        std::ostringstream oss;
+        oss << path << "kiosk_dispatch_" << static_cast<unsigned long>(::getpid()) << ".img";
+        return oss.str();
     }
-    return "/tmp/kiosk_dispatch.img";
+    std::ostringstream dir_ss;
+    dir_ss << "/tmp/dosbox-kiosk-" << static_cast<unsigned long>(::geteuid())
+           << "-" << static_cast<unsigned long>(::getpid());
+    std::string priv_dir = dir_ss.str();
+    (void)::mkdir(priv_dir.c_str(), 0700);
+    return priv_dir + "/kiosk_dispatch.img";
 #endif
 }
 
 bool BootInjector::CleanupDispatchVolume(const std::string& image_path) const {
     if (image_path.empty()) return false;
-    return std::remove(image_path.c_str()) == 0;
+    bool removed = (std::remove(image_path.c_str()) == 0);
+#if !defined(_WIN32)
+    if (image_path.compare(0, 18, "/tmp/dosbox-kiosk-") == 0) {
+        size_t slash = image_path.find_last_of('/');
+        if (slash != std::string::npos && slash > 5) {
+            std::string parent_dir = image_path.substr(0, slash);
+            (void)::rmdir(parent_dir.c_str());
+        }
+    }
+#endif
+    return removed;
 }
 
 #endif // defined(C_KIOSK)

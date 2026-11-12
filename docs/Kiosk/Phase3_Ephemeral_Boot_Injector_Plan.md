@@ -6,9 +6,9 @@
 **Document Status:** Detailed Phase Execution Plan  
 **Date:** November 1, 2026  
 **Reference Documents:**
-- [`docs/Kiosk/DOSBox-X_Kiosk_Implementation_Plan.md`](file:///C:/code/dosbox-x-kiosk/docs/Kiosk/DOSBox-X_Kiosk_Implementation_Plan.md#L169-L188)
-- [`docs/Kiosk/DOSBox-X Kiosk Launcher Design.md`](file:///C:/code/dosbox-x-kiosk/docs/Kiosk/DOSBox-X%20Kiosk%20Launcher%20Design.md#L803-L1040)
-- [`docs/Kiosk/Phase2_Retrospective.md`](file:///C:/code/dosbox-x-kiosk/docs/Kiosk/Phase2_Retrospective.md)
+- [`docs/Kiosk/DOSBox-X_Kiosk_Implementation_Plan.md`](./DOSBox-X_Kiosk_Implementation_Plan.md#L169-L188)
+- [`docs/Kiosk/DOSBox-X Kiosk Launcher Design.md`](./DOSBox-X%20Kiosk%20Launcher%20Design.md#L803-L1040)
+- [`docs/Kiosk/Phase2_Retrospective.md`](./Phase2_Retrospective.md)
 
 ---
 
@@ -36,13 +36,13 @@ Phase 3 solves both problems by introducing a **One-Time Boot Hook + Ephemeral F
 
 > [!IMPORTANT]
 > **Assembly Offset Correction in `KIOSKEXT.COM` (`kioskext_bin.h`)**:
-> In the original design sketch ([`DOSBox-X Kiosk Launcher Design.md`](file:///C:/code/dosbox-x-kiosk/docs/Kiosk/DOSBox-X%20Kiosk%20Launcher%20Design.md#L987-L1011)), the `jc bochs_fallback` instruction used displacement `0x14` (`72 14`) and `mov si, shutdown_str` used `0x0128` (`BE 28 01`). However, the APM 1.1 negotiation + `5307h` power-off sequence between `0x010D` and `bochs_fallback` is **21 bytes (`0x15`)**, not 20 (`0x14`). With `72 14`, an 8088 XT (where `INT 15h AX=5301h` sets Carry) jumps into the middle of the `CD 15` instruction at `0x0121` instead of `mov dx, 0x8900` at `0x0122`.
+> In the original design sketch ([`DOSBox-X Kiosk Launcher Design.md`](./DOSBox-X%20Kiosk%20Launcher%20Design.md#L987-L1011)), the `jc bochs_fallback` instruction used displacement `0x14` (`72 14`) and `mov si, shutdown_str` used `0x0128` (`BE 28 01`). However, the APM 1.1 negotiation + `5307h` power-off sequence between `0x010D` and `bochs_fallback` is **21 bytes (`0x15`)**, not 20 (`0x14`). With `72 14`, an 8088 XT (where `INT 15h AX=5301h` sets Carry) jumps into the middle of the `CD 15` instruction at `0x0121` instead of `mov dx, 0x8900` at `0x0122`.
 >
 > In this plan, we correct the relative jump to `0x72, 0x15` (`jc +21` -> `0x0122`), include the safety `ret` (`0xC3`) at `0x0130`, and point `SI` to `0x0131` (`0xBE, 0x31, 0x01`), yielding a verified **57-byte** `KIOSKEXT.COM` binary (with a unit test verifying exact opcode offsets and simulated Port `0x8900` execution).
 
 > [!NOTE]
 > **Self-Contained Userspace FAT12 Generator & Injector**:
-> Rather than invoking interactive DOS shell commands (`IMGMAKE` / `MOUNT`) during pre-boot config synthesis, [`BootInjector`](file:///C:/code/dosbox-x-kiosk/src/kiosk/machine/boot_injector.h) synthesizes the 1.44MB FAT12 image (2,880 sectors $\times$ 512 bytes = 1,474,560 bytes) and performs one-time `AUTOEXEC.BAT` hook injection directly in userspace C++14. This allows deterministic, sub-5ms unit testing in Google Test without requiring a live emulated CPU loop.
+> Rather than invoking interactive DOS shell commands (`IMGMAKE` / `MOUNT`) during pre-boot config synthesis, [`BootInjector`](../../src/kiosk/machine/boot_injector.h) synthesizes the 1.44MB FAT12 image (2,880 sectors $\times$ 512 bytes = 1,474,560 bytes) and performs one-time `AUTOEXEC.BAT` hook injection directly in userspace C++14. This allows deterministic, sub-5ms unit testing in Google Test without requiring a live emulated CPU loop.
 
 ---
 
@@ -111,7 +111,7 @@ sequenceDiagram
 
 Provide deterministic, header-only `constexpr` binary payloads for `KIOSKEXT.COM` and `KIOSKWIN.EXE` so DOSBox-X Kiosk Edition never depends on external runtime binary files on the host filesystem.
 
-#### [NEW] [`src/kiosk/machine/kioskext_bin.h`](file:///C:/code/dosbox-x-kiosk/src/kiosk/machine/kioskext_bin.h)
+#### [NEW] [`src/kiosk/machine/kioskext_bin.h`](../../src/kiosk/machine/kioskext_bin.h)
 
 - Defines `KIOSKEXT_COM_BYTES` (57 bytes) with verified x86 machine code:
   ```cpp
@@ -170,10 +170,10 @@ Provide deterministic, header-only `constexpr` binary payloads for `KIOSKEXT.COM
 
 ### Component 2: Ephemeral FAT12 Dispatch Floppy (`B:`) & Boot Injector
 
-Implement [`BootInjector`](file:///C:/code/dosbox-x-kiosk/src/kiosk/machine/boot_injector.h) to synthesize the 1.44MB FAT12 dispatch floppy (`B:`), generate `KIOSKGO.BAT` (for DOS, Windows 3.1x, and Windows 95/98 targets with zero `SYSTEM.INI` mutation), and perform idempotent one-time `C:\AUTOEXEC.BAT` hooking.
+Implement [`BootInjector`](../../src/kiosk/machine/boot_injector.h) to synthesize the 1.44MB FAT12 dispatch floppy (`B:`), generate `KIOSKGO.BAT` (for DOS, Windows 3.1x, and Windows 95/98 targets with zero `SYSTEM.INI` mutation), and perform idempotent one-time `C:\AUTOEXEC.BAT` hooking.
 
-#### [NEW] [`src/kiosk/machine/boot_injector.h`](file:///C:/code/dosbox-x-kiosk/src/kiosk/machine/boot_injector.h)
-#### [NEW] [`src/kiosk/machine/boot_injector.cpp`](file:///C:/code/dosbox-x-kiosk/src/kiosk/machine/boot_injector.cpp)
+#### [NEW] [`src/kiosk/machine/boot_injector.h`](../../src/kiosk/machine/boot_injector.h)
+#### [NEW] [`src/kiosk/machine/boot_injector.cpp`](../../src/kiosk/machine/boot_injector.cpp)
 
 ```cpp
 #ifndef DOSBOX_KIOSK_BOOT_INJECTOR_H
@@ -305,10 +305,10 @@ private:
 
 ### Component 3: ConfigSynthesizer & KioskManager Integration
 
-Update [`ConfigSynthesizer`](file:///C:/code/dosbox-x-kiosk/src/kiosk/machine/config_synthesizer.h) and [`KioskManager`](file:///C:/code/dosbox-x-kiosk/src/kiosk/kiosk_main.h) so that launching a Carousel item on a `REAL_HDD_BOOT` machine automatically synthesizes `kiosk_dispatch.img` and mounts it on **Floppy Drive `B:` (`IMGMOUNT 1 "<dispatch_image_path>" -t floppy -fs none`)**, leaving `C:` (HDD) and `D:` (CD-ROM) completely undisturbed.
+Update [`ConfigSynthesizer`](../../src/kiosk/machine/config_synthesizer.h) and [`KioskManager`](../../src/kiosk/kiosk_main.h) so that launching a Carousel item on a `REAL_HDD_BOOT` machine automatically synthesizes `kiosk_dispatch.img` and mounts it on **Floppy Drive `B:` (`IMGMOUNT 1 "<dispatch_image_path>" -t floppy -fs none`)**, leaving `C:` (HDD) and `D:` (CD-ROM) completely undisturbed.
 
-#### [MODIFY] [`src/kiosk/machine/config_synthesizer.h`](file:///C:/code/dosbox-x-kiosk/src/kiosk/machine/config_synthesizer.h)
-#### [MODIFY] [`src/kiosk/machine/config_synthesizer.cpp`](file:///C:/code/dosbox-x-kiosk/src/kiosk/machine/config_synthesizer.cpp)
+#### [MODIFY] [`src/kiosk/machine/config_synthesizer.h`](../../src/kiosk/machine/config_synthesizer.h)
+#### [MODIFY] [`src/kiosk/machine/config_synthesizer.cpp`](../../src/kiosk/machine/config_synthesizer.cpp)
 
 - Add optional `dispatch_image_path` parameter to `SynthesizeConfig()` and `SynthesizeAutoexec()` (defaulting to `""` for backward compatibility with all existing Phase 1 and Phase 2 callers and tests):
   ```cpp
@@ -336,9 +336,9 @@ Update [`ConfigSynthesizer`](file:///C:/code/dosbox-x-kiosk/src/kiosk/machine/co
       ```
   - Optical drives (`D:` on `-ide 2m` and `E:` on `-ide 2s`) remain permanently at `D:` and `E:` regardless of whether a Carousel item or a Machine-Only session is booted.
 
-#### [MODIFY] [`src/kiosk/kiosk_main.h`](file:///C:/code/dosbox-x-kiosk/src/kiosk/kiosk_main.h)
-#### [MODIFY] [`src/kiosk/kiosk_main.cpp`](file:///C:/code/dosbox-x-kiosk/src/kiosk/kiosk_main.cpp)
-#### [MODIFY] [`src/gui/sdlmain.cpp`](file:///C:/code/dosbox-x-kiosk/src/gui/sdlmain.cpp)
+#### [MODIFY] [`src/kiosk/kiosk_main.h`](../../src/kiosk/kiosk_main.h)
+#### [MODIFY] [`src/kiosk/kiosk_main.cpp`](../../src/kiosk/kiosk_main.cpp)
+#### [MODIFY] [`src/gui/sdlmain.cpp`](../../src/gui/sdlmain.cpp)
 
 - Add `m_active_dispatch_image_path` and `m_session_conf_path` members (`GetActiveDispatchImagePath() const`, `GetSessionConfPath() const`) to `KioskManager`.
 - **Pre-Hardware-Init Hook & 60 Hz Pre-Boot Loop (Remediation for Phase 2 Finding 2.1)**:
@@ -374,19 +374,19 @@ Update [`ConfigSynthesizer`](file:///C:/code/dosbox-x-kiosk/src/kiosk/machine/co
     - Pump a 60 Hz modal loop while `GetState() == STATE_RUNTIME_OVERLAY` that polls SDL events, redraws the frozen guest texture via `GFX_OpenGLRedrawScreen()`, composites the ImGui overlay via `SDL_GL_SwapBuffers()`, and delays `16ms`.
     - On loop exit, restore `SDL_PauseAudioDevice(SDL2_AudioDevice, 0)`, `CPU_Reset_AutoAdjust()`, and relative mouse mode (when resuming); if the user clicked `"Quit to Kiosk Menu"` (`AbortSessionToShell()` / `USER_OVERLAY_ABORT`), throw `KioskGuestShutdownException(KioskShutdownReason::USER_OVERLAY_ABORT)` to unwind `DOSBOX_RunMachine()` into the clean shutdown and re-exec path.
 - **SQLite DDL `CHECK` Constraints & `KioskUI` Cache Invalidation (Remediation for Phase 2 Finding 2.4)**:
-  - In [`src/kiosk/kiosk_db.cpp`](file:///C:/code/dosbox-x-kiosk/src/kiosk/kiosk_db.cpp#L137-L206) (`KioskDatabase::InitializeSchema()`), add the 6 missing `CHECK` constraints (`media_pool.media_type`, `media_pool.physical_style`, `media_pool.label_font_style`, `os_distributions.install_strategy`, `machines.archetype_id`, and `catalog_items.launch_mechanism`).
+  - In [`src/kiosk/kiosk_db.cpp`](../../src/kiosk/kiosk_db.cpp#L137-L206) (`KioskDatabase::InitializeSchema()`), add the 6 missing `CHECK` constraints (`media_pool.media_type`, `media_pool.physical_style`, `media_pool.label_font_style`, `os_distributions.install_strategy`, `machines.archetype_id`, and `catalog_items.launch_mechanism`).
   - Call `KioskUI::GetInstance().InvalidateCatalogCache()` in `KioskManager::Initialize()`, `KioskManager::OnGuestShutdown()`, and at the end of machine/catalog mutation methods in `KioskDatabase` (`InsertMachine`, `UpdateMachine`, `DeleteMachine`, `InsertCatalogItem`, `UpdateCatalogItem`, `DeleteCatalogItem`, `IncrementPlayCount`).
 
 ---
 
 ### Component 4: Build Systems & Unit Test Suite
 
-#### [MODIFY] [`src/kiosk/Makefile.am`](file:///C:/code/dosbox-x-kiosk/src/kiosk/Makefile.am)
-#### [MODIFY] [`vs/dosbox-x.vcxproj`](file:///C:/code/dosbox-x-kiosk/vs/dosbox-x.vcxproj)
+#### [MODIFY] [`src/kiosk/Makefile.am`](../../src/kiosk/Makefile.am)
+#### [MODIFY] [`vs/dosbox-x.vcxproj`](../../vs/dosbox-x.vcxproj)
 
 - Register `src/kiosk/machine/kioskext_bin.h`, `src/kiosk/machine/boot_injector.h`, and `src/kiosk/machine/boot_injector.cpp` in `src/kiosk/Makefile.am` and `vs/dosbox-x.vcxproj` (using `.agents/skills/msbuild-runner/scripts/add-source.ps1` with non-SDL2 `<ExcludedFromBuild>` guards).
 
-#### [MODIFY] [`tests/kiosk_tests.cpp`](file:///C:/code/dosbox-x-kiosk/tests/kiosk_tests.cpp)
+#### [MODIFY] [`tests/kiosk_tests.cpp`](../../tests/kiosk_tests.cpp)
 
 Add 6 comprehensive Google Test cases under `KioskBootInjectorTest`:
 1. `KioskBootInjectorTest.KioskExtComBinaryLayoutAndPort8900Execution`:
