@@ -1228,4 +1228,247 @@ TEST(KioskBootInjectorTest, HostAutoexecPreservesExistingCommandsAndRejectsCorru
     std::remove(bad_img_path.c_str());
 }
 
+TEST(KioskBootInjectorTest, MbrPartitionedFat16AndFat32AutoexecHookCreationAndClusterGrowth) {
+    auto write_le16 = [](uint8_t* p, uint16_t val) {
+        p[0] = static_cast<uint8_t>(val & 0xFFU);
+        p[1] = static_cast<uint8_t>((val >> 8) & 0xFFU);
+    };
+    auto write_le32 = [](uint8_t* p, uint32_t val) {
+        p[0] = static_cast<uint8_t>(val & 0xFFU);
+        p[1] = static_cast<uint8_t>((val >> 8) & 0xFFU);
+        p[2] = static_cast<uint8_t>((val >> 16) & 0xFFU);
+        p[3] = static_cast<uint8_t>((val >> 24) & 0xFFU);
+    };
+    auto read_le16 = [](const uint8_t* p) -> uint16_t {
+        return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+    };
+    auto read_le32 = [](const uint8_t* p) -> uint32_t {
+        return static_cast<uint32_t>(p[0]) |
+               (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) |
+               (static_cast<uint32_t>(p[3]) << 24);
+    };
+
+    // ------------------------------------------------------------------------
+    // Part 1: MBR-Partitioned FAT16 Image with Cluster Boundary Growth
+    // ------------------------------------------------------------------------
+    // Layout:
+    // - LBA 0: MBR with active partition (status 0x80, type 0x06) at LBA 63, count 4200
+    // - Partition VBR at LBA 63:
+    //   BytsPerSec=512, SecPerClus=1 (512B cluster), RsvdSecCnt=1, NumFATs=2,
+    //   RootEntCnt=32 (2 sectors), FATSz16=17, TotSec16=4200 -> 4163 clusters (>= 4085 -> FAT16)
+    // - Existing AUTOEXEC.BAT has 480 bytes in Cluster 2 (so adding the 97-byte hook forces a 2nd cluster allocation)
+    const uint32_t fat16_lba_start = 63;
+    const uint32_t fat16_part_sectors = 4200;
+    const uint32_t fat16_total_sectors = fat16_lba_start + fat16_part_sectors;
+    std::vector<uint8_t> fat16_img(static_cast<size_t>(fat16_total_sectors) * 512U, 0);
+
+    // MBR at LBA 0
+    uint8_t* mbr16 = fat16_img.data();
+    mbr16[0x1BE + 0] = 0x80; // Active bootable
+    mbr16[0x1BE + 4] = 0x06; // FAT16B
+    write_le32(mbr16 + 0x1BE + 8, fat16_lba_start);
+    write_le32(mbr16 + 0x1BE + 12, fat16_part_sectors);
+    mbr16[510] = 0x55;
+    mbr16[511] = 0xAA;
+
+    // FAT16 VBR at LBA 63
+    const size_t part16_off = static_cast<size_t>(fat16_lba_start) * 512U;
+    uint8_t* vbr16 = fat16_img.data() + part16_off;
+    vbr16[0] = 0xEB;
+    vbr16[1] = 0x3C;
+    vbr16[2] = 0x90;
+    std::memcpy(vbr16 + 3, "MSDOS5.0", 8);
+    write_le16(vbr16 + 11, 512);  // BytsPerSec
+    vbr16[13] = 1;                // SecPerClus (512 bytes)
+    write_le16(vbr16 + 14, 1);    // RsvdSecCnt
+    vbr16[16] = 2;                // NumFATs
+    write_le16(vbr16 + 17, 32);   // RootEntCnt (2 sectors)
+    write_le16(vbr16 + 19, static_cast<uint16_t>(fat16_part_sectors)); // TotSec16
+    vbr16[21] = 0xF8;             // Fixed disk media
+    write_le16(vbr16 + 22, 17);   // FATSz16
+    vbr16[510] = 0x55;
+    vbr16[511] = 0xAA;
+
+    const size_t fat16_1_off = part16_off + 1U * 512U;
+    const size_t fat16_2_off = part16_off + (1U + 17U) * 512U;
+    const size_t root16_off = part16_off + (1U + 34U) * 512U;
+    const size_t data16_off = part16_off + (1U + 34U + 2U) * 512U; // first_data_sec = 37
+
+    // Initialize FAT1 and FAT2 media headers and Cluster 2 EOF (0xFFFF)
+    write_le16(fat16_img.data() + fat16_1_off + 0, 0xFFF8U);
+    write_le16(fat16_img.data() + fat16_1_off + 2, 0xFFFFU);
+    write_le16(fat16_img.data() + fat16_1_off + 4, 0xFFFFU); // Cluster 2 = EOF
+    std::memcpy(fat16_img.data() + fat16_2_off, fat16_img.data() + fat16_1_off, 17U * 512U);
+
+    // Seed a 480-byte AUTOEXEC.BAT in Cluster 2 (root entry 0)
+    std::string seed_fat16_autoexec = "@ECHO OFF\r\n";
+    while (seed_fat16_autoexec.size() < 470U) {
+        seed_fat16_autoexec += "REM PADDING LINE FOR CLUSTER BOUNDARY EXPANSION\r\n";
+    }
+    seed_fat16_autoexec.resize(478U, 'X');
+    seed_fat16_autoexec += "\r\n"; // 480 bytes total
+
+    uint8_t* dent16 = fat16_img.data() + root16_off;
+    std::memcpy(dent16, "AUTOEXECBAT", 11);
+    dent16[11] = 0x20;
+    write_le16(dent16 + 26, 2); // FirstCluster = 2
+    write_le32(dent16 + 28, static_cast<uint32_t>(seed_fat16_autoexec.size()));
+    std::memcpy(fat16_img.data() + data16_off, seed_fat16_autoexec.data(), seed_fat16_autoexec.size());
+
+    const std::string temp_fat16_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".mbr_fat16_test.img";
+    {
+        std::ofstream out(temp_fat16_path.c_str(), std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open());
+        out.write(reinterpret_cast<const char*>(fat16_img.data()), static_cast<std::streamsize>(fat16_img.size()));
+    }
+
+    ASSERT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(temp_fat16_path));
+
+    // Read modified FAT16 image back and verify 2-cluster chain (Cluster 2 -> Cluster 3 -> 0xFFFF) in both FATs
+    std::vector<uint8_t> mod_fat16;
+    {
+        std::ifstream in(temp_fat16_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(in.is_open());
+        mod_fat16.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+    EXPECT_EQ(3U, read_le16(mod_fat16.data() + fat16_1_off + 2 * 2));
+    EXPECT_EQ(0xFFFFU, read_le16(mod_fat16.data() + fat16_1_off + 3 * 2));
+    EXPECT_EQ(3U, read_le16(mod_fat16.data() + fat16_2_off + 2 * 2));
+    EXPECT_EQ(0xFFFFU, read_le16(mod_fat16.data() + fat16_2_off + 3 * 2));
+
+    uint32_t new_fat16_size = read_le32(mod_fat16.data() + root16_off + 28);
+    EXPECT_GT(new_fat16_size, 512U);
+    ASSERT_LE(new_fat16_size, 1024U);
+
+    // Reconstruct file data across Cluster 2 and Cluster 3
+    std::string reconstructed16;
+    reconstructed16.append(reinterpret_cast<const char*>(mod_fat16.data() + data16_off), 512U);
+    reconstructed16.append(reinterpret_cast<const char*>(mod_fat16.data() + data16_off + 512U), new_fat16_size - 512U);
+    EXPECT_EQ(0U, reconstructed16.find(seed_fat16_autoexec));
+    EXPECT_NE(std::string::npos, reconstructed16.find("IF EXIST B:\\KIOSKGO.BAT CALL B:\\KIOSKGO.BAT\r\n"));
+
+    // Verify idempotency on second call
+    EXPECT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(temp_fat16_path));
+    std::remove(temp_fat16_path.c_str());
+
+    // ------------------------------------------------------------------------
+    // Part 2: MBR-Partitioned FAT32 Image with Missing AUTOEXEC.BAT Creation
+    // ------------------------------------------------------------------------
+    // Layout:
+    // - LBA 0: MBR with active partition (status 0x80, type 0x0C) at LBA 63, count 200
+    // - Partition VBR at LBA 63:
+    //   BytsPerSec=512, SecPerClus=1, RsvdSecCnt=32, NumFATs=2, RootEntCnt=0,
+    //   FATSz16=0, TotSec32=200, FATSz32=2, RootClus=2
+    const uint32_t fat32_lba_start = 63;
+    const uint32_t fat32_part_sectors = 200;
+    const uint32_t fat32_total_sectors = fat32_lba_start + fat32_part_sectors;
+    std::vector<uint8_t> fat32_img(static_cast<size_t>(fat32_total_sectors) * 512U, 0);
+
+    uint8_t* mbr32 = fat32_img.data();
+    mbr32[0x1BE + 0] = 0x80; // Active
+    mbr32[0x1BE + 4] = 0x0C; // FAT32 LBA
+    write_le32(mbr32 + 0x1BE + 8, fat32_lba_start);
+    write_le32(mbr32 + 0x1BE + 12, fat32_part_sectors);
+    mbr32[510] = 0x55;
+    mbr32[511] = 0xAA;
+
+    const size_t part32_off = static_cast<size_t>(fat32_lba_start) * 512U;
+    uint8_t* vbr32 = fat32_img.data() + part32_off;
+    vbr32[0] = 0xEB;
+    vbr32[1] = 0x58;
+    vbr32[2] = 0x90;
+    std::memcpy(vbr32 + 3, "MSWIN4.1", 8);
+    write_le16(vbr32 + 11, 512);  // BytsPerSec
+    vbr32[13] = 1;                // SecPerClus
+    write_le16(vbr32 + 14, 32);   // RsvdSecCnt
+    vbr32[16] = 2;                // NumFATs
+    write_le16(vbr32 + 17, 0);    // RootEntCnt (0 for FAT32)
+    write_le16(vbr32 + 19, 0);    // TotSec16 (0 for FAT32)
+    vbr32[21] = 0xF8;
+    write_le16(vbr32 + 22, 0);    // FATSz16 (0 for FAT32)
+    write_le32(vbr32 + 32, fat32_part_sectors); // TotSec32
+    write_le32(vbr32 + 36, 2);    // FATSz32 (2 sectors per FAT)
+    write_le32(vbr32 + 44, 2);    // RootClus = 2
+    vbr32[510] = 0x55;
+    vbr32[511] = 0xAA;
+
+    const size_t fat32_1_off = part32_off + 32U * 512U;
+    const size_t fat32_2_off = part32_off + 34U * 512U;
+    const size_t data32_off = part32_off + 36U * 512U; // Cluster 2 = Root directory
+
+    write_le32(fat32_img.data() + fat32_1_off + 0, 0x0FFFFFF8U);
+    write_le32(fat32_img.data() + fat32_1_off + 4, 0x0FFFFFFFU);
+    write_le32(fat32_img.data() + fat32_1_off + 8, 0x0FFFFFFFU); // Cluster 2 (Root dir) = EOF
+    std::memcpy(fat32_img.data() + fat32_2_off, fat32_img.data() + fat32_1_off, 2U * 512U);
+
+    const std::string temp_fat32_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".mbr_fat32_test.img";
+    {
+        std::ofstream out(temp_fat32_path.c_str(), std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open());
+        out.write(reinterpret_cast<const char*>(fat32_img.data()), static_cast<std::streamsize>(fat32_img.size()));
+    }
+
+    // First call creates AUTOEXEC.BAT in the FAT32 root directory cluster (Cluster 2) and allocates Cluster 3 for its content
+    ASSERT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(temp_fat32_path));
+
+    std::vector<uint8_t> mod_fat32;
+    {
+        std::ifstream in(temp_fat32_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(in.is_open());
+        mod_fat32.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+
+    const uint8_t* root32_ent = mod_fat32.data() + data32_off;
+    EXPECT_EQ(0, std::memcmp(root32_ent, "AUTOEXECBAT", 11));
+    uint32_t fst_clus32 = (static_cast<uint32_t>(read_le16(root32_ent + 20)) << 16) | read_le16(root32_ent + 26);
+    uint32_t file_size32 = read_le32(root32_ent + 28);
+    EXPECT_EQ(3U, fst_clus32);
+    EXPECT_EQ(BootInjector::GetAutoexecHookBlock().size(), file_size32);
+
+    std::string created_fat32_content(
+        reinterpret_cast<const char*>(mod_fat32.data() + data32_off + (fst_clus32 - 2U) * 512U),
+        file_size32
+    );
+    EXPECT_EQ(BootInjector::GetAutoexecHookBlock(), created_fat32_content);
+
+    // Second call is idempotent
+    EXPECT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(temp_fat32_path));
+    std::remove(temp_fat32_path.c_str());
+}
+
+TEST(KioskBootInjectorTest, Windows9xRunOnceAndOsIdFallbackSynthesis) {
+    MachineRecord m;
+    m.id = "mach-win98";
+    m.archetype_id = KioskArchetypes::PENTIUM_3DFX;
+    m.archetype_tier = 5;
+    m.os_id = "WIN98_SE";
+    m.boot_mode = "REAL_HDD_BOOT";
+
+    // 1. Explicit WIN9X_RUNONCE_HOOK with spaced working directory and spaced executable
+    CatalogItemRecord win9x_game;
+    win9x_game.guest_working_dir = "C:\\Program Files\\Valve/Half-Life";
+    win9x_game.guest_executable = "HL.EXE";
+    win9x_game.guest_arguments = "-console -game cstrike";
+    win9x_game.launch_mechanism = "WIN9X_RUNONCE_HOOK";
+    win9x_game.return_on_exit = true;
+
+    std::string bat_win9x = BootInjector::GetInstance().SynthesizeKioskGoBat(m, win9x_game);
+    EXPECT_NE(std::string::npos, bat_win9x.find("C:\r\n"));
+    EXPECT_NE(std::string::npos, bat_win9x.find("CD \"\\Program Files\\Valve\\Half-Life\"\r\n"));
+    EXPECT_NE(std::string::npos, bat_win9x.find("C:\\WINDOWS\\WIN.COM HL.EXE -console -game cstrike\r\n"));
+    EXPECT_NE(std::string::npos, bat_win9x.find("B:\\KIOSKEXT.COM\r\n"));
+
+    // 2. Fallback to machine.os_id ("WIN*") when launch_mechanism is unset and executable has spaces
+    CatalogItemRecord win_fallback;
+    win_fallback.guest_working_dir = "C:\\GAMES\\DIABLO";
+    win_fallback.guest_executable = "DiabloLauncher.exe";
+    win_fallback.launch_mechanism = "";
+    win_fallback.return_on_exit = false;
+
+    std::string bat_fallback = BootInjector::GetInstance().SynthesizeKioskGoBat(m, win_fallback);
+    EXPECT_NE(std::string::npos, bat_fallback.find("C:\\WINDOWS\\WIN.COM DiabloLauncher.exe\r\n"));
+    EXPECT_EQ(std::string::npos, bat_fallback.find("KIOSKEXT.COM"));
+}
+
 #endif // defined(C_DEBUG) && defined(C_KIOSK)
