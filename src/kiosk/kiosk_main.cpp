@@ -332,10 +332,16 @@ bool KioskManager::IsOverlayHotkeyEvent(const SDL_Event& event, const uint8_t* k
 
     const SDL_Keycode sym = event.key.keysym.sym;
 
-    // Built-in default (F12+D) and disk-swapper alias (F11+O)
+    // Built-in default (F12+D) and disk-swapper alias (F11+O), tolerant of key press order
     if (kb_state != nullptr) {
-        if (sym == SDLK_d && kb_state[SDL_SCANCODE_F12]) return true;
-        if (sym == SDLK_o && kb_state[SDL_SCANCODE_F11]) return true;
+        if ((sym == SDLK_d && kb_state[SDL_SCANCODE_F12]) ||
+            (sym == SDLK_F12 && kb_state[SDL_SCANCODE_D])) {
+            return true;
+        }
+        if ((sym == SDLK_o && kb_state[SDL_SCANCODE_F11]) ||
+            (sym == SDLK_F11 && kb_state[SDL_SCANCODE_O])) {
+            return true;
+        }
     }
 
     // Configurable kiosk_config.overlay_hotkey

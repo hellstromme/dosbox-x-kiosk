@@ -5997,6 +5997,18 @@ static void Kiosk_RunRuntimeOverlayLoop(void) {
         throw KioskGuestShutdownException(KioskShutdownReason::USER_OVERLAY_ABORT);
     }
 
+#if C_OPENGL
+    if (OpenGL_using() && sdl.window != NULL) {
+        // Clear all double/triple-buffered swap-chain backbuffers so fullscreen
+        // pillarbox/letterbox borders do not retain the dimmed overlay backdrop.
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        GFX_OpenGLRedrawScreen();
+        SDL_GL_SwapBuffers();
+        sdl_opengl.clear_countdown = 3;
+    }
+#endif
+
     if (was_mouse_locked) {
         SDL_SetRelativeMouseMode(SDL_TRUE);
         SDL_ShowCursor(SDL_DISABLE);

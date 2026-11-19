@@ -803,8 +803,10 @@ void RuntimeOverlay::Render() {
             );
         }
 
-        const float win_w = std::max(720.0f, std::min(1160.0f, viewport->WorkSize.x * 0.92f));
-        const float win_h = std::max(480.0f, std::min(760.0f, viewport->WorkSize.y * 0.90f));
+        const float max_w = std::max(320.0f, viewport->WorkSize.x - 16.0f);
+        const float max_h = std::max(240.0f, viewport->WorkSize.y - 16.0f);
+        const float win_w = std::min(max_w, std::max(std::min(720.0f, max_w), std::min(1160.0f, viewport->WorkSize.x * 0.92f)));
+        const float win_h = std::min(max_h, std::max(std::min(480.0f, max_h), std::min(760.0f, viewport->WorkSize.y * 0.90f)));
         ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(win_w, win_h), ImGuiCond_Always);
     }

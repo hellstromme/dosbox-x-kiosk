@@ -737,6 +737,20 @@ std::vector<std::string> DriveManager::GetKioskDrivePaths(int drive) {
 	return paths;
 }
 
+static bool Kiosk_PathsEqual(const std::string& a, const std::string& b) {
+	if (a.size() != b.size()) return false;
+	for (size_t i = 0; i < a.size(); ++i) {
+		char ca = (a[i] == '\\') ? '/' : a[i];
+		char cb = (b[i] == '\\') ? '/' : b[i];
+#if defined(WIN32)
+		ca = (char)tolower((unsigned char)ca);
+		cb = (char)tolower((unsigned char)cb);
+#endif
+		if (ca != cb) return false;
+	}
+	return true;
+}
+
 bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bool is_cdrom, bool write_protected) {
 	if (drive < 0 || drive >= DOS_DRIVES || host_path.empty()) return false;
 
@@ -745,39 +759,30 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 	if (!is_cdrom) {
 		if (drive >= 2) return false;
 
-		FILE* fp = fopen(clean_path.c_str(), write_protected ? "rb" : "rb+");
-		if (!fp && !write_protected) {
-			fp = fopen(clean_path.c_str(), "rb");
-		}
-		if (!fp) {
-			LOG_MSG("KIOSK DriveManager: Cannot open floppy image '%s'", clean_path.c_str());
-			return false;
-		}
-		fseek(fp, 0, SEEK_END);
-		long fsz = ftell(fp);
-		fseek(fp, 0, SEEK_SET);
-		if (fsz <= 0) {
-			fclose(fp);
-			return false;
-		}
-
+		// Check already-mounted DriveManager slots BEFORE any fopen() call:
+		// on Windows, IMGMOUNT opens floppy images via fopen_lock() with dwShareMode=0
+		// (exclusive lock), so re-opening an already-mounted image with fopen() fails.
+		bool mounted_via_fat = false;
 		if (!dos_kernel_disabled && (!driveInfos[drive].disks.empty() || dos.tables.mediaid != 0)) {
 			int existing_idx = -1;
 			for (size_t i = 0; i < driveInfos[drive].disks.size(); ++i) {
-				if (Kiosk_ExtractDriveHostPath(driveInfos[drive].disks[i], -1) == clean_path) {
+				if (Kiosk_PathsEqual(Kiosk_ExtractDriveHostPath(driveInfos[drive].disks[i], -1), clean_path)) {
 					existing_idx = (int)i;
 					break;
 				}
 			}
 
 			if (existing_idx >= 0) {
-				fclose(fp);
-				fp = NULL;
-				if ((int)driveInfos[drive].currentDisk != existing_idx) {
+				if ((int)driveInfos[drive].currentDisk != existing_idx && driveInfos[drive].disks.size() > 1) {
 					CycleDisks(drive, true, false, (unsigned int)(existing_idx + 1));
+				} else {
+					driveInfos[drive].currentDisk = (uint32_t)existing_idx;
+					Drives[drive] = driveInfos[drive].disks[existing_idx];
 				}
 				if (Drives[drive] != NULL) {
 					Drives[drive]->readonly = write_protected;
+					Drives[drive]->Activate();
+					Drives[drive]->UpdateDPB(drive);
 					Drives[drive]->EmptyCache();
 					Drives[drive]->MediaChange();
 					fatDrive* fdp = dynamic_cast<fatDrive*>(Drives[drive]);
@@ -787,12 +792,14 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 						imageDiskList[drive]->Addref();
 					}
 				}
+				mounted_via_fat = true;
 			} else {
 				std::vector<std::string> opts;
+				if (write_protected) {
+					opts.push_back("readonly");
+				}
 				fatDrive* new_fd = new fatDrive(clean_path.c_str(), 0, 0, 0, 0, opts);
 				if (new_fd != NULL && new_fd->created_successfully && new_fd->loadedDisk != NULL) {
-					fclose(fp);
-					fp = NULL;
 					new_fd->readonly = write_protected;
 					new_fd->loadedDisk->kiosk_write_protected = write_protected;
 					const bool was_empty = driveInfos[drive].disks.empty();
@@ -803,26 +810,28 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 						unsigned int new_pos = (unsigned int)driveInfos[drive].disks.size();
 						CycleDisks(drive, true, false, new_pos);
 					}
+					Drives[drive] = new_fd;
 					if (imageDiskList[drive] != new_fd->loadedDisk) {
 						if (imageDiskList[drive] != NULL) imageDiskList[drive]->Release();
 						imageDiskList[drive] = new_fd->loadedDisk;
 						imageDiskList[drive]->Addref();
 					}
-					if (Drives[drive] != NULL) {
-						Drives[drive]->EmptyCache();
-						Drives[drive]->MediaChange();
-					}
+					Drives[drive]->Activate();
+					Drives[drive]->UpdateDPB(drive);
+					Drives[drive]->EmptyCache();
+					Drives[drive]->MediaChange();
+					mounted_via_fat = true;
 				} else {
 					delete new_fd;
 				}
 			}
 		}
 
-		if (fp != NULL) {
+		if (!mounted_via_fat) {
 			int existing_swap = -1;
 			if (swapInDisksSpecificDrive == drive) {
 				for (int i = 0; i < MAX_SWAPPABLE_DISKS; ++i) {
-					if (diskSwap[i] != NULL && Kiosk_StripWriteProtectPrefix(diskSwap[i]->diskname) == clean_path) {
+					if (diskSwap[i] != NULL && Kiosk_PathsEqual(Kiosk_StripWriteProtectPrefix(diskSwap[i]->diskname), clean_path)) {
 						existing_swap = i;
 						break;
 					}
@@ -830,15 +839,27 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 			}
 
 			if (existing_swap >= 0) {
-				fclose(fp);
-				fp = NULL;
 				swapPosition = existing_swap;
 				if (imageDiskList[drive] != NULL) imageDiskList[drive]->Release();
 				imageDiskList[drive] = diskSwap[existing_swap];
 				imageDiskList[drive]->Addref();
 			} else {
+				FILE* fp = fopen(clean_path.c_str(), write_protected ? "rb" : "rb+");
+				if (!fp && !write_protected) {
+					fp = fopen(clean_path.c_str(), "rb");
+				}
+				if (!fp) {
+					LOG_MSG("KIOSK DriveManager: Cannot open raw floppy image '%s'", clean_path.c_str());
+					return false;
+				}
+				fseek(fp, 0, SEEK_END);
+				long fsz = ftell(fp);
+				fseek(fp, 0, SEEK_SET);
+				if (fsz <= 0) {
+					fclose(fp);
+					return false;
+				}
 				imageDisk* new_disk = new imageDisk(fp, clean_path.c_str(), (uint64_t)fsz, false);
-				fp = NULL;
 				new_disk->drvnum = (unsigned int)drive;
 				new_disk->kiosk_write_protected = write_protected;
 
