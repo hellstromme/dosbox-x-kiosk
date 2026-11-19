@@ -437,6 +437,11 @@ static void IDE_ATAPI_CDInsertion(Bitu pk/*which IDE device*/) {
 		if (atapi->loading_mode == LOAD_INSERT_CD) {
 			atapi->loading_mode = LOAD_DISC_LOADING;
 			LOG_MSG("ATAPI CD-ROM: insert CD to loading\n");
+#if defined(C_KIOSK)
+			if (atapi->has_changed) {
+				atapi->set_sense(/*SK=*/0x02,/*ASC=*/0x04,/*ASCQ=*/0x01);
+			}
+#endif
 			PIC_RemoveSpecificEvents(IDE_ATAPI_SpinDown,pk);
 			PIC_RemoveSpecificEvents(IDE_ATAPI_CDInsertion,pk);
 			PIC_AddEvent(IDE_ATAPI_SpinUpComplete,atapi->spinup_time/*ms*/,pk);
@@ -466,6 +471,11 @@ static void IDE_ATAPI_SpinUpComplete(Bitu pk/*which IDE device*/) {
 		if (atapi->loading_mode == LOAD_DISC_LOADING) {
 			atapi->loading_mode = LOAD_DISC_READIED;
 			LOG_MSG("ATAPI CD-ROM: spinup complete\n");
+#if defined(C_KIOSK)
+			if (atapi->has_changed) {
+				atapi->set_sense(/*SK=*/0x06,/*ASC=*/0x28,/*ASCQ=*/0x00);
+			}
+#endif
 			PIC_RemoveSpecificEvents(IDE_ATAPI_SpinDown,pk);
 			PIC_RemoveSpecificEvents(IDE_ATAPI_CDInsertion,pk);
 			PIC_AddEvent(IDE_ATAPI_SpinDown,atapi->spindown_timeout/*ms*/,pk);
@@ -523,7 +533,13 @@ bool IDEATAPICDROMDevice::common_spinup_response(bool trigger,bool wait) {
 			loading_mode = LOAD_READY;
 			if (has_changed) {
 				if (trigger) has_changed = false;
+#if defined(C_KIOSK)
+				has_changed = false;
+				set_sense(/*SK=*/0x06,/*ASC=*/0x28,/*ASCQ=*/0x00); /* UNIT ATTENTION: Not ready to ready transition, medium may have changed */
+#else
+				if (trigger) has_changed = false;
 				set_sense(/*SK=*/0x02,/*ASC=*/0x28,/*ASCQ=*/0x00); /* Medium is ready (has changed) */
+#endif
 				return false;
 			}
 			break;
@@ -2994,6 +3010,179 @@ bool IDE_CDROM_Eject(int index,bool slave) {
 
         return true;
 }
+
+#if defined(C_KIOSK)
+void IDE_Secondary_Init(Section *sec);
+static IDEATAPICDROMDevice* Kiosk_IDE_FindOrCreateATAPI(unsigned char drive_index, unsigned int& out_pk, bool create_if_missing) {
+	for (unsigned int ide = 0; ide < MAX_IDE_CONTROLLERS; ++ide) {
+		IDEController* c = idecontroller[ide];
+		if (!c) continue;
+		for (unsigned int ms = 0; ms < 2; ++ms) {
+			IDEDevice* dev = c->device[ms];
+			if (dev && dev->type == IDE_TYPE_CDROM) {
+				IDEATAPICDROMDevice* atapi = (IDEATAPICDROMDevice*)dev;
+				if (atapi->drive_index == drive_index) {
+					out_pk = IDEEventPack(c->interface_index, ms).get();
+					return atapi;
+				}
+			}
+		}
+	}
+	for (unsigned int ide = 0; ide < MAX_IDE_CONTROLLERS; ++ide) {
+		IDEController* c = idecontroller[ide];
+		if (!c) continue;
+		for (unsigned int ms = 0; ms < 2; ++ms) {
+			IDEDevice* dev = c->device[ms];
+			if (dev && dev->type == IDE_TYPE_CDROM) {
+				IDEATAPICDROMDevice* atapi = (IDEATAPICDROMDevice*)dev;
+				if (atapi->drive_index == 0xFFu || ide == 1) {
+					atapi->drive_index = drive_index;
+					out_pk = IDEEventPack(c->interface_index, ms).get();
+					return atapi;
+				}
+			}
+		}
+	}
+	if (!create_if_missing) return NULL;
+
+	IDEController* ctrl = (idecontroller[1] != NULL) ? idecontroller[1] : idecontroller[0];
+	if (ctrl == NULL && control != NULL) {
+		Section* sec = control->GetSection("ide, secondary");
+		if (sec != NULL) {
+			IDE_Secondary_Init(sec);
+			ctrl = idecontroller[1];
+		}
+	}
+	if (ctrl == NULL) return NULL;
+
+	unsigned int slot = (ctrl->device[0] == NULL) ? 0u : ((ctrl->device[1] == NULL) ? 1u : 0u);
+	if (ctrl->device[slot] != NULL) return NULL;
+
+	CDROM_Interface* cdrom = NULL;
+	bool has_mscdex = GetMSCDEXDrive(drive_index, &cdrom);
+	if (!has_mscdex || cdrom == NULL) {
+		if (CDROM_AllocateInterface("empty", true, 0xFFFF, &cdrom)) {
+			cdrom = NULL;
+		}
+	}
+	IDEATAPICDROMDevice* atapi = new IDEATAPICDROMDevice(ctrl, drive_index, slot != 0, cdrom);
+	atapi->mscdex = has_mscdex;
+	if (cdrom != NULL) cdrom->Release();
+	ctrl->device[slot] = (IDEDevice*)atapi;
+	out_pk = IDEEventPack(ctrl->interface_index, slot).get();
+	return atapi;
+}
+
+bool Kiosk_IDE_MountATAPIMedia(unsigned char drive_index, const char* host_path, double tray_delay_ms) {
+	unsigned int pk = 0;
+	IDEATAPICDROMDevice* atapi = Kiosk_IDE_FindOrCreateATAPI(drive_index, pk, true);
+	if (!atapi) return false;
+
+	CDROM_Interface* new_cdrom = NULL;
+	if (GetMSCDEXDrive(drive_index, &new_cdrom) && new_cdrom != NULL &&
+	    new_cdrom->class_id != CDROM_Interface::ID_FAKE) {
+		if (atapi->cdrom) atapi->cdrom->Release();
+		atapi->cdrom = new_cdrom;
+		atapi->mscdex = true;
+	} else {
+		if (new_cdrom != NULL) {
+			new_cdrom->Release();
+			new_cdrom = NULL;
+		}
+		if (host_path != NULL && *host_path != '\0') {
+			if (CDROM_AllocateInterface(host_path, -1, 0xFFFF, &new_cdrom) == 0 && new_cdrom != NULL) {
+				if (atapi->cdrom) atapi->cdrom->Release();
+				atapi->cdrom = new_cdrom;
+				atapi->mscdex = false;
+			} else {
+				return false;
+			}
+		}
+	}
+
+	PIC_RemoveSpecificEvents(IDE_ATAPI_SpinDown, pk);
+	PIC_RemoveSpecificEvents(IDE_ATAPI_SpinUpComplete, pk);
+	PIC_RemoveSpecificEvents(IDE_ATAPI_CDInsertion, pk);
+
+	atapi->has_changed = true;
+	if (tray_delay_ms <= 0.0) {
+		atapi->loading_mode = LOAD_DISC_READIED;
+		atapi->set_sense(/*SK=*/0x06, /*ASC=*/0x28, /*ASCQ=*/0x00);
+	} else {
+		atapi->loading_mode = LOAD_INSERT_CD;
+		atapi->set_sense(/*SK=*/0x02, /*ASC=*/0x3A, /*ASCQ=*/0x00);
+		atapi->cd_insertion_time = tray_delay_ms * 0.5;
+		atapi->spinup_time = tray_delay_ms * 0.5;
+		PIC_AddEvent(IDE_ATAPI_CDInsertion, (float)atapi->cd_insertion_time, pk);
+	}
+	LOG_MSG("KIOSK IDE: Mounted ATAPI media '%s' on Drive %c: (delay=%.1fms)",
+		host_path ? host_path : "", 'A' + drive_index, tray_delay_ms);
+	return true;
+}
+
+bool Kiosk_IDE_NotifyATAPIMediaChange(unsigned char drive_index, double tray_delay_ms) {
+	unsigned int pk = 0;
+	IDEATAPICDROMDevice* atapi = Kiosk_IDE_FindOrCreateATAPI(drive_index, pk, true);
+	if (!atapi) return false;
+
+	CDROM_Interface* cdrom = NULL;
+	if (GetMSCDEXDrive(drive_index, &cdrom) && cdrom != NULL) {
+		if (atapi->cdrom) atapi->cdrom->Release();
+		atapi->cdrom = cdrom; /* GetMSCDEXDrive already called Addref() */
+		atapi->mscdex = true;
+	}
+
+	PIC_RemoveSpecificEvents(IDE_ATAPI_SpinDown, pk);
+	PIC_RemoveSpecificEvents(IDE_ATAPI_SpinUpComplete, pk);
+	PIC_RemoveSpecificEvents(IDE_ATAPI_CDInsertion, pk);
+
+	atapi->has_changed = true;
+	if (tray_delay_ms <= 0.0) {
+		atapi->loading_mode = LOAD_DISC_READIED;
+		atapi->set_sense(/*SK=*/0x06, /*ASC=*/0x28, /*ASCQ=*/0x00);
+	} else {
+		atapi->loading_mode = LOAD_INSERT_CD;
+		atapi->set_sense(/*SK=*/0x02, /*ASC=*/0x3A, /*ASCQ=*/0x00);
+		atapi->cd_insertion_time = tray_delay_ms * 0.5;
+		atapi->spinup_time = tray_delay_ms * 0.5;
+		PIC_AddEvent(IDE_ATAPI_CDInsertion, (float)atapi->cd_insertion_time, pk);
+	}
+	LOG_MSG("KIOSK IDE: Scheduled ATAPI media change on Drive %c: (delay=%.1fms)", 'A' + drive_index, tray_delay_ms);
+	return true;
+}
+
+bool Kiosk_IDE_EjectATAPIMedia(unsigned char drive_index) {
+	unsigned int pk = 0;
+	IDEATAPICDROMDevice* atapi = Kiosk_IDE_FindOrCreateATAPI(drive_index, pk, false);
+	if (!atapi) return false;
+
+	PIC_RemoveSpecificEvents(IDE_ATAPI_SpinDown, pk);
+	PIC_RemoveSpecificEvents(IDE_ATAPI_SpinUpComplete, pk);
+	PIC_RemoveSpecificEvents(IDE_ATAPI_CDInsertion, pk);
+
+	CDROM_Interface* empty_cd = NULL;
+	if (!CDROM_AllocateInterface("empty", true, 0xFFFF, &empty_cd) && empty_cd != NULL) {
+		if (atapi->cdrom) atapi->cdrom->Release();
+		atapi->cdrom = empty_cd;
+	}
+	atapi->loading_mode = LOAD_NO_DISC;
+	atapi->has_changed = true;
+	atapi->set_sense(/*SK=*/0x02, /*ASC=*/0x3A, /*ASCQ=*/0x00);
+	LOG_MSG("KIOSK IDE: Ejected ATAPI CD-ROM media on Drive %c:", 'A' + drive_index);
+	return true;
+}
+
+bool Kiosk_IDE_GetATAPISense(unsigned char drive_index, uint8_t& out_sk, uint8_t& out_asc, uint8_t& out_ascq, int& out_loading_mode) {
+	unsigned int pk = 0;
+	IDEATAPICDROMDevice* atapi = Kiosk_IDE_FindOrCreateATAPI(drive_index, pk, false);
+	if (!atapi) return false;
+	out_sk = atapi->sense[2] & 0x0F;
+	out_asc = atapi->sense[12];
+	out_ascq = atapi->sense[13];
+	out_loading_mode = atapi->loading_mode;
+	return true;
+}
+#endif
 
 bool IDE_CDROM_Attach(signed char index,bool slave,const std::vector<CDROM_Interface*> &cds,bool opt_replace) {
 	IDEATAPICDROMDevice *dev;

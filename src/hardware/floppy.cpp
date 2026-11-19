@@ -209,6 +209,94 @@ bool FDC_UnassignINT13Disk(unsigned char drv) {
 	return true;
 }
 
+#if defined(C_KIOSK)
+static bool fdc_kiosk_door_open[4] = {false, false, false, false};
+static bool fdc_kiosk_write_protect[4] = {false, false, false, false};
+
+static void FDC_KioskCloseDoorEvent(Bitu drive_idx) {
+	if (drive_idx < 4) {
+		fdc_kiosk_door_open[drive_idx] = false;
+		if (drive_idx < MAX_DISK_IMAGES) {
+			imageDiskChange[drive_idx] = true;
+		}
+		if (floppycontroller[0] != NULL) {
+			floppycontroller[0]->update_ST3();
+		}
+		LOG_MSG("KIOSK FDC: Drive %c: virtual door closed after swap; DSKCHG latched.", 'A' + (int)drive_idx);
+	}
+}
+
+void FDC_NotifyDiskSwap(int drive_idx, double door_open_ms, bool write_protected) {
+	if (drive_idx < 0 || drive_idx >= 4) return;
+	fdc_kiosk_write_protect[drive_idx] = write_protected;
+	if (drive_idx < MAX_DISK_IMAGES) {
+		imageDiskChange[drive_idx] = true;
+		if (imageDiskList[drive_idx] != NULL) {
+			imageDiskList[drive_idx]->kiosk_write_protected = write_protected;
+		}
+	}
+	PIC_RemoveSpecificEvents(FDC_KioskCloseDoorEvent, (Bitu)drive_idx);
+	if (door_open_ms > 0.0) {
+		fdc_kiosk_door_open[drive_idx] = true;
+		PIC_AddEvent(FDC_KioskCloseDoorEvent, (float)door_open_ms, (Bitu)drive_idx);
+	} else {
+		fdc_kiosk_door_open[drive_idx] = false;
+	}
+	if (floppycontroller[0] != NULL) {
+		floppycontroller[0]->update_ST3();
+	}
+	LOG_MSG("KIOSK FDC: Notified disk swap on Drive %c: (door_open=%.1fms, wp=%d)",
+		'A' + drive_idx, door_open_ms, write_protected ? 1 : 0);
+}
+
+void FDC_NotifyDiskEject(int drive_idx) {
+	if (drive_idx < 0 || drive_idx >= 4) return;
+	PIC_RemoveSpecificEvents(FDC_KioskCloseDoorEvent, (Bitu)drive_idx);
+	fdc_kiosk_door_open[drive_idx] = true;
+	if (drive_idx < MAX_DISK_IMAGES) {
+		imageDiskChange[drive_idx] = true;
+	}
+	if (floppycontroller[0] != NULL) {
+		floppycontroller[0]->update_ST3();
+	}
+	LOG_MSG("KIOSK FDC: Drive %c: media ejected (door open, DSKCHG=1).", 'A' + drive_idx);
+}
+
+bool FDC_IsDoorOpen(int drive_idx) {
+	if (drive_idx < 0 || drive_idx >= 4) return false;
+	return fdc_kiosk_door_open[drive_idx];
+}
+
+void FDC_SetWriteProtected(int drive_idx, bool write_protected) {
+	if (drive_idx < 0 || drive_idx >= 4) return;
+	fdc_kiosk_write_protect[drive_idx] = write_protected;
+	if (drive_idx < MAX_DISK_IMAGES && imageDiskList[drive_idx] != NULL) {
+		imageDiskList[drive_idx]->kiosk_write_protected = write_protected;
+	}
+	if (floppycontroller[0] != NULL) {
+		floppycontroller[0]->update_ST3();
+	}
+}
+
+bool FDC_IsWriteProtected(int drive_idx) {
+	if (drive_idx < 0 || drive_idx >= 4) return false;
+	if (drive_idx < MAX_DISK_IMAGES && imageDiskList[drive_idx] != NULL) {
+		return fdc_kiosk_write_protect[drive_idx] || imageDiskList[drive_idx]->kiosk_write_protected;
+	}
+	return fdc_kiosk_write_protect[drive_idx];
+}
+
+uint8_t FDC_DebugReadDIR(int drive_idx) {
+	if (drive_idx < 0 || drive_idx >= 4) return 0xF8;
+	uint8_t b = 0x78;
+	const bool changed = (drive_idx < MAX_DISK_IMAGES && imageDiskChange[drive_idx]);
+	const bool no_disk = (drive_idx < MAX_DISK_IMAGES && imageDiskList[drive_idx] == NULL);
+	if (changed || fdc_kiosk_door_open[drive_idx] || no_disk) {
+		b |= 0x80;
+	}
+	return b;
+}
+#endif
 static void fdc_baseio98_w(Bitu port,Bitu val,Bitu iolen);
 static Bitu fdc_baseio98_r(Bitu port,Bitu iolen);
 static void fdc_baseio_w(Bitu port,Bitu val,Bitu iolen);
@@ -303,7 +391,11 @@ void FloppyController::ProcessReadID(void) {
 	imageDisk *image=NULL;
 	if (dev != NULL) image = dev->getImage();
 
+#if defined(C_KIOSK)
+	if (devidx >= 0 && devidx < MAX_DISK_IMAGES && !FDC_IsDoorOpen(devidx)) imageDiskChange[devidx] = false;
+#else
 	if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+#endif
 	if (dev != NULL && dev->motor && dev->select && image != NULL && (in_cmd[0]&0x40)/*MFM=1*/ &&
 		current_cylinder[devidx] < image->cylinders && ((in_cmd[1]&4U)?1U:0U) <= image->heads) {
 		int ns = (int)floor(dev->floppy_image_motor_position() * image->sectors);
@@ -474,6 +566,13 @@ void FloppyController::update_ST3() {
 
 	if (dev != NULL)
 		ST[3] |= (dev->track0 ? 0x10 : 0)/*TRACK 0 signal from device*/;
+#if defined(C_KIOSK)
+	{
+		const int sel_drv = drive_selected() & 3;
+		if (FDC_IsWriteProtected(sel_drv)) ST[3] |= 0x40;
+		if (FDC_IsDoorOpen(sel_drv)) ST[3] &= ~0x20;
+	}
+#endif
 }
 
 void FloppyController::reset_io() {
@@ -808,6 +907,9 @@ void FloppyController::on_fdc_in_command() {
 			 */
 			reset_res();
 			prepare_res_phase(1);
+#if defined(C_KIOSK)
+			update_ST3();
+#endif
 			out_res[0] = ST[3];
 			ST[0] = 0x00 | devidx;
 			break;
@@ -827,7 +929,11 @@ void FloppyController::on_fdc_in_command() {
 			 */
 			/* must have a device present. must have an image. device motor and select must be enabled.
 			 * current physical cylinder position must be within range of the image. request must have MFM bit set. */
-			if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+		#if defined(C_KIOSK)
+	if (devidx >= 0 && devidx < MAX_DISK_IMAGES && !FDC_IsDoorOpen(devidx)) imageDiskChange[devidx] = false;
+#else
+	if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+#endif
 			dma = GetDMAChannel(DMA);
 			if (dev != NULL && dma != NULL && dev->motor && dev->select && image != NULL && (in_cmd[0]&0x40)/*MFM=1*/ &&
 				current_cylinder[devidx] < image->cylinders && ((in_cmd[1]&4U)?1U:0U) <= image->heads &&
@@ -888,6 +994,14 @@ void FloppyController::on_fdc_in_command() {
 
 					/* write sector */
 					Int13Status err = image->Write_Sector(in_cmd[3]/*head*/,in_cmd[2]/*cylinder*/,in_cmd[4]/*sector*/,sector,sector_size_bytes);
+#if defined(C_KIOSK)
+					if (err == Int13Status::WriteProtected || FDC_IsWriteProtected(devidx)) {
+						ST[0] = (ST[0] & 0x1F) | 0x40;
+						ST[1] = (1 << 1)/*not writeable (WP)*/;
+						ST[2] = 0;
+						break;
+					}
+#endif
 					if (err != Int13Status::NoError) {
 						fail = true;
 						break;
@@ -951,7 +1065,11 @@ void FloppyController::on_fdc_in_command() {
 			 * In order to support copy-protected booter games (IBM PC or PC-98) the sector number is NOT range
 			 * limited in order to support games such as Star Cruiser that look for intentionally out of range
 			 * sector numbers. */
-			if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+		#if defined(C_KIOSK)
+	if (devidx >= 0 && devidx < MAX_DISK_IMAGES && !FDC_IsDoorOpen(devidx)) imageDiskChange[devidx] = false;
+#else
+	if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+#endif
 			dma = GetDMAChannel(DMA);
 			if (dev != NULL && dma != NULL && dev->motor && dev->select && image != NULL && (in_cmd[0]&0x40)/*MFM=1*/ &&
 					current_cylinder[devidx] < image->cylinders && ((in_cmd[1]&4U)?1U:0U) <= image->heads &&
@@ -1067,7 +1185,11 @@ void FloppyController::on_fdc_in_command() {
 			break;
 		case 0x07: /* Calibrate drive */
 			ST[0] = devidx;
-			if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+		#if defined(C_KIOSK)
+	if (devidx >= 0 && devidx < MAX_DISK_IMAGES && !FDC_IsDoorOpen(devidx)) imageDiskChange[devidx] = false;
+#else
+	if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+#endif
 			if (instant_mode) {
 				/* move head to track 0 */
 				current_cylinder[devidx] = 0;
@@ -1165,7 +1287,11 @@ void FloppyController::on_fdc_in_command() {
 			 */
 			/* the raw images used by DOSBox cannot represent "deleted sectors", so always fail */
 			reset_res();
-			if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+		#if defined(C_KIOSK)
+	if (devidx >= 0 && devidx < MAX_DISK_IMAGES && !FDC_IsDoorOpen(devidx)) imageDiskChange[devidx] = false;
+#else
+	if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+#endif
 			ST[0] = (ST[0] & 0x1F) | 0x80;
 			ST[1] = (1 << 0)/*missing address mark*/ | (1 << 2)/*no data*/;
 			ST[2] = (1 << 0)/*missing data address mark*/;
@@ -1203,7 +1329,11 @@ void FloppyController::on_fdc_in_command() {
 			break;
 		case 0x0F: /* Seek Head */
 			ST[0] = 0x00 | drive_selected();
-			if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+		#if defined(C_KIOSK)
+	if (devidx >= 0 && devidx < MAX_DISK_IMAGES && !FDC_IsDoorOpen(devidx)) imageDiskChange[devidx] = false;
+#else
+	if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+#endif
 			if (instant_mode) {
 				/* move head to whatever track was wanted */
 				current_cylinder[devidx] = in_cmd[2]; /* from 3rd byte of command */
@@ -1601,7 +1731,17 @@ static Bitu fdc_baseio_r(Bitu port,Bitu iolen) {
 			/* HACK: Re-use from INT 13h emulation */
 			/* WARNING: The meaning of this bit changes whether PC/AT, PS/2, or other modes.
 			 *          Depending on which, it's either inverted, or not. Imagine model-specific Opposite Day */
+#if defined(C_KIOSK)
+			{
+				const int devidx = fdc->drive_selected() & 3;
+				const bool has_img = (fdc->device[devidx] != NULL && fdc->device[devidx]->getImage() != NULL);
+				if ((devidx < MAX_DISK_IMAGES && imageDiskChange[devidx]) || FDC_IsDoorOpen(devidx) || !has_img) {
+					b |= 0x80;
+				}
+			}
+#else
 			if (fdc->interface_index < MAX_DISK_IMAGES && imageDiskChange[fdc->interface_index]) b |= 0x80;
+#endif
 
 			return b;
 		default:

@@ -9,7 +9,14 @@
 #include "machine/kioskext_bin.h"
 #include "machine/boot_injector.h"
 #include "ui/kiosk_ui.h"
+#include "ui/view_disk_caddy.h"
+#include "ui/runtime_overlay.h"
 #include "kiosk_main.h"
+#include "../src/dos/drives.h"
+#include "bios_disk.h"
+#include "ide.h"
+#include "pic.h"
+#include "timer.h"
 #include <cstdio>
 #include <fstream>
 #include "dosbox.h"
@@ -1469,6 +1476,413 @@ TEST(KioskBootInjectorTest, Windows9xRunOnceAndOsIdFallbackSynthesis) {
     std::string bat_fallback = BootInjector::GetInstance().SynthesizeKioskGoBat(m, win_fallback);
     EXPECT_NE(std::string::npos, bat_fallback.find("C:\\WINDOWS\\WIN.COM DiabloLauncher.exe\r\n"));
     EXPECT_EQ(std::string::npos, bat_fallback.find("KIOSKEXT.COM"));
+}
+
+// ----------------------------------------------------------------------------
+// Phase 4: Skeuomorphic Media Caddy & Runtime Disk-Swap Overlay Tests
+// ----------------------------------------------------------------------------
+
+namespace {
+
+void AdvanceEmulatedPicTimeMs(int milliseconds) {
+    if (CPU_CycleMax <= 0) {
+        CPU_CycleMax = 3000;
+    }
+    for (int ms = 0; ms < milliseconds; ++ms) {
+        CPU_CycleLeft = CPU_CycleMax;
+        CPU_Cycles = 0;
+        TIMER_AddTick();
+        CPU_CycleLeft = CPU_CycleMax;
+        CPU_Cycles = 0;
+        PIC_RunQueue();
+    }
+}
+
+bool WriteRawFloppyFileWithVolumeLabel(
+    const std::string& path,
+    size_t total_bytes,
+    const std::string& bpb_label,
+    const std::string& root_vol_label = ""
+) {
+    std::vector<uint8_t> img(total_bytes, 0);
+    if (total_bytes < 4096) return false;
+
+    // Minimal valid FAT12 BPB
+    img[0x00] = 0xEB; img[0x01] = 0x3C; img[0x02] = 0x90;
+    std::memcpy(&img[0x03], "MSDOS5.0", 8);
+    img[0x0B] = 0x00; img[0x0C] = 0x02; // 512 bytes/sec
+    img[0x0D] = 0x01;                   // 1 sec/clus
+    img[0x0E] = 0x01; img[0x0F] = 0x00; // 1 reserved sector
+    img[0x10] = 0x02;                   // 2 FATs
+    img[0x11] = 0xE0; img[0x12] = 0x00; // 224 root entries
+    const uint16_t tot_sec = static_cast<uint16_t>(total_bytes / 512u);
+    img[0x13] = static_cast<uint8_t>(tot_sec & 0xFFu);
+    img[0x14] = static_cast<uint8_t>((tot_sec >> 8) & 0xFFu);
+    img[0x15] = 0xF0;
+    img[0x16] = 0x03; img[0x17] = 0x00; // 3 sectors/FAT
+    img[0x18] = 18;   img[0x19] = 0;
+    img[0x1A] = 2;    img[0x1B] = 0;
+    img[0x26] = 0x29;                   // Extended boot signature
+    std::memset(&img[0x2B], ' ', 11);
+    for (size_t i = 0; i < bpb_label.size() && i < 11; ++i) {
+        img[0x2B + i] = static_cast<uint8_t>(bpb_label[i]);
+    }
+    std::memcpy(&img[0x36], "FAT12   ", 8);
+    img[0x1FE] = 0x55; img[0x1FF] = 0xAA;
+
+    // Root directory starts at sector (1 + 2 * 3) = sector 7 (offset 7 * 512 = 3584)
+    if (!root_vol_label.empty()) {
+        const size_t root_ofs = 7u * 512u;
+        std::memset(&img[root_ofs], ' ', 11);
+        for (size_t i = 0; i < root_vol_label.size() && i < 11; ++i) {
+            img[root_ofs + i] = static_cast<uint8_t>(root_vol_label[i]);
+        }
+        img[root_ofs + 11] = 0x08; // ATTR_VOLUME_ID
+    }
+
+    FILE* fp = std::fopen(path.c_str(), "wb");
+    if (!fp) return false;
+    const size_t written = std::fwrite(img.data(), 1, img.size(), fp);
+    std::fclose(fp);
+    return (written == img.size());
+}
+
+} // anonymous namespace
+
+TEST(KioskDiskCaddyTest, MediaInspectorDetectsFloppyGeometriesAndFatVolumeLabel) {
+    const std::string base = BootInjector::GetInstance().GetDefaultDispatchImagePath();
+    const std::string p360  = base + "_360k.img";
+    const std::string p720  = base + "_720k.img";
+    const std::string p1200 = base + "_1200k.img";
+    const std::string p1440 = base + "_1440k.img";
+
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(p360,  360u * 1024u,  "ULTIMA_IV", ""));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(p720,  720u * 1024u,  "NO NAME",   "MONKEY_DISK"));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(p1200, 1200u * 1024u, "WING_CMD1", ""));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(p1440, 1440u * 1024u, "DOOM2_DISK1", "MONKEY_DISK"));
+
+    InspectedMediaInfo info360, info720, info1200, info1440;
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(p360, info360));
+    EXPECT_STREQ("FLOPPY_525_360K", info360.media_type.c_str());
+    EXPECT_STREQ("CHARCOAL_525", info360.physical_style.c_str());
+    EXPECT_STREQ("ULTIMA_IV", info360.volume_label.c_str());
+
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(p720, info720));
+    EXPECT_STREQ("FLOPPY_35_720K", info720.media_type.c_str());
+    EXPECT_STREQ("MONKEY_DISK", info720.volume_label.c_str());
+
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(p1200, info1200));
+    EXPECT_STREQ("FLOPPY_525_1200K", info1200.media_type.c_str());
+    EXPECT_STREQ("CHARCOAL_525", info1200.physical_style.c_str());
+    EXPECT_STREQ("WING_CMD1", info1200.volume_label.c_str());
+
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(p1440, info1440));
+    EXPECT_STREQ("FLOPPY_35_1440K", info1440.media_type.c_str());
+    EXPECT_STREQ("MONKEY_DISK", info1440.volume_label.c_str());
+
+    std::remove(p360.c_str());
+    std::remove(p720.c_str());
+    std::remove(p1200.c_str());
+    std::remove(p1440.c_str());
+}
+
+TEST(KioskDiskCaddyTest, MediaInspectorExtractsIso9660PvdAndCueRedbookAudio) {
+    const std::string base = BootInjector::GetInstance().GetDefaultDispatchImagePath();
+    const std::string iso_path = base + "_sc2000.iso";
+    const std::string cue_path = base + "_sc2000.cue";
+
+    // Build a minimal 18-sector ISO9660 image with Primary Volume Descriptor at sector 16 (0x8000)
+    std::vector<uint8_t> iso_bytes(18u * 2048u, 0);
+    iso_bytes[0x8000] = 0x01; // Primary Volume Descriptor type
+    std::memcpy(&iso_bytes[0x8001], "CD001", 5);
+    iso_bytes[0x8006] = 0x01; // PVD version
+    std::memset(&iso_bytes[0x8028], ' ', 32);
+    const char* vol_id = "SC2000_SE_CD";
+    std::memcpy(&iso_bytes[0x8028], vol_id, std::strlen(vol_id));
+
+    // Terminator Volume Descriptor at sector 17
+    iso_bytes[17u * 2048u] = 0xFF;
+    std::memcpy(&iso_bytes[17u * 2048u + 1], "CD001", 5);
+
+    {
+        FILE* fp = std::fopen(iso_path.c_str(), "wb");
+        ASSERT_NE(nullptr, fp);
+        ASSERT_EQ(iso_bytes.size(), std::fwrite(iso_bytes.data(), 1, iso_bytes.size(), fp));
+        std::fclose(fp);
+    }
+
+    {
+        std::ofstream cue_ofs(cue_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(cue_ofs.is_open());
+        cue_ofs << "FILE \"" << iso_path << "\" BINARY\r\n"
+                << "  TRACK 01 MODE1/2048\r\n"
+                << "    INDEX 01 00:00:00\r\n"
+                << "  TRACK 02 AUDIO\r\n"
+                << "    INDEX 01 02:00:00\r\n";
+    }
+
+    InspectedMediaInfo iso_info;
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(iso_path, iso_info));
+    EXPECT_STREQ("CDROM_ISO", iso_info.media_type.c_str());
+    EXPECT_STREQ("JEWEL_CD", iso_info.physical_style.c_str());
+    EXPECT_STREQ("SC2000_SE_CD", iso_info.volume_label.c_str());
+    EXPECT_FALSE(iso_info.has_redbook_audio);
+
+    InspectedMediaInfo cue_info;
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(cue_path, cue_info));
+    EXPECT_STREQ("CDROM_CUE", cue_info.media_type.c_str());
+    EXPECT_STREQ("JEWEL_CD", cue_info.physical_style.c_str());
+    EXPECT_STREQ("SC2000_SE_CD", cue_info.volume_label.c_str());
+    EXPECT_TRUE(cue_info.has_redbook_audio);
+
+    std::remove(cue_path.c_str());
+    std::remove(iso_path.c_str());
+}
+
+TEST(KioskDiskCaddyTest, DeterministicPhysicalStyleVarietyAndAngleJitter) {
+    bool saw_beige = false;
+    bool saw_blue = false;
+    bool saw_black = false;
+
+    for (int i = 0; i < 32; ++i) {
+        const std::string seed = "floppy_seed_" + std::to_string(i);
+        const std::string style1 = DiskCaddyView::ResolvePhysicalStyle("FLOPPY_35_1440K", "", seed);
+        const std::string style2 = DiskCaddyView::ResolvePhysicalStyle("FLOPPY_35_1440K", "", seed);
+        EXPECT_EQ(style1, style2); // Deterministic across runs
+
+        const uint32_t crc_mod = DiskCaddyView::ComputeStringCrc32(seed) % 3u;
+        if (crc_mod == 0u) {
+            EXPECT_STREQ("BEIGE_35", style1.c_str());
+            saw_beige = true;
+        } else if (crc_mod == 1u) {
+            EXPECT_STREQ("BLUE_35", style1.c_str());
+            saw_blue = true;
+        } else {
+            EXPECT_STREQ("BLACK_35", style1.c_str());
+            saw_black = true;
+        }
+
+        const float jitter1 = DiskCaddyView::ComputeStickerAngleJitterDeg(seed);
+        const float jitter2 = DiskCaddyView::ComputeStickerAngleJitterDeg(seed);
+        EXPECT_FLOAT_EQ(jitter1, jitter2);
+        EXPECT_GE(jitter1, -0.8f);
+        EXPECT_LE(jitter1, 0.8f);
+    }
+
+    EXPECT_TRUE(saw_beige);
+    EXPECT_TRUE(saw_blue);
+    EXPECT_TRUE(saw_black);
+
+    // 5.25" always resolves to CHARCOAL_525; CD-ROM respects GOLD_CD
+    EXPECT_STREQ("CHARCOAL_525",
+                 DiskCaddyView::ResolvePhysicalStyle("FLOPPY_525_360K", "", "any").c_str());
+    EXPECT_STREQ("GOLD_CD",
+                 DiskCaddyView::ResolvePhysicalStyle("CDROM_ISO", "GOLD_CD", "any").c_str());
+}
+
+TEST(KioskRuntimeSwapTest, FloppyHotSwapTogglesFdc0x3F7DskChgAndHoldsDoorOpen100ms) {
+    const std::string base = BootInjector::GetInstance().GetDefaultDispatchImagePath();
+    const std::string disk1_path = base + "_swap_disk1.img";
+    const std::string disk2_path = base + "_swap_disk2.img";
+    const std::string diskb_path = base + "_swap_diskb.img";
+
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(disk1_path, 1440u * 1024u, "DISK_ONE"));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(disk2_path, 1440u * 1024u, "DISK_TWO"));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(diskb_path, 1440u * 1024u, "DISK_BEE"));
+
+    // Mount initial floppies in Drive A: (0) and Drive B: (1)
+    ASSERT_TRUE(DriveManager::AppendAndSwapDisk(0, disk1_path, false, false));
+    ASSERT_TRUE(DriveManager::AppendAndSwapDisk(1, diskb_path, false, false));
+
+    // Close door after initial mount by advancing 110ms
+    AdvanceEmulatedPicTimeMs(110);
+    EXPECT_FALSE(FDC_IsDoorOpen(0));
+    EXPECT_FALSE(FDC_IsDoorOpen(1));
+
+    // Simulate guest clearing initial DSKCHG on A: and B:
+    imageDiskChange[0] = false;
+    imageDiskChange[1] = false;
+    EXPECT_EQ(0u, FDC_DebugReadDIR(0) & 0x80u);
+    EXPECT_EQ(0u, FDC_DebugReadDIR(1) & 0x80u);
+
+    // Hot-swap Disk 2 into Drive A: with write_protected = true
+    ASSERT_TRUE(DriveManager::AppendAndSwapDisk(0, disk2_path, false, true));
+    ASSERT_NE(nullptr, imageDiskList[0]);
+    EXPECT_STREQ(disk2_path.c_str(), DriveManager::GetKioskActiveDiskPath(0).c_str());
+
+    // Verify 100ms virtual door-open state & 0x3F7 bit 7 (0x80 DSKCHG) high on Drive A:,
+    // while Drive B: remains untouched!
+    EXPECT_TRUE(FDC_IsDoorOpen(0));
+    EXPECT_NE(0u, FDC_DebugReadDIR(0) & 0x80u);
+    EXPECT_FALSE(FDC_IsDoorOpen(1));
+    EXPECT_EQ(0u, FDC_DebugReadDIR(1) & 0x80u);
+
+    // Verify write-protection blocks sector writes with Int13Status::WriteProtected (0x03)
+    uint8_t dummy_sector[512] = { 0 };
+    EXPECT_EQ(Int13Status::WriteProtected, imageDiskList[0]->Write_AbsoluteSector(0, dummy_sector));
+
+    // At 50ms of emulated CPU time, the virtual floppy door must STILL be held open
+    AdvanceEmulatedPicTimeMs(50);
+    EXPECT_TRUE(FDC_IsDoorOpen(0));
+    EXPECT_NE(0u, FDC_DebugReadDIR(0) & 0x80u);
+
+    // Past 100ms (e.g. +60ms -> 110ms total), the virtual door closes and DSKCHG remains latched
+    AdvanceEmulatedPicTimeMs(60);
+    EXPECT_FALSE(FDC_IsDoorOpen(0));
+    EXPECT_TRUE(imageDiskChange[0]);
+    EXPECT_NE(0u, FDC_DebugReadDIR(0) & 0x80u);
+
+    // Clean up test floppy mounts
+    DriveManager::EjectDriveMedia(0, false);
+    DriveManager::EjectDriveMedia(1, false);
+    for (int i = 0; i < MAX_SWAPPABLE_DISKS; ++i) {
+        if (diskSwap[i] != NULL) {
+            diskSwap[i]->Release();
+            diskSwap[i] = NULL;
+        }
+    }
+    std::remove(disk1_path.c_str());
+    std::remove(disk2_path.c_str());
+    std::remove(diskb_path.c_str());
+}
+
+TEST(KioskRuntimeSwapTest, AtapiCdRomHotSwapTriggersUnitAttentionAsc28) {
+    // 1. Immediate transition (0.0ms) -> LOAD_DISC_READIED with SK=0x06 (UNIT ATTENTION), ASC=0x28, ASCQ=0x00
+    ASSERT_TRUE(Kiosk_IDE_NotifyATAPIMediaChange(3 /* Drive D: */, 0.0));
+    uint8_t sk = 0, asc = 0, ascq = 0;
+    int loading_mode = -1;
+    ASSERT_TRUE(Kiosk_IDE_GetATAPISense(3, sk, asc, ascq, loading_mode));
+    EXPECT_EQ(0x06u, sk);
+    EXPECT_EQ(0x28u, asc);
+    EXPECT_EQ(0x00u, ascq);
+
+    // 2. Timed 250ms virtual tray eject/insert cycle:
+    //    t=0ms:    LOAD_INSERT_CD (SK=0x02 NOT READY, ASC=0x3A MEDIUM NOT PRESENT)
+    //    t=130ms:  LOAD_DISC_LOADING (SK=0x02 NOT READY, ASC=0x04, ASCQ=0x01 BECOMING READY)
+    //    t=260ms:  LOAD_DISC_READIED (SK=0x06 UNIT ATTENTION, ASC=0x28, ASCQ=0x00 MEDIUM MAY HAVE CHANGED)
+    ASSERT_TRUE(Kiosk_IDE_NotifyATAPIMediaChange(3 /* Drive D: */, 250.0));
+    ASSERT_TRUE(Kiosk_IDE_GetATAPISense(3, sk, asc, ascq, loading_mode));
+    EXPECT_EQ(0x02u, sk);
+    EXPECT_EQ(0x3Au, asc);
+
+    AdvanceEmulatedPicTimeMs(135);
+    ASSERT_TRUE(Kiosk_IDE_GetATAPISense(3, sk, asc, ascq, loading_mode));
+    EXPECT_EQ(0x02u, sk);
+    EXPECT_EQ(0x04u, asc);
+    EXPECT_EQ(0x01u, ascq);
+
+    AdvanceEmulatedPicTimeMs(135);
+    ASSERT_TRUE(Kiosk_IDE_GetATAPISense(3, sk, asc, ascq, loading_mode));
+    EXPECT_EQ(0x06u, sk);
+    EXPECT_EQ(0x28u, asc);
+    EXPECT_EQ(0x00u, ascq);
+}
+
+TEST_F(KioskDatabaseFixture, OverlayCachesSessionCaddyAndTogglesViewMode) {
+    const std::string base = BootInjector::GetInstance().GetDefaultDispatchImagePath();
+    const std::string disk1_path = base + "_ovl_disk1.img";
+    const std::string disk2_path = base + "_ovl_disk2.img";
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(disk1_path, 1440u * 1024u, "KQ6_DISK1"));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(disk2_path, 1440u * 1024u, "KQ6_DISK2"));
+
+    KioskDatabase& db = KioskDatabase::GetInstance();
+
+    MachineRecord mach;
+    mach.id = "mach-486";
+    mach.display_name = "486DX2 Sound Blaster 16";
+    mach.archetype_id = KioskArchetypes::DX2_486;
+    mach.archetype_tier = 4;
+    mach.boot_mode = "INTEGRATED_DOS";
+    ASSERT_TRUE(db.InsertMachine(mach));
+
+    CatalogItemRecord item;
+    item.id = "item-kq6";
+    item.machine_id = mach.id;
+    item.item_type = "GAME";
+    item.title = "King's Quest VI";
+    item.launch_mechanism = "INTEGRATED_AUTOEXEC";
+    item.guest_executable = "SIERRA.EXE";
+    ASSERT_TRUE(db.InsertCatalogItem(item));
+
+    MediaPoolRecord m1;
+    m1.id = "med-kq6-1";
+    m1.file_path = disk1_path;
+    m1.media_type = "FLOPPY_35_1440K";
+    m1.label_title = "King's Quest VI - Disk 1";
+    ASSERT_TRUE(db.InsertMedia(m1));
+
+    MediaPoolRecord m2;
+    m2.id = "med-kq6-2";
+    m2.file_path = disk2_path;
+    m2.media_type = "FLOPPY_35_1440K";
+    m2.label_title = "King's Quest VI - Disk 2";
+    m2.is_write_protected = true;
+    ASSERT_TRUE(db.InsertMedia(m2));
+
+    CaddyBindingRecord b1;
+    b1.catalog_item_id = item.id;
+    b1.media_id = m1.id;
+    b1.target_drive = "A";
+    b1.slot_order = 1;
+    ASSERT_TRUE(db.AddCaddyBinding(b1));
+
+    CaddyBindingRecord b2;
+    b2.catalog_item_id = item.id;
+    b2.media_id = m2.id;
+    b2.target_drive = "A";
+    b2.slot_order = 2;
+    ASSERT_TRUE(db.AddCaddyBinding(b2));
+
+    // Set active launch context and enter STATE_RUNTIME_OVERLAY
+    KioskManager& km = KioskManager::GetInstance();
+    LaunchContext ctx;
+    ctx.machine_id = mach.id;
+    ctx.catalog_item_id = item.id;
+    ctx.is_real_hdd_boot = false;
+    km.SetLaunchContext(ctx);
+    km.SetState(KioskState::STATE_EMULATION_RUNNING);
+    km.EnterRuntimeOverlay();
+    EXPECT_EQ(KioskState::STATE_RUNTIME_OVERLAY, km.GetState());
+
+    RuntimeOverlay& ovl = RuntimeOverlay::GetInstance();
+    ASSERT_GE(ovl.GetSessionCaddy().size(), 2u);
+    EXPECT_STREQ("KQ6_DISK1", ovl.GetSessionCaddy()[0].media.volume_label.c_str());
+    EXPECT_STREQ("KQ6_DISK2", ovl.GetSessionCaddy()[1].media.volume_label.c_str());
+    EXPECT_EQ(CaddyViewMode::SKEUOMORPHIC, ovl.GetViewMode());
+
+    // Toggle view mode via 'V' key event
+    SDL_Event key_v = {};
+    key_v.type = SDL_KEYDOWN;
+    key_v.key.repeat = 0;
+    key_v.key.keysym.sym = SDLK_v;
+    EXPECT_TRUE(ovl.HandleInputEvent(key_v));
+    EXPECT_EQ(CaddyViewMode::LIST, ovl.GetViewMode());
+
+    // Toggle view mode back via Gamepad Y button event
+    SDL_Event pad_y = {};
+    pad_y.type = SDL_CONTROLLERBUTTONDOWN;
+    pad_y.cbutton.button = SDL_CONTROLLER_BUTTON_Y;
+    EXPECT_TRUE(ovl.HandleInputEvent(pad_y));
+    EXPECT_EQ(CaddyViewMode::SKEUOMORPHIC, ovl.GetViewMode());
+
+    // Perform hot-swap of Caddy Slot 1 (Disk 2, write-protected)
+    ASSERT_TRUE(ovl.PerformHotSwapCaddySlot(1));
+    EXPECT_STREQ(disk2_path.c_str(), DriveManager::GetKioskActiveDiskPath(0).c_str());
+    EXPECT_TRUE(FDC_IsWriteProtected(0));
+
+    // Resume emulation
+    km.ResumeEmulation();
+    EXPECT_EQ(KioskState::STATE_EMULATION_RUNNING, km.GetState());
+
+    DriveManager::EjectDriveMedia(0, false);
+    for (int i = 0; i < MAX_SWAPPABLE_DISKS; ++i) {
+        if (diskSwap[i] != NULL) {
+            diskSwap[i]->Release();
+            diskSwap[i] = NULL;
+        }
+    }
+    std::remove(disk1_path.c_str());
+    std::remove(disk2_path.c_str());
 }
 
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

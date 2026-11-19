@@ -4,6 +4,8 @@ noinst_LIBRARIES = libkiosk.a
 libkiosk_a_SOURCES = kiosk_main.cpp kiosk_main.h kiosk_types.h \
                      kiosk_db.cpp kiosk_db.h \
                      ui/kiosk_ui.cpp ui/kiosk_ui.h \
+                     ui/view_disk_caddy.cpp ui/view_disk_caddy.h \
+                     ui/runtime_overlay.cpp ui/runtime_overlay.h \
                      machine/archetypes.cpp machine/archetypes.h \
                      machine/config_synthesizer.cpp machine/config_synthesizer.h \
                      machine/boot_injector.cpp machine/boot_injector.h machine/kioskext_bin.h

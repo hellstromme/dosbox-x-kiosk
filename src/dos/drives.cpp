@@ -629,3 +629,328 @@ void POD_Load_DOS_DriveManager( std::istream& stream )
 {
 	DriveManager::LoadState(stream);
 }
+
+#if defined(C_KIOSK)
+bool MSCDEX_HasDrive(char driveLetter);
+
+static std::string Kiosk_StripWriteProtectPrefix(const std::string& path) {
+	if (path.size() > 1 && path[0] == ':' && path[1] != '\\' && path[1] != '/') {
+		return path.substr(1);
+	}
+	return path;
+}
+
+static std::string Kiosk_ExtractDriveHostPath(DOS_Drive* drv, int drive) {
+	if (drv != NULL) {
+		fatDrive* fdp = dynamic_cast<fatDrive*>(drv);
+		if (fdp != NULL && fdp->loadedDisk != NULL && !fdp->loadedDisk->diskname.empty()) {
+			return Kiosk_StripWriteProtectPrefix(fdp->loadedDisk->diskname);
+		}
+		const char* info = drv->GetInfo();
+		if (info != NULL && *info != '\0') {
+			if (strncmp(info, "isoDrive ", 9) == 0) {
+				return Kiosk_StripWriteProtectPrefix(std::string(info + 9));
+			}
+			if (strncmp(info, "fatDrive ", 9) == 0) {
+				return Kiosk_StripWriteProtectPrefix(std::string(info + 9));
+			}
+			if (strncmp(info, "local directory ", 16) == 0) {
+				return std::string(info + 16);
+			}
+		}
+	}
+	if (drive >= 0 && drive < MAX_DISK_IMAGES && imageDiskList[drive] != NULL && !imageDiskList[drive]->diskname.empty()) {
+		return Kiosk_StripWriteProtectPrefix(imageDiskList[drive]->diskname);
+	}
+	return std::string();
+}
+
+int DriveManager::GetKioskSlotCount(int drive) {
+	if (drive < 0 || drive >= DOS_DRIVES) return 0;
+	if (!driveInfos[drive].disks.empty()) {
+		return (int)driveInfos[drive].disks.size();
+	}
+	if (drive < 2 && swapInDisksSpecificDrive == drive) {
+		int count = 0;
+		for (int i = 0; i < MAX_SWAPPABLE_DISKS; ++i) {
+			if (diskSwap[i] != NULL) ++count;
+		}
+		if (count > 0) return count;
+	}
+	if (drive < MAX_DISK_IMAGES && imageDiskList[drive] != NULL) return 1;
+	if (Drives[drive] != NULL) return 1;
+	return 0;
+}
+
+int DriveManager::GetKioskCurrentSlot(int drive) {
+	if (drive < 0 || drive >= DOS_DRIVES) return 0;
+	if (!driveInfos[drive].disks.empty()) {
+		return (int)driveInfos[drive].currentDisk;
+	}
+	if (drive < 2 && swapInDisksSpecificDrive == drive) {
+		if (swapPosition >= 0 && swapPosition < MAX_SWAPPABLE_DISKS) {
+			return (int)swapPosition;
+		}
+	}
+	return 0;
+}
+
+std::string DriveManager::GetKioskActiveDiskPath(int drive) {
+	if (drive < 0 || drive >= DOS_DRIVES) return std::string();
+	if (drive < 2 && imageDiskList[drive] != NULL && !imageDiskList[drive]->diskname.empty()) {
+		return Kiosk_StripWriteProtectPrefix(imageDiskList[drive]->diskname);
+	}
+	if (Drives[drive] != NULL) {
+		std::string p = Kiosk_ExtractDriveHostPath(Drives[drive], drive);
+		if (!p.empty()) return p;
+	}
+	if (!driveInfos[drive].disks.empty() && driveInfos[drive].currentDisk < driveInfos[drive].disks.size()) {
+		return Kiosk_ExtractDriveHostPath(driveInfos[drive].disks[driveInfos[drive].currentDisk], drive);
+	}
+	return std::string();
+}
+
+std::vector<std::string> DriveManager::GetKioskDrivePaths(int drive) {
+	std::vector<std::string> paths;
+	if (drive < 0 || drive >= DOS_DRIVES) return paths;
+
+	if (!driveInfos[drive].disks.empty()) {
+		for (size_t i = 0; i < driveInfos[drive].disks.size(); ++i) {
+			std::string p = Kiosk_ExtractDriveHostPath(driveInfos[drive].disks[i], -1);
+			if (!p.empty()) paths.push_back(p);
+		}
+		return paths;
+	}
+
+	if (drive < 2 && swapInDisksSpecificDrive == drive) {
+		for (int i = 0; i < MAX_SWAPPABLE_DISKS; ++i) {
+			if (diskSwap[i] != NULL && !diskSwap[i]->diskname.empty()) {
+				paths.push_back(Kiosk_StripWriteProtectPrefix(diskSwap[i]->diskname));
+			}
+		}
+	}
+
+	if (paths.empty()) {
+		std::string active = GetKioskActiveDiskPath(drive);
+		if (!active.empty()) paths.push_back(active);
+	}
+	return paths;
+}
+
+bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bool is_cdrom, bool write_protected) {
+	if (drive < 0 || drive >= DOS_DRIVES || host_path.empty()) return false;
+
+	const std::string clean_path = Kiosk_StripWriteProtectPrefix(host_path);
+
+	if (!is_cdrom) {
+		if (drive >= 2) return false;
+
+		FILE* fp = fopen(clean_path.c_str(), write_protected ? "rb" : "rb+");
+		if (!fp && !write_protected) {
+			fp = fopen(clean_path.c_str(), "rb");
+		}
+		if (!fp) {
+			LOG_MSG("KIOSK DriveManager: Cannot open floppy image '%s'", clean_path.c_str());
+			return false;
+		}
+		fseek(fp, 0, SEEK_END);
+		long fsz = ftell(fp);
+		fseek(fp, 0, SEEK_SET);
+		if (fsz <= 0) {
+			fclose(fp);
+			return false;
+		}
+
+		if (!dos_kernel_disabled && (!driveInfos[drive].disks.empty() || dos.tables.mediaid != 0)) {
+			int existing_idx = -1;
+			for (size_t i = 0; i < driveInfos[drive].disks.size(); ++i) {
+				if (Kiosk_ExtractDriveHostPath(driveInfos[drive].disks[i], -1) == clean_path) {
+					existing_idx = (int)i;
+					break;
+				}
+			}
+
+			if (existing_idx >= 0) {
+				fclose(fp);
+				fp = NULL;
+				if ((int)driveInfos[drive].currentDisk != existing_idx) {
+					CycleDisks(drive, true, false, (unsigned int)(existing_idx + 1));
+				}
+				if (Drives[drive] != NULL) {
+					Drives[drive]->readonly = write_protected;
+					Drives[drive]->EmptyCache();
+					Drives[drive]->MediaChange();
+					fatDrive* fdp = dynamic_cast<fatDrive*>(Drives[drive]);
+					if (fdp != NULL && fdp->loadedDisk != NULL && imageDiskList[drive] != fdp->loadedDisk) {
+						if (imageDiskList[drive] != NULL) imageDiskList[drive]->Release();
+						imageDiskList[drive] = fdp->loadedDisk;
+						imageDiskList[drive]->Addref();
+					}
+				}
+			} else {
+				std::vector<std::string> opts;
+				fatDrive* new_fd = new fatDrive(clean_path.c_str(), 0, 0, 0, 0, opts);
+				if (new_fd != NULL && new_fd->created_successfully && new_fd->loadedDisk != NULL) {
+					fclose(fp);
+					fp = NULL;
+					new_fd->readonly = write_protected;
+					new_fd->loadedDisk->kiosk_write_protected = write_protected;
+					const bool was_empty = driveInfos[drive].disks.empty();
+					AppendDisk(drive, new_fd);
+					if (was_empty) {
+						InitializeDrive(drive);
+					} else {
+						unsigned int new_pos = (unsigned int)driveInfos[drive].disks.size();
+						CycleDisks(drive, true, false, new_pos);
+					}
+					if (imageDiskList[drive] != new_fd->loadedDisk) {
+						if (imageDiskList[drive] != NULL) imageDiskList[drive]->Release();
+						imageDiskList[drive] = new_fd->loadedDisk;
+						imageDiskList[drive]->Addref();
+					}
+					if (Drives[drive] != NULL) {
+						Drives[drive]->EmptyCache();
+						Drives[drive]->MediaChange();
+					}
+				} else {
+					delete new_fd;
+				}
+			}
+		}
+
+		if (fp != NULL) {
+			int existing_swap = -1;
+			if (swapInDisksSpecificDrive == drive) {
+				for (int i = 0; i < MAX_SWAPPABLE_DISKS; ++i) {
+					if (diskSwap[i] != NULL && Kiosk_StripWriteProtectPrefix(diskSwap[i]->diskname) == clean_path) {
+						existing_swap = i;
+						break;
+					}
+				}
+			}
+
+			if (existing_swap >= 0) {
+				fclose(fp);
+				fp = NULL;
+				swapPosition = existing_swap;
+				if (imageDiskList[drive] != NULL) imageDiskList[drive]->Release();
+				imageDiskList[drive] = diskSwap[existing_swap];
+				imageDiskList[drive]->Addref();
+			} else {
+				imageDisk* new_disk = new imageDisk(fp, clean_path.c_str(), (uint64_t)fsz, false);
+				fp = NULL;
+				new_disk->drvnum = (unsigned int)drive;
+				new_disk->kiosk_write_protected = write_protected;
+
+				if (imageDiskList[drive] != NULL) imageDiskList[drive]->Release();
+				imageDiskList[drive] = new_disk;
+				imageDiskList[drive]->Addref();
+
+				if (swapInDisksSpecificDrive == -1 || swapInDisksSpecificDrive == drive) {
+					swapInDisksSpecificDrive = drive;
+					for (int i = 0; i < MAX_SWAPPABLE_DISKS; ++i) {
+						if (diskSwap[i] == NULL) {
+							diskSwap[i] = new_disk;
+							new_disk->Addref();
+							swapPosition = i;
+							break;
+						}
+					}
+				}
+			}
+		}
+
+		if (imageDiskList[drive] != NULL) {
+			imageDiskList[drive]->kiosk_write_protected = write_protected;
+		}
+		updateFloppyDPT();
+		FDC_AssignINT13Disk((unsigned char)drive);
+		FDC_NotifyDiskSwap(drive, 100.0, write_protected);
+		return true;
+	}
+
+	// Optical CD-ROM hot-swap (D:, E:, etc.)
+	FILE* cd_fp = fopen(clean_path.c_str(), "rb");
+	if (!cd_fp) {
+		LOG_MSG("KIOSK DriveManager: Cannot open CD-ROM image '%s'", clean_path.c_str());
+		return false;
+	}
+	fclose(cd_fp);
+
+	int existing_cd_idx = -1;
+	for (size_t i = 0; i < driveInfos[drive].disks.size(); ++i) {
+		if (Kiosk_ExtractDriveHostPath(driveInfos[drive].disks[i], -1) == clean_path) {
+			existing_cd_idx = (int)i;
+			break;
+		}
+	}
+
+	if (existing_cd_idx >= 0) {
+		DOS_Drive* old_disk = Drives[drive];
+		DOS_Drive* new_disk = driveInfos[drive].disks[existing_cd_idx];
+		driveInfos[drive].currentDisk = (uint32_t)existing_cd_idx;
+		if (old_disk != NULL && new_disk != old_disk) {
+			strcpy(new_disk->curdir, old_disk->curdir);
+		}
+		new_disk->Activate();
+		if (!dos_kernel_disabled) new_disk->UpdateDPB(drive);
+		Drives[drive] = new_disk;
+		Drives[drive]->EmptyCache();
+		Kiosk_IDE_NotifyATAPIMediaChange((unsigned char)drive, 250.0);
+		return true;
+	}
+
+	int error = -1;
+	std::vector<std::string> options;
+	const bool had_mscdex = MSCDEX_HasDrive((char)('A' + drive));
+	if (dos_kernel_disabled && !had_mscdex) {
+		// REAL_HDD_BOOT without a boot-time CD-ROM in MSCDEX: mount directly onto ATAPI IDE
+		return Kiosk_IDE_MountATAPIMedia((unsigned char)drive, clean_path.c_str(), 250.0);
+	}
+
+	isoDrive* new_cd = new isoDrive((char)('A' + drive), clean_path.c_str(), 0xF8, error, options);
+	if (error != 0) {
+		delete new_cd;
+		if (dos_kernel_disabled) {
+			return Kiosk_IDE_MountATAPIMedia((unsigned char)drive, clean_path.c_str(), 250.0);
+		}
+		return false;
+	}
+
+	AppendDisk(drive, new_cd);
+	driveInfos[drive].currentDisk = (uint32_t)(driveInfos[drive].disks.size() - 1);
+	if (Drives[drive] != NULL) {
+		strcpy(new_cd->curdir, Drives[drive]->curdir);
+	}
+	Drives[drive] = new_cd;
+	new_cd->Activate();
+	if (!dos_kernel_disabled) new_cd->UpdateDPB(drive);
+	new_cd->EmptyCache();
+
+	if (!had_mscdex) {
+		signed char ide_idx = -1;
+		bool slave = false;
+		IDE_Auto(ide_idx, slave);
+		if (ide_idx >= 0) {
+			IDE_CDROM_Attach(ide_idx, slave, (unsigned char)drive);
+		}
+	}
+
+	Kiosk_IDE_MountATAPIMedia((unsigned char)drive, clean_path.c_str(), 250.0);
+	return true;
+}
+
+bool DriveManager::EjectDriveMedia(int drive, bool is_cdrom) {
+	if (drive < 0 || drive >= DOS_DRIVES) return false;
+	if (!is_cdrom) {
+		if (drive >= 2) return false;
+		if (imageDiskList[drive] != NULL) {
+			imageDiskList[drive]->Release();
+			imageDiskList[drive] = NULL;
+		}
+		FDC_NotifyDiskEject(drive);
+		return true;
+	}
+	return Kiosk_IDE_EjectATAPIMedia((unsigned char)drive);
+}
+#endif
