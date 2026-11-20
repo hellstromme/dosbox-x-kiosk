@@ -1153,6 +1153,9 @@ public:
 	void setFileName(const char* fileName);
 	char const* GetLabel(void) override {return discLabel;};
 	void Activate(void) override;
+#if defined(C_KIOSK)
+	void KioskSyncCDROMRef(void) { UpdateCDROMRef(); }
+#endif
 private:
 #if !defined(OSFREE)
 	int  readDirEntry(isoDirEntry* de, const uint8_t* data, unsigned int direntindex) const;

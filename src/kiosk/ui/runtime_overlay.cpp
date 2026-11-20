@@ -36,8 +36,12 @@ bool PathsMatchNormalized(const std::string& a, const std::string& b) {
     if (a.empty() || b.empty()) return false;
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
-        char ca = (a[i] == '\\') ? '/' : static_cast<char>(std::tolower(static_cast<unsigned char>(a[i])));
-        char cb = (b[i] == '\\') ? '/' : static_cast<char>(std::tolower(static_cast<unsigned char>(b[i])));
+        char ca = (a[i] == '\\') ? '/' : a[i];
+        char cb = (b[i] == '\\') ? '/' : b[i];
+#if defined(WIN32) || defined(_WIN32)
+        ca = static_cast<char>(std::tolower(static_cast<unsigned char>(ca)));
+        cb = static_cast<char>(std::tolower(static_cast<unsigned char>(cb)));
+#endif
         if (ca != cb) return false;
     }
     return true;
@@ -118,7 +122,7 @@ void RuntimeOverlay::OnEnterOverlay() {
     const LaunchContext ctx = KioskManager::GetInstance().GetCurrentLaunchContext();
     const std::string dispatch_path = KioskManager::GetInstance().GetActiveDispatchImagePath();
     const bool is_b_dispatch_reserved =
-        ctx.is_real_hdd_boot && !ctx.catalog_item_id.empty() && !dispatch_path.empty();
+        ctx.is_real_hdd_boot && !dispatch_path.empty();
 
     KioskDatabase& db = KioskDatabase::GetInstance();
     m_active_machine_name = "Default DOSBox-X Machine";
@@ -237,7 +241,7 @@ void RuntimeOverlay::RefreshDriveStatuses() {
     const LaunchContext ctx = KioskManager::GetInstance().GetCurrentLaunchContext();
     const std::string dispatch_path = KioskManager::GetInstance().GetActiveDispatchImagePath();
     const bool is_b_dispatch_reserved =
-        ctx.is_real_hdd_boot && !ctx.catalog_item_id.empty() && !dispatch_path.empty();
+        ctx.is_real_hdd_boot && !dispatch_path.empty();
 
     bool include_drive_e = (DriveManager::GetKioskSlotCount(4) > 0);
     for (size_t i = 0; i < m_session_caddy.size(); ++i) {
@@ -322,7 +326,7 @@ bool RuntimeOverlay::PerformHotSwap(
     std::string drv_letter = NormalizeDriveLetter(target_drive);
     const LaunchContext ctx = KioskManager::GetInstance().GetCurrentLaunchContext();
     const std::string dispatch_path = KioskManager::GetInstance().GetActiveDispatchImagePath();
-    if (drv_letter == "B" && ctx.is_real_hdd_boot && !ctx.catalog_item_id.empty() && !dispatch_path.empty()) {
+    if (drv_letter == "B" && ctx.is_real_hdd_boot && !dispatch_path.empty()) {
         LOG_MSG("KIOSK Overlay: Drive B: is reserved for ephemeral dispatch volume; routing hot-swap of '%s' to Drive A:.",
                 host_path.c_str());
         drv_letter = "A";
@@ -540,10 +544,16 @@ void RuntimeOverlay::RenderActiveDriveSlots() {
 
     const float avail_w = ImGui::GetContentRegionAvail().x;
     const size_t count = m_drive_statuses.size();
-    const float card_w = std::max(210.0f, (avail_w - static_cast<float>(count - 1) * 10.0f) / static_cast<float>(count));
+    const float spacing = 10.0f;
+    const float min_card_w = 210.0f;
+    size_t cols = count;
+    while (cols > 1 && (static_cast<float>(cols) * min_card_w + static_cast<float>(cols - 1) * spacing) > avail_w) {
+        --cols;
+    }
+    const float card_w = std::max(120.0f, (avail_w - static_cast<float>(cols - 1) * spacing) / static_cast<float>(cols));
 
     for (size_t i = 0; i < count; ++i) {
-        if (i > 0) ImGui::SameLine();
+        if (i % cols != 0) ImGui::SameLine();
         const RuntimeDriveSlotStatus& st = m_drive_statuses[i];
 
         std::string child_id = "##DriveSlotCard_" + st.drive_letter;
@@ -803,10 +813,10 @@ void RuntimeOverlay::Render() {
             );
         }
 
-        const float max_w = std::max(320.0f, viewport->WorkSize.x - 16.0f);
-        const float max_h = std::max(240.0f, viewport->WorkSize.y - 16.0f);
-        const float win_w = std::min(max_w, std::max(std::min(720.0f, max_w), std::min(1160.0f, viewport->WorkSize.x * 0.92f)));
-        const float win_h = std::min(max_h, std::max(std::min(480.0f, max_h), std::min(760.0f, viewport->WorkSize.y * 0.90f)));
+        const float max_w = std::max(1.0f, viewport->WorkSize.x - 16.0f);
+        const float max_h = std::max(1.0f, viewport->WorkSize.y - 16.0f);
+        const float win_w = std::min(viewport->WorkSize.x, std::min(max_w, std::max(std::min(720.0f, max_w), std::min(1160.0f, viewport->WorkSize.x * 0.92f))));
+        const float win_h = std::min(viewport->WorkSize.y, std::min(max_h, std::max(std::min(480.0f, max_h), std::min(760.0f, viewport->WorkSize.y * 0.90f))));
         ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(win_w, win_h), ImGuiCond_Always);
     }

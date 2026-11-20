@@ -476,7 +476,7 @@ void DriveManager::CycleDisks(int drive, bool notify, bool rev, unsigned int pos
 		// copy working directory, acquire system resources and finally switch to next drive
 		strcpy(newDisk->curdir, oldDisk->curdir);
 		newDisk->Activate();
-		if (!dos_kernel_disabled) newDisk->UpdateDPB(currentDrive);
+		if (!dos_kernel_disabled) newDisk->UpdateDPB(drive);
 		Drives[drive] = newDisk;
 		if (notify) LOG_MSG("Drive %c: disk %d of %d now active", 'A'+drive, currentDisk+1, numDisks);
 	}
@@ -695,8 +695,22 @@ int DriveManager::GetKioskCurrentSlot(int drive) {
 	return 0;
 }
 
+static bool kiosk_drive_ejected[DOS_DRIVES] = {};
+
+void Kiosk_DOS_SyncEjectedCDROM(unsigned char drive_index) {
+	if (drive_index >= DOS_DRIVES) return;
+	if (Drives[drive_index] != NULL) {
+		isoDrive* iso = dynamic_cast<isoDrive*>(Drives[drive_index]);
+		if (iso != NULL) {
+			iso->KioskSyncCDROMRef();
+		}
+		Drives[drive_index]->EmptyCache();
+	}
+}
+
 std::string DriveManager::GetKioskActiveDiskPath(int drive) {
 	if (drive < 0 || drive >= DOS_DRIVES) return std::string();
+	if (kiosk_drive_ejected[drive]) return std::string();
 	if (drive < 2 && imageDiskList[drive] != NULL && !imageDiskList[drive]->diskname.empty()) {
 		return Kiosk_StripWriteProtectPrefix(imageDiskList[drive]->diskname);
 	}
@@ -759,6 +773,8 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 	if (!is_cdrom) {
 		if (drive >= 2) return false;
 
+		bool effective_wp = write_protected;
+
 		// Check already-mounted DriveManager slots BEFORE any fopen() call:
 		// on Windows, IMGMOUNT opens floppy images via fopen_lock() with dwShareMode=0
 		// (exclusive lock), so re-opening an already-mounted image with fopen() fails.
@@ -780,7 +796,7 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 					Drives[drive] = driveInfos[drive].disks[existing_idx];
 				}
 				if (Drives[drive] != NULL) {
-					Drives[drive]->readonly = write_protected;
+					Drives[drive]->readonly = effective_wp;
 					Drives[drive]->Activate();
 					Drives[drive]->UpdateDPB(drive);
 					Drives[drive]->EmptyCache();
@@ -795,13 +811,17 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 				mounted_via_fat = true;
 			} else {
 				std::vector<std::string> opts;
-				if (write_protected) {
+				if (effective_wp) {
 					opts.push_back("readonly");
 				}
 				fatDrive* new_fd = new fatDrive(clean_path.c_str(), 0, 0, 0, 0, opts);
 				if (new_fd != NULL && new_fd->created_successfully && new_fd->loadedDisk != NULL) {
-					new_fd->readonly = write_protected;
-					new_fd->loadedDisk->kiosk_write_protected = write_protected;
+					if (new_fd->readonly) {
+						effective_wp = true;
+					} else {
+						new_fd->readonly = effective_wp;
+					}
+					new_fd->loadedDisk->kiosk_write_protected = effective_wp;
 					const bool was_empty = driveInfos[drive].disks.empty();
 					AppendDisk(drive, new_fd);
 					if (was_empty) {
@@ -844,9 +864,12 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 				imageDiskList[drive] = diskSwap[existing_swap];
 				imageDiskList[drive]->Addref();
 			} else {
-				FILE* fp = fopen(clean_path.c_str(), write_protected ? "rb" : "rb+");
-				if (!fp && !write_protected) {
+				FILE* fp = fopen(clean_path.c_str(), effective_wp ? "rb" : "rb+");
+				if (!fp && !effective_wp) {
 					fp = fopen(clean_path.c_str(), "rb");
+					if (fp) {
+						effective_wp = true;
+					}
 				}
 				if (!fp) {
 					LOG_MSG("KIOSK DriveManager: Cannot open raw floppy image '%s'", clean_path.c_str());
@@ -861,7 +884,7 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 				}
 				imageDisk* new_disk = new imageDisk(fp, clean_path.c_str(), (uint64_t)fsz, false);
 				new_disk->drvnum = (unsigned int)drive;
-				new_disk->kiosk_write_protected = write_protected;
+				new_disk->kiosk_write_protected = effective_wp;
 
 				if (imageDiskList[drive] != NULL) imageDiskList[drive]->Release();
 				imageDiskList[drive] = new_disk;
@@ -882,11 +905,12 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 		}
 
 		if (imageDiskList[drive] != NULL) {
-			imageDiskList[drive]->kiosk_write_protected = write_protected;
+			imageDiskList[drive]->kiosk_write_protected = effective_wp;
 		}
+		kiosk_drive_ejected[drive] = false;
 		updateFloppyDPT();
 		FDC_AssignINT13Disk((unsigned char)drive);
-		FDC_NotifyDiskSwap(drive, 100.0, write_protected);
+		FDC_NotifyDiskSwap(drive, 100.0, effective_wp);
 		return true;
 	}
 
@@ -917,6 +941,7 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 		if (!dos_kernel_disabled) new_disk->UpdateDPB(drive);
 		Drives[drive] = new_disk;
 		Drives[drive]->EmptyCache();
+		kiosk_drive_ejected[drive] = false;
 		Kiosk_IDE_NotifyATAPIMediaChange((unsigned char)drive, 250.0);
 		return true;
 	}
@@ -926,22 +951,29 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 	const bool had_mscdex = MSCDEX_HasDrive((char)('A' + drive));
 	if (dos_kernel_disabled && !had_mscdex) {
 		// REAL_HDD_BOOT without a boot-time CD-ROM in MSCDEX: mount directly onto ATAPI IDE
-		return Kiosk_IDE_MountATAPIMedia((unsigned char)drive, clean_path.c_str(), 250.0);
+		const bool ok = Kiosk_IDE_MountATAPIMedia((unsigned char)drive, clean_path.c_str(), 250.0);
+		if (ok) kiosk_drive_ejected[drive] = false;
+		return ok;
 	}
 
 	isoDrive* new_cd = new isoDrive((char)('A' + drive), clean_path.c_str(), 0xF8, error, options);
 	if (error != 0) {
 		delete new_cd;
 		if (dos_kernel_disabled) {
-			return Kiosk_IDE_MountATAPIMedia((unsigned char)drive, clean_path.c_str(), 250.0);
+			const bool ok = Kiosk_IDE_MountATAPIMedia((unsigned char)drive, clean_path.c_str(), 250.0);
+			if (ok) kiosk_drive_ejected[drive] = false;
+			return ok;
 		}
 		return false;
 	}
 
+	DOS_Drive* prev_drive = Drives[drive];
+	const uint32_t prev_slot = driveInfos[drive].currentDisk;
+
 	AppendDisk(drive, new_cd);
 	driveInfos[drive].currentDisk = (uint32_t)(driveInfos[drive].disks.size() - 1);
-	if (Drives[drive] != NULL) {
-		strcpy(new_cd->curdir, Drives[drive]->curdir);
+	if (prev_drive != NULL) {
+		strcpy(new_cd->curdir, prev_drive->curdir);
 	}
 	Drives[drive] = new_cd;
 	new_cd->Activate();
@@ -957,7 +989,20 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 		}
 	}
 
-	Kiosk_IDE_MountATAPIMedia((unsigned char)drive, clean_path.c_str(), 250.0);
+	if (!Kiosk_IDE_MountATAPIMedia((unsigned char)drive, clean_path.c_str(), 250.0)) {
+		driveInfos[drive].disks.pop_back();
+		driveInfos[drive].currentDisk = prev_slot;
+		Drives[drive] = prev_drive;
+		delete new_cd;
+		if (prev_drive != NULL) {
+			prev_drive->Activate();
+			if (!dos_kernel_disabled) prev_drive->UpdateDPB(drive);
+			prev_drive->EmptyCache();
+		}
+		return false;
+	}
+
+	kiosk_drive_ejected[drive] = false;
 	return true;
 }
 
@@ -969,9 +1014,18 @@ bool DriveManager::EjectDriveMedia(int drive, bool is_cdrom) {
 			imageDiskList[drive]->Release();
 			imageDiskList[drive] = NULL;
 		}
+		if (!dos_kernel_disabled && Drives[drive] != NULL) {
+			Drives[drive]->EmptyCache();
+			Drives[drive] = NULL;
+		}
+		kiosk_drive_ejected[drive] = true;
 		FDC_NotifyDiskEject(drive);
 		return true;
 	}
-	return Kiosk_IDE_EjectATAPIMedia((unsigned char)drive);
+	const bool ok = Kiosk_IDE_EjectATAPIMedia((unsigned char)drive);
+	if (ok) {
+		kiosk_drive_ejected[drive] = true;
+	}
+	return ok;
 }
 #endif

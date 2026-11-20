@@ -3028,6 +3028,8 @@ static IDEATAPICDROMDevice* Kiosk_IDE_FindOrCreateATAPI(unsigned char drive_inde
 			}
 		}
 	}
+	if (!create_if_missing) return NULL;
+
 	for (unsigned int ide = 0; ide < MAX_IDE_CONTROLLERS; ++ide) {
 		IDEController* c = idecontroller[ide];
 		if (!c) continue;
@@ -3035,7 +3037,7 @@ static IDEATAPICDROMDevice* Kiosk_IDE_FindOrCreateATAPI(unsigned char drive_inde
 			IDEDevice* dev = c->device[ms];
 			if (dev && dev->type == IDE_TYPE_CDROM) {
 				IDEATAPICDROMDevice* atapi = (IDEATAPICDROMDevice*)dev;
-				if (atapi->drive_index == 0xFFu || ide == 1) {
+				if (atapi->drive_index == 0xFFu) {
 					atapi->drive_index = drive_index;
 					out_pk = IDEEventPack(c->interface_index, ms).get();
 					return atapi;
@@ -3043,7 +3045,6 @@ static IDEATAPICDROMDevice* Kiosk_IDE_FindOrCreateATAPI(unsigned char drive_inde
 			}
 		}
 	}
-	if (!create_if_missing) return NULL;
 
 	IDEController* ctrl = (idecontroller[1] != NULL) ? idecontroller[1] : idecontroller[0];
 	if (ctrl == NULL && control != NULL) {
@@ -3151,24 +3152,47 @@ bool Kiosk_IDE_NotifyATAPIMediaChange(unsigned char drive_index, double tray_del
 	return true;
 }
 
+extern bool MSCDEX_HasDrive(char driveLetter);
+extern uint8_t MSCDEX_GetSubUnit(char driveLetter);
+extern void MSCDEX_ReplaceDrive(CDROM_Interface* cdrom, uint8_t subUnit);
+extern void Kiosk_DOS_SyncEjectedCDROM(unsigned char drive_index);
+
 bool Kiosk_IDE_EjectATAPIMedia(unsigned char drive_index) {
 	unsigned int pk = 0;
 	IDEATAPICDROMDevice* atapi = Kiosk_IDE_FindOrCreateATAPI(drive_index, pk, false);
-	if (!atapi) return false;
-
-	PIC_RemoveSpecificEvents(IDE_ATAPI_SpinDown, pk);
-	PIC_RemoveSpecificEvents(IDE_ATAPI_SpinUpComplete, pk);
-	PIC_RemoveSpecificEvents(IDE_ATAPI_CDInsertion, pk);
+	const char drv_letter = (char)('A' + drive_index);
+	const bool has_mscdex = MSCDEX_HasDrive(drv_letter);
+	if (!atapi && !has_mscdex) return false;
 
 	CDROM_Interface* empty_cd = NULL;
-	if (!CDROM_AllocateInterface("empty", true, 0xFFFF, &empty_cd) && empty_cd != NULL) {
-		if (atapi->cdrom) atapi->cdrom->Release();
-		atapi->cdrom = empty_cd;
+	const bool got_empty = (!CDROM_AllocateInterface("empty", true, 0xFFFF, &empty_cd) && empty_cd != NULL);
+
+	if (atapi) {
+		PIC_RemoveSpecificEvents(IDE_ATAPI_SpinDown, pk);
+		PIC_RemoveSpecificEvents(IDE_ATAPI_SpinUpComplete, pk);
+		PIC_RemoveSpecificEvents(IDE_ATAPI_CDInsertion, pk);
+
+		if (got_empty) {
+			if (atapi->cdrom) atapi->cdrom->Release();
+			atapi->cdrom = empty_cd;
+		}
+		atapi->loading_mode = LOAD_NO_DISC;
+		atapi->has_changed = true;
+		atapi->set_sense(/*SK=*/0x02, /*ASC=*/0x3A, /*ASCQ=*/0x00);
 	}
-	atapi->loading_mode = LOAD_NO_DISC;
-	atapi->has_changed = true;
-	atapi->set_sense(/*SK=*/0x02, /*ASC=*/0x3A, /*ASCQ=*/0x00);
-	LOG_MSG("KIOSK IDE: Ejected ATAPI CD-ROM media on Drive %c:", 'A' + drive_index);
+
+	if (has_mscdex && got_empty) {
+		const uint8_t subUnit = MSCDEX_GetSubUnit(drv_letter);
+		MSCDEX_ReplaceDrive(empty_cd, subUnit);
+		Kiosk_DOS_SyncEjectedCDROM(drive_index);
+		if (!atapi) {
+			empty_cd->Release();
+		}
+	} else if (!atapi && got_empty) {
+		empty_cd->Release();
+	}
+
+	LOG_MSG("KIOSK IDE: Ejected ATAPI CD-ROM media on Drive %c:", drv_letter);
 	return true;
 }
 

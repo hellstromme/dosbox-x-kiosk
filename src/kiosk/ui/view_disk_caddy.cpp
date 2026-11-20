@@ -177,29 +177,35 @@ bool DiskCaddyView::ExtractFatVolumeLabelFromBytes(const uint8_t* data, size_t s
     // 1. Check Root Directory for an explicit Volume Label entry (DIR_Attr == 0x08)
     if (bytes_per_sec >= 128 && bytes_per_sec <= 4096 &&
         rsvd_sec > 0 && num_fats > 0 && fat_sz_16 > 0 && root_ent_cnt > 0) {
-        const size_t root_dir_offset =
-            static_cast<size_t>(rsvd_sec + static_cast<uint32_t>(num_fats) * fat_sz_16) * bytes_per_sec;
-        for (uint16_t i = 0; i < root_ent_cnt; ++i) {
-            const size_t entry_ofs = root_dir_offset + static_cast<size_t>(i) * 32u;
-            if (entry_ofs + 32u > size) {
-                break;
-            }
-            const uint8_t first_byte = data[entry_ofs];
-            if (first_byte == 0x00) {
-                break; // End of root directory
-            }
-            if (first_byte == 0xE5) {
-                continue; // Deleted entry
-            }
-            const uint8_t attr = data[entry_ofs + 11];
-            if (attr == 0x0F) {
-                continue; // LFN entry
-            }
-            if ((attr & 0x08) != 0 && (attr & 0x10) == 0) {
-                std::string candidate = TrimAsciiLabel(reinterpret_cast<const char*>(data + entry_ofs), 11);
-                if (!candidate.empty() && ToUpperAscii(candidate) != "NO NAME") {
-                    out_label = candidate;
-                    return true;
+        const uint64_t root_dir_offset_u64 =
+            (static_cast<uint64_t>(rsvd_sec) + static_cast<uint64_t>(num_fats) * fat_sz_16) * bytes_per_sec;
+        if (root_dir_offset_u64 <= static_cast<uint64_t>(size)) {
+            for (uint16_t i = 0; i < root_ent_cnt; ++i) {
+                const uint64_t entry_ofs_u64 = root_dir_offset_u64 + static_cast<uint64_t>(i) * 32u;
+                if (entry_ofs_u64 > static_cast<uint64_t>(size)) {
+                    break;
+                }
+                const size_t entry_ofs = static_cast<size_t>(entry_ofs_u64);
+                if (size - entry_ofs < 32u) {
+                    break;
+                }
+                const uint8_t first_byte = data[entry_ofs];
+                if (first_byte == 0x00) {
+                    break; // End of root directory
+                }
+                if (first_byte == 0xE5) {
+                    continue; // Deleted entry
+                }
+                const uint8_t attr = data[entry_ofs + 11];
+                if (attr == 0x0F) {
+                    continue; // LFN entry
+                }
+                if ((attr & 0x08) != 0 && (attr & 0x10) == 0) {
+                    std::string candidate = TrimAsciiLabel(reinterpret_cast<const char*>(data + entry_ofs), 11);
+                    if (!candidate.empty() && ToUpperAscii(candidate) != "NO NAME") {
+                        out_label = candidate;
+                        return true;
+                    }
                 }
             }
         }

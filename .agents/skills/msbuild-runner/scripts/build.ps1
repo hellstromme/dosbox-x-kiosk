@@ -83,13 +83,19 @@ if (-not $resolvedSolution) {
 
 # Preflight write check so read-only AppContainer sandboxes fail fast instead of hanging MSBuild nodes for 600s
 $solutionDir = Split-Path -Parent $resolvedSolution.Path
-$probeFile = Join-Path $solutionDir ".msbuild_write_probe.tmp"
+$probeFile = Join-Path $solutionDir (".msbuild_write_probe_" + [System.Guid]::NewGuid().ToString("N") + ".tmp")
+$probeCreated = $false
 try {
-    [System.IO.File]::WriteAllText($probeFile, "ok")
-    Remove-Item $probeFile -Force -ErrorAction SilentlyContinue
+    $stream = [System.IO.File]::Open($probeFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+    $probeCreated = $true
+    $stream.Dispose()
 } catch {
     Write-Error "[msbuild-runner] Error: Workspace directory '$solutionDir' is not writable in current sandbox context: $($_.Exception.Message)"
     exit 1
+} finally {
+    if ($probeCreated) {
+        Remove-Item $probeFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # 5. Build arguments

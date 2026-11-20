@@ -600,14 +600,14 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
         }
 
         std::string dispatch_path = BootInjector::GetInstance().GetDefaultDispatchImagePath();
+        for (const auto& b : caddy) {
+            if (b.target_drive == "B") {
+                LOG_MSG("KIOSK: Drive B: is reserved for ephemeral dispatch floppy during REAL_HDD_BOOT; redirecting B: caddy media '%s' to Drive A: swap queue.",
+                        b.resolved_file_path.c_str());
+            }
+        }
         if (item_ptr != nullptr) {
             // Mode A: Carousel Game/App Launch -> KIOSKGO.BAT + KIOSKEXT.COM
-            for (const auto& b : caddy) {
-                if (b.target_drive == "B") {
-                    LOG_MSG("KIOSK: Drive B: is reserved for ephemeral dispatch floppy during REAL_HDD_BOOT item launch; redirecting B: caddy media '%s' to Drive A: swap queue.",
-                            b.resolved_file_path.c_str());
-                }
-            }
             if (!BootInjector::GetInstance().BuildDispatchVolume(dispatch_path, machine, *item_ptr)) {
                 LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to build dispatch volume '%s'.",
                         dispatch_path.c_str());

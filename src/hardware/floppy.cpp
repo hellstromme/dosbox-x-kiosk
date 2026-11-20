@@ -183,6 +183,7 @@ bool FDC_AssignINT13Disk(unsigned char drv) {
 	if (dev == NULL) return false;
 	dev->int13_disk = drv;
 	dev->set_select(fdc->drive_selected() == drv);
+	dev->set_motor(fdc->drive_motor_on(drv));
 
 	if (IS_PC98_ARCH) {
 		// HACK: Enable motor by default, until motor enable port 0xBE is implemented
@@ -393,10 +394,12 @@ void FloppyController::ProcessReadID(void) {
 
 #if defined(C_KIOSK)
 	if (devidx >= 0 && devidx < MAX_DISK_IMAGES && !FDC_IsDoorOpen(devidx)) imageDiskChange[devidx] = false;
+	const bool door_closed = !FDC_IsDoorOpen(devidx);
 #else
 	if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+	const bool door_closed = true;
 #endif
-	if (dev != NULL && dev->motor && dev->select && image != NULL && (in_cmd[0]&0x40)/*MFM=1*/ &&
+	if (door_closed && dev != NULL && dev->motor && dev->select && image != NULL && (in_cmd[0]&0x40)/*MFM=1*/ &&
 		current_cylinder[devidx] < image->cylinders && ((in_cmd[1]&4U)?1U:0U) <= image->heads) {
 		int ns = (int)floor(dev->floppy_image_motor_position() * image->sectors);
 		/* TODO: minor delay to emulate time for one sector to pass under the head */
@@ -929,13 +932,17 @@ void FloppyController::on_fdc_in_command() {
 			 */
 			/* must have a device present. must have an image. device motor and select must be enabled.
 			 * current physical cylinder position must be within range of the image. request must have MFM bit set. */
-		#if defined(C_KIOSK)
-	if (devidx >= 0 && devidx < MAX_DISK_IMAGES && !FDC_IsDoorOpen(devidx)) imageDiskChange[devidx] = false;
+#if defined(C_KIOSK)
+			if (devidx >= 0 && devidx < MAX_DISK_IMAGES && !FDC_IsDoorOpen(devidx)) imageDiskChange[devidx] = false;
 #else
-	if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+			if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
 #endif
 			dma = GetDMAChannel(DMA);
-			if (dev != NULL && dma != NULL && dev->motor && dev->select && image != NULL && (in_cmd[0]&0x40)/*MFM=1*/ &&
+			if (
+#if defined(C_KIOSK)
+				!FDC_IsDoorOpen(devidx) &&
+#endif
+				dev != NULL && dma != NULL && dev->motor && dev->select && image != NULL && (in_cmd[0]&0x40)/*MFM=1*/ &&
 				current_cylinder[devidx] < image->cylinders && ((in_cmd[1]&4U)?1U:0U) <= image->heads &&
 				((in_cmd[1]&4U)?1U:0U) == in_cmd[3] && in_cmd[2] == current_cylinder[devidx] &&
 				in_cmd[5] <= FLOPPY_MAX_SECTOR_SIZE_SZCODE && in_cmd[4] > 0U && in_cmd[4] <= image->sectors) {
@@ -1065,13 +1072,17 @@ void FloppyController::on_fdc_in_command() {
 			 * In order to support copy-protected booter games (IBM PC or PC-98) the sector number is NOT range
 			 * limited in order to support games such as Star Cruiser that look for intentionally out of range
 			 * sector numbers. */
-		#if defined(C_KIOSK)
-	if (devidx >= 0 && devidx < MAX_DISK_IMAGES && !FDC_IsDoorOpen(devidx)) imageDiskChange[devidx] = false;
+#if defined(C_KIOSK)
+			if (devidx >= 0 && devidx < MAX_DISK_IMAGES && !FDC_IsDoorOpen(devidx)) imageDiskChange[devidx] = false;
 #else
-	if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
+			if (interface_index < MAX_DISK_IMAGES) imageDiskChange[interface_index] = false;//FIXME
 #endif
 			dma = GetDMAChannel(DMA);
-			if (dev != NULL && dma != NULL && dev->motor && dev->select && image != NULL && (in_cmd[0]&0x40)/*MFM=1*/ &&
+			if (
+#if defined(C_KIOSK)
+				!FDC_IsDoorOpen(devidx) &&
+#endif
+				dev != NULL && dma != NULL && dev->motor && dev->select && image != NULL && (in_cmd[0]&0x40)/*MFM=1*/ &&
 					current_cylinder[devidx] < image->cylinders && ((in_cmd[1]&4U)?1U:0U) <= image->heads &&
 					((in_cmd[1]&4U)?1U:0U) == in_cmd[3] && in_cmd[2] == current_cylinder[devidx] &&
 					in_cmd[5] <= FLOPPY_MAX_SECTOR_SIZE_SZCODE && in_cmd[4] > 0U) {
