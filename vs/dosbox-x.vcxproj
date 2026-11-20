@@ -1740,6 +1740,12 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\kiosk\kiosk_db.cpp">
       <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="..\src\kiosk\ui\view_disk_caddy.cpp">
+      <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="..\src\kiosk\ui\runtime_overlay.cpp">
+      <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="..\src\kiosk\ui\kiosk_ui.cpp">
       <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
     </ClCompile>
@@ -1768,6 +1774,8 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\src\kiosk\kiosk_main.h" />
     <ClInclude Include="..\src\kiosk\kiosk_db.h" />
     <ClInclude Include="..\src\kiosk\ui\kiosk_ui.h" />
+    <ClInclude Include="..\src\kiosk\ui\view_disk_caddy.h" />
+    <ClInclude Include="..\src\kiosk\ui\runtime_overlay.h" />
     <ClInclude Include="..\src\kiosk\machine\archetypes.h" />
     <ClInclude Include="..\src\kiosk\machine\config_synthesizer.h" />
     <ClInclude Include="..\src\kiosk\machine\boot_injector.h" />

@@ -139,6 +139,9 @@ class imageDisk {
 		uint64_t diskSizeK = 0;
 		FILE* diskimg = NULL;
 		bool diskChangeFlag = false;
+#if defined(C_KIOSK)
+		bool kiosk_write_protected = false;
+#endif
         uint64_t LBA = 0;
 
 		/* this is intended only for when the disk can change out from under us while mounted */
@@ -441,5 +444,16 @@ extern unsigned char INT13_ElTorito_NoEmuDriveNumber;
 extern signed char INT13_ElTorito_IDEInterface;
 extern CDROM_Interface * INT13_ElTorito_cdrom;
 extern char INT13_ElTorito_NoEmuCDROMDrive;
+
+#if defined(C_KIOSK)
+bool FDC_AssignINT13Disk(unsigned char drv);
+bool FDC_UnassignINT13Disk(unsigned char drv);
+void FDC_NotifyDiskSwap(int drive_idx, double door_open_ms = 100.0, bool write_protected = false);
+void FDC_NotifyDiskEject(int drive_idx);
+bool FDC_IsDoorOpen(int drive_idx);
+void FDC_SetWriteProtected(int drive_idx, bool write_protected);
+bool FDC_IsWriteProtected(int drive_idx);
+uint8_t FDC_DebugReadDIR(int drive_idx);
+#endif
 
 #endif

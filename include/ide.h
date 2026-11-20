@@ -27,4 +27,12 @@ void DOS_EnableDriveIDEMenu(unsigned int idx,unsigned char ms);
 bool IDE_is_CDROM(signed char index,bool slave);
 bool IDE_is_CDROM(const std::string &opts);
 
+#if defined(C_KIOSK)
+#include <cstdint>
+bool Kiosk_IDE_MountATAPIMedia(unsigned char drive_index, const char* host_path, double tray_delay_ms = 250.0);
+bool Kiosk_IDE_NotifyATAPIMediaChange(unsigned char drive_index, double tray_delay_ms = 250.0);
+bool Kiosk_IDE_EjectATAPIMedia(unsigned char drive_index);
+bool Kiosk_IDE_GetATAPISense(unsigned char drive_index, uint8_t& out_sk, uint8_t& out_asc, uint8_t& out_ascq, int& out_loading_mode);
+#endif
+
 #endif

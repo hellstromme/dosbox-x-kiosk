@@ -8,6 +8,8 @@
 #include "machine/config_synthesizer.h"
 #include "machine/boot_injector.h"
 #include "ui/kiosk_ui.h"
+#include "ui/runtime_overlay.h"
+#include "ui/view_disk_caddy.h"
 #include "control.h"
 #include "dosbox.h"
 #include "logging.h"
@@ -31,6 +33,8 @@ extern void Kiosk_PumpPreBootFrame(void);
 
 KioskManager::KioskManager()
     : m_state(KioskState::DISABLED),
+      m_overlay_mod_scancode(SDL_SCANCODE_F12),
+      m_overlay_key_sym(SDLK_d),
       m_watchdog_timer(30.0f),
       m_initialized(false),
       m_kiosk_active(false),
@@ -42,6 +46,8 @@ KioskManager::KioskManager()
     // static lifetimes outlive KioskManager::~KioskManager() at process exit.
     (void)KioskDatabase::GetInstance();
     (void)KioskUI::GetInstance();
+    (void)DiskCaddyView::GetInstance();
+    (void)RuntimeOverlay::GetInstance();
     (void)BootInjector::GetInstance();
 }
 
@@ -96,6 +102,7 @@ bool KioskManager::Initialize(const std::string& db_path, const std::string& bas
         std::lock_guard<std::mutex> lock(m_mutex);
         CleanupSessionArtifactsLocked();
         m_config = loaded_cfg;
+        UpdateParsedOverlayHotkeyLocked();
         m_base_conf_path = base_conf;
         m_watchdog_timer = m_skip_countdown.load() ? 0.0f : static_cast<float>(m_config.boot_timeout_sec);
         m_launch_ctx = LaunchContext();
@@ -270,6 +277,81 @@ bool KioskManager::HandlePreBootInputEvent(const SDL_Event& event) {
     if (cur == KioskState::STATE_COUNTDOWN_IDLE) {
         if (IsIntentionalUserInput(event)) {
             CancelWatchdog();
+            return true;
+        }
+    }
+    return false;
+}
+
+void KioskManager::UpdateParsedOverlayHotkeyLocked() {
+    int mod_sc = SDL_SCANCODE_F12;
+    int key_sym = SDLK_d;
+
+    const std::string& spec = m_config.overlay_hotkey;
+    if (!spec.empty()) {
+        std::string upper = spec;
+        for (size_t i = 0; i < upper.size(); ++i) {
+            if (upper[i] >= 'a' && upper[i] <= 'z') {
+                upper[i] = static_cast<char>(upper[i] - 'a' + 'A');
+            }
+        }
+        size_t plus = upper.find('+');
+        if (plus != std::string::npos) {
+            std::string mod_str = upper.substr(0, plus);
+            std::string key_str = upper.substr(plus + 1);
+            if (mod_str == "F12") mod_sc = SDL_SCANCODE_F12;
+            else if (mod_str == "F11") mod_sc = SDL_SCANCODE_F11;
+            else if (mod_str == "F10") mod_sc = SDL_SCANCODE_F10;
+            else if (mod_str == "CTRL") mod_sc = SDL_SCANCODE_LCTRL;
+            else if (mod_str == "ALT") mod_sc = SDL_SCANCODE_LALT;
+
+            if (key_str.size() == 1 && key_str[0] >= 'A' && key_str[0] <= 'Z') {
+                key_sym = static_cast<int>(SDLK_a + (key_str[0] - 'A'));
+            }
+        } else if (upper.size() >= 2 && upper[0] == 'F') {
+            int fnum = std::atoi(upper.c_str() + 1);
+            if (fnum >= 1 && fnum <= 12) {
+                mod_sc = SDL_SCANCODE_UNKNOWN;
+                key_sym = static_cast<int>(SDLK_F1 + (fnum - 1));
+            }
+        }
+    }
+
+    m_overlay_mod_scancode.store(mod_sc);
+    m_overlay_key_sym.store(key_sym);
+}
+
+bool KioskManager::IsOverlayHotkeyEvent(const SDL_Event& event, const uint8_t* kb_state) const {
+    if (event.type == SDL_CONTROLLERBUTTONDOWN &&
+        event.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE) {
+        return true;
+    }
+    if (event.type != SDL_KEYDOWN || event.key.repeat != 0) {
+        return false;
+    }
+
+    const SDL_Keycode sym = event.key.keysym.sym;
+
+    // Built-in default (F12+D) and disk-swapper alias (F11+O), tolerant of key press order
+    if (kb_state != nullptr) {
+        if ((sym == SDLK_d && kb_state[SDL_SCANCODE_F12]) ||
+            (sym == SDLK_F12 && kb_state[SDL_SCANCODE_D])) {
+            return true;
+        }
+        if ((sym == SDLK_o && kb_state[SDL_SCANCODE_F11]) ||
+            (sym == SDLK_F11 && kb_state[SDL_SCANCODE_O])) {
+            return true;
+        }
+    }
+
+    // Configurable kiosk_config.overlay_hotkey
+    const int custom_mod = m_overlay_mod_scancode.load();
+    const int custom_key = m_overlay_key_sym.load();
+    if (static_cast<int>(sym) == custom_key) {
+        if (custom_mod == SDL_SCANCODE_UNKNOWN) {
+            return true;
+        }
+        if (kb_state != nullptr && custom_mod > 0 && custom_mod < SDL_NUM_SCANCODES && kb_state[custom_mod]) {
             return true;
         }
     }
@@ -518,14 +600,14 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
         }
 
         std::string dispatch_path = BootInjector::GetInstance().GetDefaultDispatchImagePath();
+        for (const auto& b : caddy) {
+            if (b.target_drive == "B") {
+                LOG_MSG("KIOSK: Drive B: is reserved for ephemeral dispatch floppy during REAL_HDD_BOOT; redirecting B: caddy media '%s' to Drive A: swap queue.",
+                        b.resolved_file_path.c_str());
+            }
+        }
         if (item_ptr != nullptr) {
             // Mode A: Carousel Game/App Launch -> KIOSKGO.BAT + KIOSKEXT.COM
-            for (const auto& b : caddy) {
-                if (b.target_drive == "B") {
-                    LOG_MSG("KIOSK: Drive B: is reserved for ephemeral dispatch floppy during REAL_HDD_BOOT item launch; redirecting B: caddy media '%s' to Drive A: swap queue.",
-                            b.resolved_file_path.c_str());
-                }
-            }
             if (!BootInjector::GetInstance().BuildDispatchVolume(dispatch_path, machine, *item_ptr)) {
                 LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to build dispatch volume '%s'.",
                         dispatch_path.c_str());
@@ -598,6 +680,7 @@ void KioskManager::EnterRuntimeOverlay() {
     }
     LOG_MSG("KIOSK: Entering STATE_RUNTIME_OVERLAY (Emulation paused).");
     m_state.store(KioskState::STATE_RUNTIME_OVERLAY);
+    RuntimeOverlay::GetInstance().OnEnterOverlay();
 }
 
 void KioskManager::ResumeEmulation() {

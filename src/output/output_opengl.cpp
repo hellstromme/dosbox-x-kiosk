@@ -24,6 +24,10 @@ extern "C" {
 
 #include "sdlmain.h"
 #include "render.h"
+#if defined(C_KIOSK)
+#include "kiosk/kiosk_main.h"
+#include "kiosk/ui/kiosk_ui.h"
+#endif
 
 using namespace std;
 
@@ -358,10 +362,18 @@ void OUTPUT_OPENGL_Select( GLKind kind )
     sdl.window = GFX_SetSDLWindowMode(640,400, SCREEN_OPENGL);
     if (sdl.window) {
         if(sdl_opengl.context) {
+#if defined(C_KIOSK)
+            KioskUI::GetInstance().ShutdownBackend();
+#endif
             SDL_GL_DeleteContext(sdl_opengl.context);
             sdl_opengl.context = nullptr;
         }
         sdl_opengl.context = SDL_GL_CreateContext(sdl.window);
+#if defined(C_KIOSK)
+        if (KioskManager::GetInstance().IsKioskModeActive() && sdl_opengl.context != NULL) {
+            KioskUI::GetInstance().InitializeBackend(sdl.window, sdl_opengl.context);
+        }
+#endif
         sdl.surface = SDL_GetWindowSurface(sdl.window);
 
         LOG_MSG( "OpenGL Version : %s", glGetString( GL_VERSION ));

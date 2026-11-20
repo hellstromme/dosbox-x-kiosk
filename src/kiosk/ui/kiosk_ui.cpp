@@ -3,6 +3,7 @@
 #if defined(C_KIOSK)
 
 #include "kiosk_ui.h"
+#include "runtime_overlay.h"
 #include "../kiosk_main.h"
 #include "../kiosk_db.h"
 #include "logging.h"
@@ -209,33 +210,7 @@ void KioskUI::RenderInteractiveShellPlaceholder() {
 
 void KioskUI::RenderRuntimeOverlayPlaceholder() {
     if (!m_context_initialized) return;
-
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    if (viewport) {
-        ImVec2 center = viewport->GetCenter();
-        ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(360.0f, 200.0f), ImGuiCond_Always);
-    }
-
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse |
-                             ImGuiWindowFlags_NoResize |
-                             ImGuiWindowFlags_NoMove |
-                             ImGuiWindowFlags_NoSavedSettings;
-
-    if (ImGui::Begin("Kiosk In-Game Overlay", nullptr, flags)) {
-        ImGui::TextWrapped("Emulation is currently paused.");
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        if (ImGui::Button("Resume Game", ImVec2(-1.0f, 40.0f))) {
-            KioskManager::GetInstance().ResumeEmulation();
-        }
-        ImGui::Spacing();
-        if (ImGui::Button("Quit to Kiosk Menu", ImVec2(-1.0f, 40.0f))) {
-            KioskManager::GetInstance().AbortSessionToShell();
-        }
-    }
-    ImGui::End();
+    RuntimeOverlay::GetInstance().Render();
 }
 
 void KioskUI::CompositeActiveState() {

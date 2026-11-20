@@ -53,6 +53,15 @@ public:
 	
 	static void SaveState( std::ostream& stream );
 	static void LoadState( std::istream& stream );
+
+#if defined(C_KIOSK)
+	static int GetKioskSlotCount(int drive);
+	static int GetKioskCurrentSlot(int drive);
+	static std::string GetKioskActiveDiskPath(int drive);
+	static std::vector<std::string> GetKioskDrivePaths(int drive);
+	static bool AppendAndSwapDisk(int drive, const std::string& host_path, bool is_cdrom, bool write_protected = false);
+	static bool EjectDriveMedia(int drive, bool is_cdrom);
+#endif
 	
 private:
 	static struct DriveInfo {
@@ -1144,6 +1153,9 @@ public:
 	void setFileName(const char* fileName);
 	char const* GetLabel(void) override {return discLabel;};
 	void Activate(void) override;
+#if defined(C_KIOSK)
+	void KioskSyncCDROMRef(void) { UpdateCDROMRef(); }
+#endif
 private:
 #if !defined(OSFREE)
 	int  readDirEntry(isoDirEntry* de, const uint8_t* data, unsigned int direntindex) const;
