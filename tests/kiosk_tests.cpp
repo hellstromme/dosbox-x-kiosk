@@ -9,7 +9,14 @@
 #include "machine/kioskext_bin.h"
 #include "machine/boot_injector.h"
 #include "ui/kiosk_ui.h"
+#include "ui/view_disk_caddy.h"
+#include "ui/runtime_overlay.h"
 #include "kiosk_main.h"
+#include "../src/dos/drives.h"
+#include "bios_disk.h"
+#include "ide.h"
+#include "pic.h"
+#include "timer.h"
 #include <cstdio>
 #include <fstream>
 #include "dosbox.h"
@@ -1226,6 +1233,656 @@ TEST(KioskBootInjectorTest, HostAutoexecPreservesExistingCommandsAndRejectsCorru
     }
     EXPECT_EQ(raw_pattern, after_bytes);
     std::remove(bad_img_path.c_str());
+}
+
+TEST(KioskBootInjectorTest, MbrPartitionedFat16AndFat32AutoexecHookCreationAndClusterGrowth) {
+    auto write_le16 = [](uint8_t* p, uint16_t val) {
+        p[0] = static_cast<uint8_t>(val & 0xFFU);
+        p[1] = static_cast<uint8_t>((val >> 8) & 0xFFU);
+    };
+    auto write_le32 = [](uint8_t* p, uint32_t val) {
+        p[0] = static_cast<uint8_t>(val & 0xFFU);
+        p[1] = static_cast<uint8_t>((val >> 8) & 0xFFU);
+        p[2] = static_cast<uint8_t>((val >> 16) & 0xFFU);
+        p[3] = static_cast<uint8_t>((val >> 24) & 0xFFU);
+    };
+    auto read_le16 = [](const uint8_t* p) -> uint16_t {
+        return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+    };
+    auto read_le32 = [](const uint8_t* p) -> uint32_t {
+        return static_cast<uint32_t>(p[0]) |
+               (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) |
+               (static_cast<uint32_t>(p[3]) << 24);
+    };
+
+    // ------------------------------------------------------------------------
+    // Part 1: MBR-Partitioned FAT16 Image with Cluster Boundary Growth
+    // ------------------------------------------------------------------------
+    // Layout:
+    // - LBA 0: MBR with active partition (status 0x80, type 0x06) at LBA 63, count 4200
+    // - Partition VBR at LBA 63:
+    //   BytsPerSec=512, SecPerClus=1 (512B cluster), RsvdSecCnt=1, NumFATs=2,
+    //   RootEntCnt=32 (2 sectors), FATSz16=17, TotSec16=4200 -> 4163 clusters (>= 4085 -> FAT16)
+    // - Existing AUTOEXEC.BAT has 480 bytes in Cluster 2 (so adding the 97-byte hook forces a 2nd cluster allocation)
+    const uint32_t fat16_lba_start = 63;
+    const uint32_t fat16_part_sectors = 4200;
+    const uint32_t fat16_total_sectors = fat16_lba_start + fat16_part_sectors;
+    std::vector<uint8_t> fat16_img(static_cast<size_t>(fat16_total_sectors) * 512U, 0);
+
+    // MBR at LBA 0
+    uint8_t* mbr16 = fat16_img.data();
+    mbr16[0x1BE + 0] = 0x80; // Active bootable
+    mbr16[0x1BE + 4] = 0x06; // FAT16B
+    write_le32(mbr16 + 0x1BE + 8, fat16_lba_start);
+    write_le32(mbr16 + 0x1BE + 12, fat16_part_sectors);
+    mbr16[510] = 0x55;
+    mbr16[511] = 0xAA;
+
+    // FAT16 VBR at LBA 63
+    const size_t part16_off = static_cast<size_t>(fat16_lba_start) * 512U;
+    uint8_t* vbr16 = fat16_img.data() + part16_off;
+    vbr16[0] = 0xEB;
+    vbr16[1] = 0x3C;
+    vbr16[2] = 0x90;
+    std::memcpy(vbr16 + 3, "MSDOS5.0", 8);
+    write_le16(vbr16 + 11, 512);  // BytsPerSec
+    vbr16[13] = 1;                // SecPerClus (512 bytes)
+    write_le16(vbr16 + 14, 1);    // RsvdSecCnt
+    vbr16[16] = 2;                // NumFATs
+    write_le16(vbr16 + 17, 32);   // RootEntCnt (2 sectors)
+    write_le16(vbr16 + 19, static_cast<uint16_t>(fat16_part_sectors)); // TotSec16
+    vbr16[21] = 0xF8;             // Fixed disk media
+    write_le16(vbr16 + 22, 17);   // FATSz16
+    vbr16[510] = 0x55;
+    vbr16[511] = 0xAA;
+
+    const size_t fat16_1_off = part16_off + 1U * 512U;
+    const size_t fat16_2_off = part16_off + (1U + 17U) * 512U;
+    const size_t root16_off = part16_off + (1U + 34U) * 512U;
+    const size_t data16_off = part16_off + (1U + 34U + 2U) * 512U; // first_data_sec = 37
+
+    // Initialize FAT1 and FAT2 media headers and Cluster 2 EOF (0xFFFF)
+    write_le16(fat16_img.data() + fat16_1_off + 0, 0xFFF8U);
+    write_le16(fat16_img.data() + fat16_1_off + 2, 0xFFFFU);
+    write_le16(fat16_img.data() + fat16_1_off + 4, 0xFFFFU); // Cluster 2 = EOF
+    std::memcpy(fat16_img.data() + fat16_2_off, fat16_img.data() + fat16_1_off, 17U * 512U);
+
+    // Seed a 480-byte AUTOEXEC.BAT in Cluster 2 (root entry 0)
+    std::string seed_fat16_autoexec = "@ECHO OFF\r\n";
+    while (seed_fat16_autoexec.size() < 470U) {
+        seed_fat16_autoexec += "REM PADDING LINE FOR CLUSTER BOUNDARY EXPANSION\r\n";
+    }
+    seed_fat16_autoexec.resize(478U, 'X');
+    seed_fat16_autoexec += "\r\n"; // 480 bytes total
+
+    uint8_t* dent16 = fat16_img.data() + root16_off;
+    std::memcpy(dent16, "AUTOEXECBAT", 11);
+    dent16[11] = 0x20;
+    write_le16(dent16 + 26, 2); // FirstCluster = 2
+    write_le32(dent16 + 28, static_cast<uint32_t>(seed_fat16_autoexec.size()));
+    std::memcpy(fat16_img.data() + data16_off, seed_fat16_autoexec.data(), seed_fat16_autoexec.size());
+
+    const std::string temp_fat16_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".mbr_fat16_test.img";
+    {
+        std::ofstream out(temp_fat16_path.c_str(), std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open());
+        out.write(reinterpret_cast<const char*>(fat16_img.data()), static_cast<std::streamsize>(fat16_img.size()));
+    }
+
+    ASSERT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(temp_fat16_path));
+
+    // Read modified FAT16 image back and verify 2-cluster chain (Cluster 2 -> Cluster 3 -> 0xFFFF) in both FATs
+    std::vector<uint8_t> mod_fat16;
+    {
+        std::ifstream in(temp_fat16_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(in.is_open());
+        mod_fat16.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+    EXPECT_EQ(3U, read_le16(mod_fat16.data() + fat16_1_off + 2 * 2));
+    EXPECT_EQ(0xFFFFU, read_le16(mod_fat16.data() + fat16_1_off + 3 * 2));
+    EXPECT_EQ(3U, read_le16(mod_fat16.data() + fat16_2_off + 2 * 2));
+    EXPECT_EQ(0xFFFFU, read_le16(mod_fat16.data() + fat16_2_off + 3 * 2));
+
+    uint32_t new_fat16_size = read_le32(mod_fat16.data() + root16_off + 28);
+    EXPECT_GT(new_fat16_size, 512U);
+    ASSERT_LE(new_fat16_size, 1024U);
+
+    // Reconstruct file data across Cluster 2 and Cluster 3
+    std::string reconstructed16;
+    reconstructed16.append(reinterpret_cast<const char*>(mod_fat16.data() + data16_off), 512U);
+    reconstructed16.append(reinterpret_cast<const char*>(mod_fat16.data() + data16_off + 512U), new_fat16_size - 512U);
+    EXPECT_EQ(0U, reconstructed16.find(seed_fat16_autoexec));
+    EXPECT_NE(std::string::npos, reconstructed16.find("IF EXIST B:\\KIOSKGO.BAT CALL B:\\KIOSKGO.BAT\r\n"));
+
+    // Verify idempotency on second call
+    EXPECT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(temp_fat16_path));
+    std::remove(temp_fat16_path.c_str());
+
+    // ------------------------------------------------------------------------
+    // Part 2: MBR-Partitioned FAT32 Image with Missing AUTOEXEC.BAT Creation
+    // ------------------------------------------------------------------------
+    // Layout:
+    // - LBA 0: MBR with active partition (status 0x80, type 0x0C) at LBA 63, count 200
+    // - Partition VBR at LBA 63:
+    //   BytsPerSec=512, SecPerClus=1, RsvdSecCnt=32, NumFATs=2, RootEntCnt=0,
+    //   FATSz16=0, TotSec32=200, FATSz32=2, RootClus=2
+    const uint32_t fat32_lba_start = 63;
+    const uint32_t fat32_part_sectors = 200;
+    const uint32_t fat32_total_sectors = fat32_lba_start + fat32_part_sectors;
+    std::vector<uint8_t> fat32_img(static_cast<size_t>(fat32_total_sectors) * 512U, 0);
+
+    uint8_t* mbr32 = fat32_img.data();
+    mbr32[0x1BE + 0] = 0x80; // Active
+    mbr32[0x1BE + 4] = 0x0C; // FAT32 LBA
+    write_le32(mbr32 + 0x1BE + 8, fat32_lba_start);
+    write_le32(mbr32 + 0x1BE + 12, fat32_part_sectors);
+    mbr32[510] = 0x55;
+    mbr32[511] = 0xAA;
+
+    const size_t part32_off = static_cast<size_t>(fat32_lba_start) * 512U;
+    uint8_t* vbr32 = fat32_img.data() + part32_off;
+    vbr32[0] = 0xEB;
+    vbr32[1] = 0x58;
+    vbr32[2] = 0x90;
+    std::memcpy(vbr32 + 3, "MSWIN4.1", 8);
+    write_le16(vbr32 + 11, 512);  // BytsPerSec
+    vbr32[13] = 1;                // SecPerClus
+    write_le16(vbr32 + 14, 32);   // RsvdSecCnt
+    vbr32[16] = 2;                // NumFATs
+    write_le16(vbr32 + 17, 0);    // RootEntCnt (0 for FAT32)
+    write_le16(vbr32 + 19, 0);    // TotSec16 (0 for FAT32)
+    vbr32[21] = 0xF8;
+    write_le16(vbr32 + 22, 0);    // FATSz16 (0 for FAT32)
+    write_le32(vbr32 + 32, fat32_part_sectors); // TotSec32
+    write_le32(vbr32 + 36, 2);    // FATSz32 (2 sectors per FAT)
+    write_le32(vbr32 + 44, 2);    // RootClus = 2
+    vbr32[510] = 0x55;
+    vbr32[511] = 0xAA;
+
+    const size_t fat32_1_off = part32_off + 32U * 512U;
+    const size_t fat32_2_off = part32_off + 34U * 512U;
+    const size_t data32_off = part32_off + 36U * 512U; // Cluster 2 = Root directory
+
+    write_le32(fat32_img.data() + fat32_1_off + 0, 0x0FFFFFF8U);
+    write_le32(fat32_img.data() + fat32_1_off + 4, 0x0FFFFFFFU);
+    write_le32(fat32_img.data() + fat32_1_off + 8, 0x0FFFFFFFU); // Cluster 2 (Root dir) = EOF
+    std::memcpy(fat32_img.data() + fat32_2_off, fat32_img.data() + fat32_1_off, 2U * 512U);
+
+    const std::string temp_fat32_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".mbr_fat32_test.img";
+    {
+        std::ofstream out(temp_fat32_path.c_str(), std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open());
+        out.write(reinterpret_cast<const char*>(fat32_img.data()), static_cast<std::streamsize>(fat32_img.size()));
+    }
+
+    // First call creates AUTOEXEC.BAT in the FAT32 root directory cluster (Cluster 2) and allocates Cluster 3 for its content
+    ASSERT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(temp_fat32_path));
+
+    std::vector<uint8_t> mod_fat32;
+    {
+        std::ifstream in(temp_fat32_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(in.is_open());
+        mod_fat32.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+
+    const uint8_t* root32_ent = mod_fat32.data() + data32_off;
+    EXPECT_EQ(0, std::memcmp(root32_ent, "AUTOEXECBAT", 11));
+    uint32_t fst_clus32 = (static_cast<uint32_t>(read_le16(root32_ent + 20)) << 16) | read_le16(root32_ent + 26);
+    uint32_t file_size32 = read_le32(root32_ent + 28);
+    EXPECT_EQ(3U, fst_clus32);
+    EXPECT_EQ(BootInjector::GetAutoexecHookBlock().size(), file_size32);
+
+    std::string created_fat32_content(
+        reinterpret_cast<const char*>(mod_fat32.data() + data32_off + (fst_clus32 - 2U) * 512U),
+        file_size32
+    );
+    EXPECT_EQ(BootInjector::GetAutoexecHookBlock(), created_fat32_content);
+
+    // Second call is idempotent
+    EXPECT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(temp_fat32_path));
+    std::remove(temp_fat32_path.c_str());
+}
+
+TEST(KioskBootInjectorTest, Windows9xRunOnceAndOsIdFallbackSynthesis) {
+    MachineRecord m;
+    m.id = "mach-win98";
+    m.archetype_id = KioskArchetypes::PENTIUM_3DFX;
+    m.archetype_tier = 5;
+    m.os_id = "WIN98_SE";
+    m.boot_mode = "REAL_HDD_BOOT";
+
+    // 1. Explicit WIN9X_RUNONCE_HOOK with spaced working directory and spaced executable
+    CatalogItemRecord win9x_game;
+    win9x_game.guest_working_dir = "C:\\Program Files\\Valve/Half-Life";
+    win9x_game.guest_executable = "HL.EXE";
+    win9x_game.guest_arguments = "-console -game cstrike";
+    win9x_game.launch_mechanism = "WIN9X_RUNONCE_HOOK";
+    win9x_game.return_on_exit = true;
+
+    std::string bat_win9x = BootInjector::GetInstance().SynthesizeKioskGoBat(m, win9x_game);
+    EXPECT_NE(std::string::npos, bat_win9x.find("C:\r\n"));
+    EXPECT_NE(std::string::npos, bat_win9x.find("CD \"\\Program Files\\Valve\\Half-Life\"\r\n"));
+    EXPECT_NE(std::string::npos, bat_win9x.find("C:\\WINDOWS\\WIN.COM HL.EXE -console -game cstrike\r\n"));
+    EXPECT_NE(std::string::npos, bat_win9x.find("B:\\KIOSKEXT.COM\r\n"));
+
+    // 2. Fallback to machine.os_id ("WIN*") when launch_mechanism is unset and executable has spaces
+    CatalogItemRecord win_fallback;
+    win_fallback.guest_working_dir = "C:\\GAMES\\DIABLO";
+    win_fallback.guest_executable = "DiabloLauncher.exe";
+    win_fallback.launch_mechanism = "";
+    win_fallback.return_on_exit = false;
+
+    std::string bat_fallback = BootInjector::GetInstance().SynthesizeKioskGoBat(m, win_fallback);
+    EXPECT_NE(std::string::npos, bat_fallback.find("C:\\WINDOWS\\WIN.COM DiabloLauncher.exe\r\n"));
+    EXPECT_EQ(std::string::npos, bat_fallback.find("KIOSKEXT.COM"));
+}
+
+// ----------------------------------------------------------------------------
+// Phase 4: Skeuomorphic Media Caddy & Runtime Disk-Swap Overlay Tests
+// ----------------------------------------------------------------------------
+
+namespace {
+
+void AdvanceEmulatedPicTimeMs(int milliseconds) {
+    if (CPU_CycleMax <= 0) {
+        CPU_CycleMax = 3000;
+    }
+    for (int ms = 0; ms < milliseconds; ++ms) {
+        CPU_CycleLeft = CPU_CycleMax;
+        CPU_Cycles = 0;
+        TIMER_AddTick();
+        CPU_CycleLeft = CPU_CycleMax;
+        CPU_Cycles = 0;
+        PIC_RunQueue();
+    }
+}
+
+bool WriteRawFloppyFileWithVolumeLabel(
+    const std::string& path,
+    size_t total_bytes,
+    const std::string& bpb_label,
+    const std::string& root_vol_label = ""
+) {
+    std::vector<uint8_t> img(total_bytes, 0);
+    if (total_bytes < 4096) return false;
+
+    // Minimal valid FAT12 BPB
+    img[0x00] = 0xEB; img[0x01] = 0x3C; img[0x02] = 0x90;
+    std::memcpy(&img[0x03], "MSDOS5.0", 8);
+    img[0x0B] = 0x00; img[0x0C] = 0x02; // 512 bytes/sec
+    img[0x0D] = 0x01;                   // 1 sec/clus
+    img[0x0E] = 0x01; img[0x0F] = 0x00; // 1 reserved sector
+    img[0x10] = 0x02;                   // 2 FATs
+    img[0x11] = 0xE0; img[0x12] = 0x00; // 224 root entries
+    const uint16_t tot_sec = static_cast<uint16_t>(total_bytes / 512u);
+    img[0x13] = static_cast<uint8_t>(tot_sec & 0xFFu);
+    img[0x14] = static_cast<uint8_t>((tot_sec >> 8) & 0xFFu);
+    img[0x15] = 0xF0;
+    img[0x16] = 0x03; img[0x17] = 0x00; // 3 sectors/FAT
+    img[0x18] = 18;   img[0x19] = 0;
+    img[0x1A] = 2;    img[0x1B] = 0;
+    img[0x26] = 0x29;                   // Extended boot signature
+    std::memset(&img[0x2B], ' ', 11);
+    for (size_t i = 0; i < bpb_label.size() && i < 11; ++i) {
+        img[0x2B + i] = static_cast<uint8_t>(bpb_label[i]);
+    }
+    std::memcpy(&img[0x36], "FAT12   ", 8);
+    img[0x1FE] = 0x55; img[0x1FF] = 0xAA;
+
+    // Root directory starts at sector (1 + 2 * 3) = sector 7 (offset 7 * 512 = 3584)
+    if (!root_vol_label.empty()) {
+        const size_t root_ofs = 7u * 512u;
+        std::memset(&img[root_ofs], ' ', 11);
+        for (size_t i = 0; i < root_vol_label.size() && i < 11; ++i) {
+            img[root_ofs + i] = static_cast<uint8_t>(root_vol_label[i]);
+        }
+        img[root_ofs + 11] = 0x08; // ATTR_VOLUME_ID
+    }
+
+    FILE* fp = std::fopen(path.c_str(), "wb");
+    if (!fp) return false;
+    const size_t written = std::fwrite(img.data(), 1, img.size(), fp);
+    std::fclose(fp);
+    return (written == img.size());
+}
+
+} // anonymous namespace
+
+TEST(KioskDiskCaddyTest, MediaInspectorDetectsFloppyGeometriesAndFatVolumeLabel) {
+    const std::string base = BootInjector::GetInstance().GetDefaultDispatchImagePath();
+    const std::string p360  = base + "_360k.img";
+    const std::string p720  = base + "_720k.img";
+    const std::string p1200 = base + "_1200k.img";
+    const std::string p1440 = base + "_1440k.img";
+
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(p360,  360u * 1024u,  "ULTIMA_IV", ""));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(p720,  720u * 1024u,  "NO NAME",   "MONKEY_DISK"));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(p1200, 1200u * 1024u, "WING_CMD1", ""));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(p1440, 1440u * 1024u, "DOOM2_DISK1", "MONKEY_DISK"));
+
+    InspectedMediaInfo info360, info720, info1200, info1440;
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(p360, info360));
+    EXPECT_STREQ("FLOPPY_525_360K", info360.media_type.c_str());
+    EXPECT_STREQ("CHARCOAL_525", info360.physical_style.c_str());
+    EXPECT_STREQ("ULTIMA_IV", info360.volume_label.c_str());
+
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(p720, info720));
+    EXPECT_STREQ("FLOPPY_35_720K", info720.media_type.c_str());
+    EXPECT_STREQ("MONKEY_DISK", info720.volume_label.c_str());
+
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(p1200, info1200));
+    EXPECT_STREQ("FLOPPY_525_1200K", info1200.media_type.c_str());
+    EXPECT_STREQ("CHARCOAL_525", info1200.physical_style.c_str());
+    EXPECT_STREQ("WING_CMD1", info1200.volume_label.c_str());
+
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(p1440, info1440));
+    EXPECT_STREQ("FLOPPY_35_1440K", info1440.media_type.c_str());
+    EXPECT_STREQ("MONKEY_DISK", info1440.volume_label.c_str());
+
+    std::remove(p360.c_str());
+    std::remove(p720.c_str());
+    std::remove(p1200.c_str());
+    std::remove(p1440.c_str());
+}
+
+TEST(KioskDiskCaddyTest, MediaInspectorExtractsIso9660PvdAndCueRedbookAudio) {
+    const std::string base = BootInjector::GetInstance().GetDefaultDispatchImagePath();
+    const std::string iso_path = base + "_sc2000.iso";
+    const std::string cue_path = base + "_sc2000.cue";
+
+    // Build a minimal 18-sector ISO9660 image with Primary Volume Descriptor at sector 16 (0x8000)
+    std::vector<uint8_t> iso_bytes(18u * 2048u, 0);
+    iso_bytes[0x8000] = 0x01; // Primary Volume Descriptor type
+    std::memcpy(&iso_bytes[0x8001], "CD001", 5);
+    iso_bytes[0x8006] = 0x01; // PVD version
+    std::memset(&iso_bytes[0x8028], ' ', 32);
+    const char* vol_id = "SC2000_SE_CD";
+    std::memcpy(&iso_bytes[0x8028], vol_id, std::strlen(vol_id));
+
+    // Terminator Volume Descriptor at sector 17
+    iso_bytes[17u * 2048u] = 0xFF;
+    std::memcpy(&iso_bytes[17u * 2048u + 1], "CD001", 5);
+
+    {
+        FILE* fp = std::fopen(iso_path.c_str(), "wb");
+        ASSERT_NE(nullptr, fp);
+        ASSERT_EQ(iso_bytes.size(), std::fwrite(iso_bytes.data(), 1, iso_bytes.size(), fp));
+        std::fclose(fp);
+    }
+
+    {
+        std::ofstream cue_ofs(cue_path.c_str(), std::ios::binary);
+        ASSERT_TRUE(cue_ofs.is_open());
+        cue_ofs << "FILE \"" << iso_path << "\" BINARY\r\n"
+                << "  TRACK 01 MODE1/2048\r\n"
+                << "    INDEX 01 00:00:00\r\n"
+                << "  TRACK 02 AUDIO\r\n"
+                << "    INDEX 01 02:00:00\r\n";
+    }
+
+    InspectedMediaInfo iso_info;
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(iso_path, iso_info));
+    EXPECT_STREQ("CDROM_ISO", iso_info.media_type.c_str());
+    EXPECT_STREQ("JEWEL_CD", iso_info.physical_style.c_str());
+    EXPECT_STREQ("SC2000_SE_CD", iso_info.volume_label.c_str());
+    EXPECT_FALSE(iso_info.has_redbook_audio);
+
+    InspectedMediaInfo cue_info;
+    ASSERT_TRUE(DiskCaddyView::InspectMediaFile(cue_path, cue_info));
+    EXPECT_STREQ("CDROM_CUE", cue_info.media_type.c_str());
+    EXPECT_STREQ("JEWEL_CD", cue_info.physical_style.c_str());
+    EXPECT_STREQ("SC2000_SE_CD", cue_info.volume_label.c_str());
+    EXPECT_TRUE(cue_info.has_redbook_audio);
+
+    std::remove(cue_path.c_str());
+    std::remove(iso_path.c_str());
+}
+
+TEST(KioskDiskCaddyTest, DeterministicPhysicalStyleVarietyAndAngleJitter) {
+    bool saw_beige = false;
+    bool saw_blue = false;
+    bool saw_black = false;
+
+    for (int i = 0; i < 32; ++i) {
+        const std::string seed = "floppy_seed_" + std::to_string(i);
+        const std::string style1 = DiskCaddyView::ResolvePhysicalStyle("FLOPPY_35_1440K", "", seed);
+        const std::string style2 = DiskCaddyView::ResolvePhysicalStyle("FLOPPY_35_1440K", "", seed);
+        EXPECT_EQ(style1, style2); // Deterministic across runs
+
+        const uint32_t crc_mod = DiskCaddyView::ComputeStringCrc32(seed) % 3u;
+        if (crc_mod == 0u) {
+            EXPECT_STREQ("BEIGE_35", style1.c_str());
+            saw_beige = true;
+        } else if (crc_mod == 1u) {
+            EXPECT_STREQ("BLUE_35", style1.c_str());
+            saw_blue = true;
+        } else {
+            EXPECT_STREQ("BLACK_35", style1.c_str());
+            saw_black = true;
+        }
+
+        const float jitter1 = DiskCaddyView::ComputeStickerAngleJitterDeg(seed);
+        const float jitter2 = DiskCaddyView::ComputeStickerAngleJitterDeg(seed);
+        EXPECT_FLOAT_EQ(jitter1, jitter2);
+        EXPECT_GE(jitter1, -0.8f);
+        EXPECT_LE(jitter1, 0.8f);
+    }
+
+    EXPECT_TRUE(saw_beige);
+    EXPECT_TRUE(saw_blue);
+    EXPECT_TRUE(saw_black);
+
+    // 5.25" always resolves to CHARCOAL_525; CD-ROM respects GOLD_CD
+    EXPECT_STREQ("CHARCOAL_525",
+                 DiskCaddyView::ResolvePhysicalStyle("FLOPPY_525_360K", "", "any").c_str());
+    EXPECT_STREQ("GOLD_CD",
+                 DiskCaddyView::ResolvePhysicalStyle("CDROM_ISO", "GOLD_CD", "any").c_str());
+}
+
+TEST(KioskRuntimeSwapTest, FloppyHotSwapTogglesFdc0x3F7DskChgAndHoldsDoorOpen100ms) {
+    const std::string base = BootInjector::GetInstance().GetDefaultDispatchImagePath();
+    const std::string disk1_path = base + "_swap_disk1.img";
+    const std::string disk2_path = base + "_swap_disk2.img";
+    const std::string diskb_path = base + "_swap_diskb.img";
+
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(disk1_path, 1440u * 1024u, "DISK_ONE"));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(disk2_path, 1440u * 1024u, "DISK_TWO"));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(diskb_path, 1440u * 1024u, "DISK_BEE"));
+
+    // Mount initial floppies in Drive A: (0) and Drive B: (1)
+    ASSERT_TRUE(DriveManager::AppendAndSwapDisk(0, disk1_path, false, false));
+    ASSERT_TRUE(DriveManager::AppendAndSwapDisk(1, diskb_path, false, false));
+
+    // Close door after initial mount by advancing 110ms
+    AdvanceEmulatedPicTimeMs(110);
+    EXPECT_FALSE(FDC_IsDoorOpen(0));
+    EXPECT_FALSE(FDC_IsDoorOpen(1));
+
+    // Simulate guest clearing initial DSKCHG on A: and B:
+    imageDiskChange[0] = false;
+    imageDiskChange[1] = false;
+    EXPECT_EQ(0u, FDC_DebugReadDIR(0) & 0x80u);
+    EXPECT_EQ(0u, FDC_DebugReadDIR(1) & 0x80u);
+
+    // Hot-swap Disk 2 into Drive A: with write_protected = true
+    ASSERT_TRUE(DriveManager::AppendAndSwapDisk(0, disk2_path, false, true));
+    ASSERT_NE(nullptr, imageDiskList[0]);
+    EXPECT_STREQ(disk2_path.c_str(), DriveManager::GetKioskActiveDiskPath(0).c_str());
+
+    // Verify 100ms virtual door-open state & 0x3F7 bit 7 (0x80 DSKCHG) high on Drive A:,
+    // while Drive B: remains untouched!
+    EXPECT_TRUE(FDC_IsDoorOpen(0));
+    EXPECT_NE(0u, FDC_DebugReadDIR(0) & 0x80u);
+    EXPECT_FALSE(FDC_IsDoorOpen(1));
+    EXPECT_EQ(0u, FDC_DebugReadDIR(1) & 0x80u);
+
+    // Verify write-protection blocks sector writes with Int13Status::WriteProtected (0x03)
+    uint8_t dummy_sector[512] = { 0 };
+    EXPECT_EQ(Int13Status::WriteProtected, imageDiskList[0]->Write_AbsoluteSector(0, dummy_sector));
+
+    // At 50ms of emulated CPU time, the virtual floppy door must STILL be held open
+    AdvanceEmulatedPicTimeMs(50);
+    EXPECT_TRUE(FDC_IsDoorOpen(0));
+    EXPECT_NE(0u, FDC_DebugReadDIR(0) & 0x80u);
+
+    // Past 100ms (e.g. +60ms -> 110ms total), the virtual door closes and DSKCHG remains latched
+    AdvanceEmulatedPicTimeMs(60);
+    EXPECT_FALSE(FDC_IsDoorOpen(0));
+    EXPECT_TRUE(imageDiskChange[0]);
+    EXPECT_NE(0u, FDC_DebugReadDIR(0) & 0x80u);
+
+    // Clean up test floppy mounts
+    DriveManager::EjectDriveMedia(0, false);
+    DriveManager::EjectDriveMedia(1, false);
+    for (int i = 0; i < MAX_SWAPPABLE_DISKS; ++i) {
+        if (diskSwap[i] != NULL) {
+            diskSwap[i]->Release();
+            diskSwap[i] = NULL;
+        }
+    }
+    std::remove(disk1_path.c_str());
+    std::remove(disk2_path.c_str());
+    std::remove(diskb_path.c_str());
+}
+
+TEST(KioskRuntimeSwapTest, AtapiCdRomHotSwapTriggersUnitAttentionAsc28) {
+    // 1. Immediate transition (0.0ms) -> LOAD_DISC_READIED with SK=0x06 (UNIT ATTENTION), ASC=0x28, ASCQ=0x00
+    ASSERT_TRUE(Kiosk_IDE_NotifyATAPIMediaChange(3 /* Drive D: */, 0.0));
+    uint8_t sk = 0, asc = 0, ascq = 0;
+    int loading_mode = -1;
+    ASSERT_TRUE(Kiosk_IDE_GetATAPISense(3, sk, asc, ascq, loading_mode));
+    EXPECT_EQ(0x06u, sk);
+    EXPECT_EQ(0x28u, asc);
+    EXPECT_EQ(0x00u, ascq);
+
+    // 2. Timed 250ms virtual tray eject/insert cycle:
+    //    t=0ms:    LOAD_INSERT_CD (SK=0x02 NOT READY, ASC=0x3A MEDIUM NOT PRESENT)
+    //    t=130ms:  LOAD_DISC_LOADING (SK=0x02 NOT READY, ASC=0x04, ASCQ=0x01 BECOMING READY)
+    //    t=260ms:  LOAD_DISC_READIED (SK=0x06 UNIT ATTENTION, ASC=0x28, ASCQ=0x00 MEDIUM MAY HAVE CHANGED)
+    ASSERT_TRUE(Kiosk_IDE_NotifyATAPIMediaChange(3 /* Drive D: */, 250.0));
+    ASSERT_TRUE(Kiosk_IDE_GetATAPISense(3, sk, asc, ascq, loading_mode));
+    EXPECT_EQ(0x02u, sk);
+    EXPECT_EQ(0x3Au, asc);
+
+    AdvanceEmulatedPicTimeMs(135);
+    ASSERT_TRUE(Kiosk_IDE_GetATAPISense(3, sk, asc, ascq, loading_mode));
+    EXPECT_EQ(0x02u, sk);
+    EXPECT_EQ(0x04u, asc);
+    EXPECT_EQ(0x01u, ascq);
+
+    AdvanceEmulatedPicTimeMs(135);
+    ASSERT_TRUE(Kiosk_IDE_GetATAPISense(3, sk, asc, ascq, loading_mode));
+    EXPECT_EQ(0x06u, sk);
+    EXPECT_EQ(0x28u, asc);
+    EXPECT_EQ(0x00u, ascq);
+}
+
+TEST_F(KioskDatabaseFixture, OverlayCachesSessionCaddyAndTogglesViewMode) {
+    const std::string base = BootInjector::GetInstance().GetDefaultDispatchImagePath();
+    const std::string disk1_path = base + "_ovl_disk1.img";
+    const std::string disk2_path = base + "_ovl_disk2.img";
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(disk1_path, 1440u * 1024u, "KQ6_DISK1"));
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(disk2_path, 1440u * 1024u, "KQ6_DISK2"));
+
+    KioskDatabase& db = KioskDatabase::GetInstance();
+
+    MachineRecord mach;
+    mach.id = "mach-486";
+    mach.display_name = "486DX2 Sound Blaster 16";
+    mach.archetype_id = KioskArchetypes::DX2_486;
+    mach.archetype_tier = 4;
+    mach.boot_mode = "INTEGRATED_DOS";
+    ASSERT_TRUE(db.InsertMachine(mach));
+
+    CatalogItemRecord item;
+    item.id = "item-kq6";
+    item.machine_id = mach.id;
+    item.item_type = "GAME";
+    item.title = "King's Quest VI";
+    item.launch_mechanism = "INTEGRATED_AUTOEXEC";
+    item.guest_executable = "SIERRA.EXE";
+    ASSERT_TRUE(db.InsertCatalogItem(item));
+
+    MediaPoolRecord m1;
+    m1.id = "med-kq6-1";
+    m1.file_path = disk1_path;
+    m1.media_type = "FLOPPY_35_1440K";
+    m1.label_title = "King's Quest VI - Disk 1";
+    ASSERT_TRUE(db.InsertMedia(m1));
+
+    MediaPoolRecord m2;
+    m2.id = "med-kq6-2";
+    m2.file_path = disk2_path;
+    m2.media_type = "FLOPPY_35_1440K";
+    m2.label_title = "King's Quest VI - Disk 2";
+    m2.is_write_protected = true;
+    ASSERT_TRUE(db.InsertMedia(m2));
+
+    CaddyBindingRecord b1;
+    b1.catalog_item_id = item.id;
+    b1.media_id = m1.id;
+    b1.target_drive = "A";
+    b1.slot_order = 1;
+    ASSERT_TRUE(db.AddCaddyBinding(b1));
+
+    CaddyBindingRecord b2;
+    b2.catalog_item_id = item.id;
+    b2.media_id = m2.id;
+    b2.target_drive = "A";
+    b2.slot_order = 2;
+    ASSERT_TRUE(db.AddCaddyBinding(b2));
+
+    // Set active launch context and enter STATE_RUNTIME_OVERLAY
+    KioskManager& km = KioskManager::GetInstance();
+    LaunchContext ctx;
+    ctx.machine_id = mach.id;
+    ctx.catalog_item_id = item.id;
+    ctx.is_real_hdd_boot = false;
+    km.SetLaunchContext(ctx);
+    km.SetState(KioskState::STATE_EMULATION_RUNNING);
+    km.EnterRuntimeOverlay();
+    EXPECT_EQ(KioskState::STATE_RUNTIME_OVERLAY, km.GetState());
+
+    RuntimeOverlay& ovl = RuntimeOverlay::GetInstance();
+    ASSERT_GE(ovl.GetSessionCaddy().size(), 2u);
+    EXPECT_STREQ("KQ6_DISK1", ovl.GetSessionCaddy()[0].media.volume_label.c_str());
+    EXPECT_STREQ("KQ6_DISK2", ovl.GetSessionCaddy()[1].media.volume_label.c_str());
+    EXPECT_EQ(CaddyViewMode::SKEUOMORPHIC, ovl.GetViewMode());
+
+    // Toggle view mode via 'V' key event
+    SDL_Event key_v = {};
+    key_v.type = SDL_KEYDOWN;
+    key_v.key.repeat = 0;
+    key_v.key.keysym.sym = SDLK_v;
+    EXPECT_TRUE(ovl.HandleInputEvent(key_v));
+    EXPECT_EQ(CaddyViewMode::LIST, ovl.GetViewMode());
+
+    // Toggle view mode back via Gamepad Y button event
+    SDL_Event pad_y = {};
+    pad_y.type = SDL_CONTROLLERBUTTONDOWN;
+    pad_y.cbutton.button = SDL_CONTROLLER_BUTTON_Y;
+    EXPECT_TRUE(ovl.HandleInputEvent(pad_y));
+    EXPECT_EQ(CaddyViewMode::SKEUOMORPHIC, ovl.GetViewMode());
+
+    // Perform hot-swap of Caddy Slot 1 (Disk 2, write-protected)
+    ASSERT_TRUE(ovl.PerformHotSwapCaddySlot(1));
+    EXPECT_STREQ(disk2_path.c_str(), DriveManager::GetKioskActiveDiskPath(0).c_str());
+    EXPECT_TRUE(FDC_IsWriteProtected(0));
+
+    // Resume emulation
+    km.ResumeEmulation();
+    EXPECT_EQ(KioskState::STATE_EMULATION_RUNNING, km.GetState());
+
+    DriveManager::EjectDriveMedia(0, false);
+    for (int i = 0; i < MAX_SWAPPABLE_DISKS; ++i) {
+        if (diskSwap[i] != NULL) {
+            diskSwap[i]->Release();
+            diskSwap[i] = NULL;
+        }
+    }
+    std::remove(disk1_path.c_str());
+    std::remove(disk2_path.c_str());
 }
 
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

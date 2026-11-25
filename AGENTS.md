@@ -97,9 +97,11 @@ To avoid scanning 24,000+ lines of monolithic upstream source files during futur
 
 ---
 
-## 5. Phase Verification & Commit Lifecycle
-Before committing changes at each phase milestone:
-1. **Build & Runtime Verification**: Invoke `build-verifier` (or run `build.ps1` and `test-kiosk.ps1`).
-2. **Pre-Commit Code Review**: Invoke `code-reviewer` to perform an adversarial review of `git diff master`.
-3. **Remediation**: Remediate all critical, portability, and concurrency findings.
-4. **Commit**: Use Conventional Commits (`feat(kiosk): ...`, `fix(kiosk): ...`).
+## 5. Phase Branching, Verification & Commit Lifecycle
+1. **Isolated Feature Branch per Phase**:
+   - Every phase must be developed on its own dedicated feature branch (e.g., `feat/kiosk-phase-N`) branched directly off `master`.
+   - **Never stack phases**: Wait for the current phase to be completely verified, reviewed, and merged back to `master` before creating the branch for or starting work on the next phase.
+2. **Build & Runtime Verification**: Before committing changes at each phase milestone, invoke `build-verifier` (or run `build.ps1` and `test-kiosk.ps1`).
+3. **Pre-Commit Code Review**: Stage new files or mark them intent-to-add (`git add -N <files>`) so they appear in `git diff master`, then invoke `code-reviewer` to perform an adversarial review of `git diff master` (which must reflect only the current phase's changes).
+4. **Remediation**: Remediate all critical, portability, and concurrency findings, then re-run the build and tests (`build.ps1` and `test-kiosk.ps1`) after any source-code remediation and before committing—earlier results do not verify later edits (if the current session's Windows sandbox is read-only after running `code-reviewer`, perform the re-verification in a separate session).
+5. **Commit & Merge**: Use Conventional Commits (`feat(kiosk): ...`, `fix(kiosk): ...`) and ensure the feature branch is merged back to `master` upon phase completion before advancing.

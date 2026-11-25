@@ -124,6 +124,9 @@ imageDiskNFD::vfdentry *imageDiskNFD::findSector(uint8_t head,uint8_t track,uint
 }
 
 Int13Status imageDiskNFD::Write_Sector(uint32_t head,uint32_t cylinder,uint32_t sector,const void * data,unsigned int req_sector_size) {
+#if defined(C_KIOSK)
+    if (this->kiosk_write_protected) return Int13Status::WriteProtected;
+#endif
     const vfdentry *ent;
 
     if (req_sector_size == 0)

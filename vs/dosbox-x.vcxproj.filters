@@ -1827,6 +1827,12 @@
     <ClCompile Include="..\src\kiosk\machine\boot_injector.cpp">
       <Filter>Sources\kiosk\machine</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\kiosk\ui\view_disk_caddy.cpp">
+      <Filter>Sources\kiosk\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\kiosk\ui\runtime_overlay.cpp">
+      <Filter>Sources\kiosk\ui</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\kiosk\ui\kiosk_ui.cpp">
       <Filter>Sources\kiosk\ui</Filter>
     </ClCompile>
@@ -2893,6 +2899,12 @@
     </ClInclude>
     <ClInclude Include="..\src\kiosk\machine\kioskext_bin.h">
       <Filter>Sources\kiosk\machine</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\kiosk\ui\view_disk_caddy.h">
+      <Filter>Sources\kiosk\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\kiosk\ui\runtime_overlay.h">
+      <Filter>Sources\kiosk\ui</Filter>
     </ClInclude>
     <ClInclude Include="..\src\kiosk\ui\kiosk_ui.h">
       <Filter>Sources\kiosk\ui</Filter>

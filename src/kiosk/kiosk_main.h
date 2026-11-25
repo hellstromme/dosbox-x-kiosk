@@ -37,6 +37,7 @@ public:
     // Input & Pre-Boot Routing
     bool HandlePreBootInputEvent(const SDL_Event& event);
     static bool IsIntentionalUserInput(const SDL_Event& event);
+    bool IsOverlayHotkeyEvent(const SDL_Event& event, const uint8_t* kb_state) const;
 
     // Default Boot Target Resolution & Launch Requests
     LaunchContext ResolveDefaultBootContext() const;
@@ -81,10 +82,14 @@ private:
     KioskManager& operator=(const KioskManager&) = delete;
 
     void CleanupSessionArtifactsLocked();
+    void UpdateParsedOverlayHotkeyLocked();
 
     mutable std::mutex m_mutex;
     std::atomic<KioskState> m_state;
     KioskConfigRecord m_config;
+    std::atomic<int> m_overlay_mod_scancode;
+    std::atomic<int> m_overlay_key_sym;
+    mutable std::atomic<bool> m_overlay_chord_latched;
     LaunchContext m_launch_ctx;
     std::string m_base_conf_path;
     std::string m_last_synthesized_conf;

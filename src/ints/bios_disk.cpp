@@ -1498,6 +1498,9 @@ Int13Status imageDisk::Write_Sector(uint32_t head,uint32_t cylinder,uint32_t sec
 
 
 Int13Status imageDisk::Write_AbsoluteSector(uint32_t sectnum, const void *data) {
+#if defined(C_KIOSK)
+	if (this->kiosk_write_protected) return Int13Status::WriteProtected;
+#endif
 	if (ffdd) return ffdd->WriteSector(sectnum, data);
 
     uint64_t bytenum;

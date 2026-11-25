@@ -139,6 +139,7 @@ char* revert_escape_newlines(const char* aMessage);
 #include "kiosk/kiosk_main.h"
 #include "kiosk/kiosk_db.h"
 #include "kiosk/ui/kiosk_ui.h"
+#include "kiosk/ui/runtime_overlay.h"
 #endif
 #include "menudef.h"
 #include "pic.h"
@@ -5963,15 +5964,13 @@ static void Kiosk_RunRuntimeOverlayLoop(void) {
             const Uint8* kb_state = SDL_GetKeyboardState(NULL);
             const bool is_toggle_or_esc =
                 (overlay_event.type == SDL_KEYDOWN && overlay_event.key.keysym.sym == SDLK_ESCAPE) ||
-                (overlay_event.type == SDL_KEYDOWN && overlay_event.key.keysym.sym == SDLK_d &&
-                 kb_state != NULL && kb_state[SDL_SCANCODE_F12]) ||
-                (overlay_event.type == SDL_CONTROLLERBUTTONDOWN &&
-                 overlay_event.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE);
+                KioskManager::GetInstance().IsOverlayHotkeyEvent(overlay_event, kb_state);
             if (is_toggle_or_esc) {
                 KioskManager::GetInstance().ResumeEmulation();
                 break;
             }
 
+            RuntimeOverlay::GetInstance().HandleInputEvent(overlay_event);
             KioskUI::GetInstance().ProcessEvent(&overlay_event);
         }
 
@@ -5997,6 +5996,18 @@ static void Kiosk_RunRuntimeOverlayLoop(void) {
         KioskManager::GetInstance().GetState() != KioskState::STATE_EMULATION_RUNNING) {
         throw KioskGuestShutdownException(KioskShutdownReason::USER_OVERLAY_ABORT);
     }
+
+#if C_OPENGL
+    if (OpenGL_using() && sdl.window != NULL) {
+        // Clear all double/triple-buffered swap-chain backbuffers so fullscreen
+        // pillarbox/letterbox borders do not retain the dimmed overlay backdrop.
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        GFX_OpenGLRedrawScreen();
+        SDL_GL_SwapBuffers();
+        sdl_opengl.clear_countdown = 3;
+    }
+#endif
 
     if (was_mouse_locked) {
         SDL_SetRelativeMouseMode(SDL_TRUE);
@@ -6068,9 +6079,7 @@ void GFX_Events() {
 #if defined(C_KIOSK)
         if (KioskManager::GetInstance().IsKioskModeActive()) {
             const Uint8* kb_state = SDL_GetKeyboardState(NULL);
-            const bool is_overlay_hotkey =
-                (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_d && kb_state != NULL && kb_state[SDL_SCANCODE_F12]) ||
-                (event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE);
+            const bool is_overlay_hotkey = KioskManager::GetInstance().IsOverlayHotkeyEvent(event, kb_state);
             KioskState kstate = KioskManager::GetInstance().GetState();
             if (is_overlay_hotkey) {
                 if (kstate == KioskState::STATE_EMULATION_RUNNING) {
