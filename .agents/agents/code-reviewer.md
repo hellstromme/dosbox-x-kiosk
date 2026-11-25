@@ -32,6 +32,18 @@ The **Adversarial Code Review Subagent** provides independent, read-only scrutin
    - Is `"config.h"` included as the first header in all `.cpp` files?
    - Are shared state flags thread-safe (`std::atomic`)?
    - Is the code strictly compatible with C++14 across MSVC and GCC/Clang?
+   - Are binary header offset calculations overflow-safe on 32-bit `size_t` targets (e.g., 32-bit ARM Buildroot)?
+5. **Dual-Layer Media & Hardware Consistency**:
+   - Do mount, swap, fallback, and eject paths keep *both* integrated-DOS (`Drives[]`, `driveInfos[]`, MSCDEX, `isoDrive`) and native hardware (`imageDiskList[]`, FDC, ATAPI) synchronized?
+   - Are read-only lookups guaranteed not to mutate device assignments (e.g., `drive_index`), and do creation paths only claim explicitly unassigned slots (`0xFFu`)?
+   - Are host paths compared with normalized, host-appropriate case rules (`Kiosk_PathsEqual` / `PathsMatchNormalized`) across both floppy and optical branches?
+6. **Write-Protection & Subclass Completeness**:
+   - Is logical write protection decoupled from host stream open mode so toggling WP off works on writable host images while refusing to unlock physically read-only files (`kiosk_host_readonly`)?
+   - Is `kiosk_host_readonly` seeded on all image creation paths (including boot-time `IMGMOUNT` / `fatDrive`)?
+   - Is `kiosk_write_protected` enforced *before* any host write in FDC and all floppy-capable `imageDisk` write overrides (`imageDiskD88`, `imageDiskNFD`, `imageDiskVFD`)?
+7. **Input & UI Viewport Safety**:
+   - Are multi-key SDL hotkey chords latched until key release so queued keydowns in one pump cannot double-toggle?
+   - Do ImGui overlays clamp to `viewport->WorkSize` and wrap/scroll cards cleanly on 640×480 viewports?
 
 ---
 
@@ -50,6 +62,6 @@ If no issues are identified, the agent outputs an explicit certification that th
 {
   "TypeName": "code-reviewer",
   "Role": "Adversarial Code Reviewer",
-  "Prompt": "Perform a critical review of the current uncommitted changes (git diff) against master. Check against the 4 core architecture constraints in AGENTS.md."
+  "Prompt": "Perform a critical review of the full current-phase diff against master (`git diff master`, after staging or marking new files with `git add -N`), including both committed milestones and uncommitted edits. Check against all architecture and domain scrutiny areas in AGENTS.md and code-reviewer.md."
 }
 ```

@@ -141,3 +141,6 @@ contrib/macos/dosbox-x.plist
 # ignore default dosbox config files (used for manual testing)
 /dosbox-x.conf
 /src/dosbox-x.conf
+
+# ignore Dear ImGui runtime layout persistence artifact
+imgui.ini

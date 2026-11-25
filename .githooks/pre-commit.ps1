@@ -106,7 +106,52 @@ if ($stagedFiles -contains "vs/dosbox-x.vcxproj") {
     }
 }
 
-# 4. Report results
+# 5. Rule 4: Documentation SQL schema & PowerShell quoting lint for docs/Kiosk/*.md
+$docFiles = @($stagedFiles | Where-Object { $_ -like "docs/Kiosk/*.md" -and $_ -notlike "*Retrospective.md" })
+if ($docFiles.Count -gt 0 -and (Test-Path "src/kiosk/kiosk_db.cpp")) {
+    $dbSource = Get-Content "src/kiosk/kiosk_db.cpp" -Raw
+    $validTables = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($m in [regex]::Matches($dbSource, 'CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)')) {
+        [void]$validTables.Add($m.Groups[1].Value)
+    }
+
+    foreach ($docFile in $docFiles) {
+        $docContent = git show ":$docFile" 2>$null
+        if ($LASTEXITCODE -ne 0 -or $null -eq $docContent) { continue }
+        $docLines = $docContent -split "`r?`n"
+        $inPsBlock = $false
+        for ($i = 0; $i -lt $docLines.Count; $i++) {
+            $ln = $docLines[$i]
+            $lineNo = $i + 1
+            if ($ln -match '^\s*```powershell\b') {
+                $inPsBlock = $true
+                continue
+            }
+            if ($inPsBlock -and $ln -match '^\s*```\s*$') {
+                $inPsBlock = $false
+                continue
+            }
+            if ($inPsBlock) {
+                if ($ln -match '(?<!["&])\.\\bin\\x64\\Debug SDL2\\dosbox-x\.exe') {
+                    $violations.Add("$docFile : Line $lineNo has unquoted 'Debug SDL2' path in PowerShell block; use '& "".\bin\x64\Debug SDL2\dosbox-x.exe""'.")
+                }
+                if ($ln -match 'python\s+-c\s+"[^"]*\\"') {
+                    $violations.Add("$docFile : Line $lineNo uses backslash-escaped double quotes inside PowerShell python -c; use a single-quoted here-string piped to 'python -'.")
+                }
+            }
+            if ($validTables.Count -gt 0) {
+                foreach ($sm in [regex]::Matches($ln, '\b(?:INSERT(?:\s+OR\s+REPLACE)?\s+INTO|DELETE\s+FROM)\s+([A-Za-z_][A-Za-z0-9_]*)\b')) {
+                    $tbl = $sm.Groups[1].Value
+                    if (-not $validTables.Contains($tbl)) {
+                        $violations.Add("$docFile : Line $lineNo references unknown SQLite table '$tbl' (not found in src/kiosk/kiosk_db.cpp).")
+                    }
+                }
+            }
+        }
+    }
+}
+
+# 6. Report results
 if ($violations.Count -gt 0) {
     Write-Host "[pre-commit] FAILED: Architectural constraint violations found:" -ForegroundColor Red
     foreach ($v in $violations) {

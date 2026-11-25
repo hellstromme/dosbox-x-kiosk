@@ -1885,4 +1885,102 @@ TEST_F(KioskDatabaseFixture, OverlayCachesSessionCaddyAndTogglesViewMode) {
     std::remove(disk2_path.c_str());
 }
 
+TEST(KioskRuntimeSwapTest, OverlayHotkeyChordLatchesUntilKeyRelease) {
+    KioskManager& km = KioskManager::GetInstance();
+    uint8_t kb_state[SDL_NUM_SCANCODES] = {};
+
+    // Ensure clean unlatched state
+    SDL_Event reset_evt = {};
+    reset_evt.type = SDL_KEYUP;
+    reset_evt.key.keysym.sym = SDLK_d;
+    EXPECT_FALSE(km.IsOverlayHotkeyEvent(reset_evt, kb_state));
+
+    // Simulate both F12 and D held in the same SDL event pump
+    kb_state[SDL_SCANCODE_F12] = 1;
+    kb_state[SDL_SCANCODE_D] = 1;
+
+    SDL_Event f12_down = {};
+    f12_down.type = SDL_KEYDOWN;
+    f12_down.key.repeat = 0;
+    f12_down.key.keysym.sym = SDLK_F12;
+    f12_down.key.keysym.scancode = SDL_SCANCODE_F12;
+
+    SDL_Event d_down = {};
+    d_down.type = SDL_KEYDOWN;
+    d_down.key.repeat = 0;
+    d_down.key.keysym.sym = SDLK_d;
+    d_down.key.keysym.scancode = SDL_SCANCODE_D;
+
+    // First queued keydown triggers once; second queued keydown is suppressed by latch
+    EXPECT_TRUE(km.IsOverlayHotkeyEvent(f12_down, kb_state));
+    EXPECT_FALSE(km.IsOverlayHotkeyEvent(d_down, kb_state));
+
+    // Releasing D clears the latch
+    kb_state[SDL_SCANCODE_D] = 0;
+    SDL_Event d_up = {};
+    d_up.type = SDL_KEYUP;
+    d_up.key.keysym.sym = SDLK_d;
+    d_up.key.keysym.scancode = SDL_SCANCODE_D;
+    EXPECT_FALSE(km.IsOverlayHotkeyEvent(d_up, kb_state));
+
+    // Pressing D again while F12 is held triggers once more
+    kb_state[SDL_SCANCODE_D] = 1;
+    EXPECT_TRUE(km.IsOverlayHotkeyEvent(d_down, kb_state));
+
+    // Clean up latch for subsequent tests
+    kb_state[SDL_SCANCODE_F12] = 0;
+    kb_state[SDL_SCANCODE_D] = 0;
+    EXPECT_FALSE(km.IsOverlayHotkeyEvent(d_up, kb_state));
+}
+
+TEST(KioskRuntimeSwapTest, LogicalWriteProtectDecoupledFromHostReadOnly) {
+    const std::string disk_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + "_wp_toggle_test.img";
+    ASSERT_TRUE(WriteRawFloppyFileWithVolumeLabel(disk_path, 1440u * 1024u, "WP_TEST"));
+
+    // Mount writable host image initially with logical write protection enabled
+    ASSERT_TRUE(DriveManager::AppendAndSwapDisk(0, disk_path, false, /*write_protected=*/true));
+    ASSERT_NE(nullptr, imageDiskList[0]);
+    EXPECT_TRUE(FDC_IsWriteProtected(0));
+    EXPECT_TRUE(imageDiskList[0]->kiosk_write_protected);
+    EXPECT_FALSE(imageDiskList[0]->kiosk_host_readonly);
+
+    // Logical WP can be disabled because host stream is writable
+    EXPECT_TRUE(DriveManager::SetKioskFloppyWriteProtect(0, false));
+    EXPECT_FALSE(FDC_IsWriteProtected(0));
+    EXPECT_FALSE(imageDiskList[0]->kiosk_write_protected);
+
+    // Simulate a physically read-only host file: unlocking WP must fail and retain protection
+    imageDiskList[0]->kiosk_host_readonly = true;
+    EXPECT_TRUE(DriveManager::SetKioskFloppyWriteProtect(0, true));
+    EXPECT_FALSE(DriveManager::SetKioskFloppyWriteProtect(0, false));
+    EXPECT_TRUE(FDC_IsWriteProtected(0));
+    EXPECT_TRUE(imageDiskList[0]->kiosk_write_protected);
+
+    // Eject and verify active path clears while ejected
+    EXPECT_TRUE(DriveManager::EjectDriveMedia(0, false));
+    EXPECT_TRUE(DriveManager::GetKioskActiveDiskPath(0).empty());
+
+    for (int i = 0; i < MAX_SWAPPABLE_DISKS; ++i) {
+        if (diskSwap[i] != NULL) {
+            diskSwap[i]->Release();
+            diskSwap[i] = NULL;
+        }
+    }
+    std::remove(disk_path.c_str());
+}
+
+TEST(KioskRuntimeSwapTest, AtapiReadOnlyLookupDoesNotMutateAssignedDriveIndex) {
+    ASSERT_TRUE(Kiosk_IDE_NotifyATAPIMediaChange(3 /* Drive D: */, 0.0));
+
+    uint8_t sk = 0, asc = 0, ascq = 0;
+    int loading_mode = -1;
+    ASSERT_TRUE(Kiosk_IDE_GetATAPISense(3, sk, asc, ascq, loading_mode));
+
+    // Read-only sense lookup for unmounted Drive E: must return false without hijacking D:
+    EXPECT_FALSE(Kiosk_IDE_GetATAPISense(4 /* Drive E: */, sk, asc, ascq, loading_mode));
+
+    // Drive D: must remain intact and queryable
+    EXPECT_TRUE(Kiosk_IDE_GetATAPISense(3, sk, asc, ascq, loading_mode));
+}
+
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

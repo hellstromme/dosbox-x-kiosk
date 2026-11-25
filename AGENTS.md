@@ -38,15 +38,25 @@ powershell -ExecutionPolicy Bypass -File .agents/skills/dosbox-config-tester/scr
 ```
 - Validates Kiosk CLI flags, SQLite catalog connection, Dear ImGui context, unit test suite, and clean shutdown without window hangs or shell quoting errors.
 
-### 2.3 Editing CRLF Upstream Files with `patch-lines.ps1`
-- Upstream DOSBox-X files (`src/gui/sdlmain.cpp`, `src/ints/bios.cpp`) use Windows CRLF (`\r\n`) line endings and exceed 10,000 lines.
-- Passing multi-line `Target` strings to `edit_file` on CRLF files will fail due to LF (`\n`) normalization, and passing single-line `Target` strings to `edit_file` replaces **every** match in the file.
-- For multi-line or scoped edits in large CRLF files, use `.agents/skills/msbuild-runner/scripts/patch-lines.ps1` bounded by `-StartLine` and `-EndLine`:
+### 2.3 Editing CRLF Upstream Files (`edit_file` vs `patch-lines.ps1`)
+- Upstream DOSBox-X files (`src/gui/sdlmain.cpp`, `src/ints/bios.cpp`, `src/dos/drives.cpp`, `src/hardware/ide.cpp`, `src/hardware/floppy.cpp`) use Windows CRLF (`\r\n`) line endings and can exceed 10,000 lines.
+- Prefer native `edit_file` for scoped edits on CRLF files: it runs in the host process (unaffected by read-only Windows sandbox ACLs) and preserves CRLF line endings cleanly when given a unique multi-line `Target`.
+- Reserve `.agents/skills/msbuild-runner/scripts/patch-lines.ps1` (bounded by `-StartLine` and `-EndLine`) for very large bulk line-range replacements or when a `Target` appears multiple times in the file:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .agents/skills/msbuild-runner/scripts/patch-lines.ps1 -FilePath "src/gui/sdlmain.cpp" -StartLine 10940 -EndLine 10965 -ReplaceEntireRange -ReplacementFile "patch.txt"
 ```
 
-### 2.4 Specialized Custom Subagents
+### 2.4 Triaging & Resolving PR Comments with `github-pr-review`
+Use the custom skill scripts (`.agents/skills/github-pr-review/`) instead of raw `gh api graphql` shell one-liners to avoid truncated dumps and Windows PowerShell quoting issues:
+```powershell
+# Fetch only unresolved review threads in compact format
+powershell -ExecutionPolicy Bypass -File .agents/skills/github-pr-review/scripts/fetch-pr-threads.ps1 -Pr 3 -UnresolvedOnly
+
+# Batch reply and resolve threads via UTF-8 stdin JSON
+powershell -ExecutionPolicy Bypass -File .agents/skills/github-pr-review/scripts/resolve-pr-threads.ps1 -InputJson "actions.json"
+```
+
+### 2.5 Specialized Custom Subagents
 Two dedicated subagents are configured to isolate heavy context operations:
 - **`build-verifier`** ([spec](.agents/agents/build-verifier.md)): Runs MSBuild and runtime testing in an isolated subagent context, shielding the primary conversation from token-heavy compiler logs.
 - **`code-reviewer`** ([spec](.agents/agents/code-reviewer.md)): Conducts pre-commit adversarial reviews against the architecture constraints below.
