@@ -175,16 +175,24 @@ bool KioskUI::ProcessEvent(const SDL_Event* event) {
 
     if (KioskManager::GetInstance().GetState() == KioskState::STATE_SHELL_INTERACTIVE) {
         const bool want_text = m_context_initialized ? ImGui::GetIO().WantTextInput : false;
-        const bool suppress_actions =
+        const bool popup_or_active =
             m_context_initialized &&
             (ImGui::IsAnyItemActive() || ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId));
-        // When ImGui keyboard/gamepad nav has a focused widget, let ImGui handle Enter/Space/A
-        // instead of double-dispatching ACTION_CONFIRM to the active carousel tab.
+        const bool is_carousel_tab =
+            (m_active_tab == KioskHubTab::GAMES ||
+             m_active_tab == KioskHubTab::APPLICATIONS ||
+             m_active_tab == KioskHubTab::MACHINES);
+        // Single-owner navigation rule:
+        // - On carousel tabs without an active widget/popup/text input, KioskInputRouter is the
+        //   sole owner of directional & confirm input (ImGui keyboard/gamepad nav is disabled).
+        // - On form/modal views (Wizard, Settings, Media Pool, or open modals), ImGui nav owns
+        //   focused widget activation and KioskInputRouter suppresses confirm while focused.
+        const bool router_owns_nav = is_carousel_tab && !want_text && !popup_or_active;
         const bool suppress_confirm =
-            m_context_initialized &&
+            !router_owns_nav && m_context_initialized &&
             (ImGui::IsAnyItemFocused() || ImGui::GetIO().NavVisible);
         if (KioskInputRouter::GetInstance().ProcessSDLEvent(
-                *event, want_text, 0, suppress_actions, suppress_confirm)) {
+                *event, want_text, 0, popup_or_active, suppress_confirm)) {
             handled = true;
         }
     }
@@ -322,6 +330,9 @@ void KioskUI::ProcessPendingInputActions() {
 
     KioskInputAction action = KioskInputAction::NONE;
     while (router.PollAction(action)) {
+        // Reload cache before each queued action so consecutive mutations (e.g., double favorite)
+        // observe the latest persisted state instead of stale cached records.
+        EnsureCatalogCacheLoaded();
         if (action == KioskInputAction::NAV_TAB_PREV) {
             int idx = static_cast<int>(m_active_tab);
             idx = (idx - 1 + 6) % 6;
@@ -526,6 +537,25 @@ void KioskUI::RenderToastOverlay(float delta_sec) {
 
 void KioskUI::RenderInteractiveShell() {
     if (!m_context_initialized) return;
+
+    // Enforce single directional/confirm input owner: disable ImGui keyboard/gamepad nav on
+    // carousel tabs when no popup/text input is active so Right/D-Pad cannot move both the
+    // carousel and ImGui button focus simultaneously.
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        const bool is_carousel_tab =
+            (m_active_tab == KioskHubTab::GAMES ||
+             m_active_tab == KioskHubTab::APPLICATIONS ||
+             m_active_tab == KioskHubTab::MACHINES);
+        const bool allow_imgui_nav =
+            !is_carousel_tab || io.WantTextInput ||
+            ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
+        if (allow_imgui_nav) {
+            io.ConfigFlags |= (ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad);
+        } else {
+            io.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad);
+        }
+    }
 
     EnsureCatalogCacheLoaded();
     ProcessPendingInputActions();

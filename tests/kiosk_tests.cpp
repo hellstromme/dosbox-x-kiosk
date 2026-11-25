@@ -2430,6 +2430,98 @@ TEST(KioskInputRouterTest, ClearsHeldStickOnDisconnectAndSuppressesConfirmWhenFo
     EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 3200, false, true /* suppress_confirm */));
     ASSERT_TRUE(router.PollAction(act));
     EXPECT_EQ(act, KioskInputAction::ACTION_CONFIRM);
+
+    // Multi-joystick independent hat tracking: joystick 7 and joystick 8 both pressing RIGHT
+    // must each produce NAV_RIGHT independently.
+    std::memset(&ev, 0, sizeof(ev));
+    ev.type = SDL_JOYHATMOTION;
+    ev.jhat.which = 7;
+    ev.jhat.hat = 0;
+    ev.jhat.value = SDL_HAT_RIGHT;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 3300, false, false));
+    ev.jhat.which = 8;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 3310, false, false));
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::NAV_RIGHT);
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::NAV_RIGHT);
+
+    // Disconnect both joysticks to clear hat state
+    std::memset(&ev, 0, sizeof(ev));
+    ev.type = SDL_JOYDEVICEREMOVED;
+    ev.jdevice.which = 7;
+    router.ProcessSDLEvent(ev, false, 3320, false, false);
+    ev.jdevice.which = 8;
+    router.ProcessSDLEvent(ev, false, 3330, false, false);
+}
+
+TEST(KioskWizardTest, ValidatesChsOverrideCreatesParentDirsAndHandlesFormattedPendingInstall) {
+    // 1. Strict CHS override validation (#23)
+    std::string norm;
+    EXPECT_TRUE(ViewWizard::ParseAndNormalizeChs("", norm));
+    EXPECT_TRUE(norm.empty());
+    EXPECT_TRUE(ViewWizard::ParseAndNormalizeChs("  1015 , 16 , 63  ", norm));
+    EXPECT_EQ(norm, "1015,16,63");
+    EXPECT_FALSE(ViewWizard::ParseAndNormalizeChs("abc", norm));
+    EXPECT_FALSE(ViewWizard::ParseAndNormalizeChs("1,2,3 -fs fat", norm));
+    EXPECT_FALSE(ViewWizard::ParseAndNormalizeChs("0,16,63", norm));
+    EXPECT_FALSE(ViewWizard::ParseAndNormalizeChs("100,256,63", norm));
+    EXPECT_FALSE(ViewWizard::ParseAndNormalizeChs("100,16,64", norm));
+
+    // 2. Parent directory creation + distinct ALREADY_EXISTS status (#22)
+    std::string temp_dir = "/tmp/";
+#if defined(_WIN32)
+    if (const char* td = std::getenv("TEMP")) {
+        temp_dir = td;
+        if (!temp_dir.empty() && temp_dir.back() != '\\' && temp_dir.back() != '/') temp_dir += '\\';
+    }
+#endif
+    const std::string nested_dir = temp_dir + "kiosk_test_nested_dir";
+    const std::string nested_hdd = nested_dir + "/nested_blank.img";
+    std::remove(nested_hdd.c_str());
+
+    std::string created_chs;
+    EXPECT_EQ(ViewWizard::CreateBlankHddImageEx(nested_hdd, 20, created_chs), HddCreateStatus::OK);
+    EXPECT_EQ(ViewWizard::CreateBlankHddImageEx(nested_hdd, 20, created_chs), HddCreateStatus::ALREADY_EXISTS);
+    std::remove(nested_hdd.c_str());
+
+    // 3. Formatted FAT HDD with !os_installed + bound installer media must still boot installer (#17)
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(":memory:"));
+    std::vector<uint8_t> fat_img;
+    ASSERT_TRUE(BootInjector::GetInstance().BuildFat12ImageInMemory({}, fat_img));
+    const std::string fmt_hdd = temp_dir + "kiosk_test_formatted_pending.img";
+    {
+        std::ofstream ofs(fmt_hdd.c_str(), std::ios::binary | std::ios::trunc);
+        ofs.write(reinterpret_cast<const char*>(fat_img.data()), static_cast<std::streamsize>(fat_img.size()));
+    }
+
+    MediaPoolRecord flp;
+    flp.id = "med-pending-flp";
+    flp.file_path = "dos_setup1.img";
+    flp.media_type = "FLOPPY_35_1440K";
+    flp.label_title = "DOS Setup 1";
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMedia(flp));
+
+    MachineRecord mach;
+    mach.id = "mach-formatted-pending";
+    mach.display_name = "Interrupted Install Rig";
+    mach.archetype_id = KioskArchetypes::DX_386;
+    mach.archetype_tier = 3;
+    mach.boot_mode = "REAL_HDD_BOOT";
+    mach.os_installed = false;
+    mach.primary_hdd_path = fmt_hdd;
+    std::vector<CaddyBindingRecord> b_list;
+    CaddyBindingRecord b; b.media_id = flp.id; b.target_drive = "A"; b.slot_order = 1;
+    b_list.push_back(b);
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMachineWithBindings(mach, b_list));
+
+    KioskManager::GetInstance().Initialize("", "");
+    ASSERT_TRUE(KioskManager::GetInstance().RequestLaunchMachine(mach.id));
+    std::string conf;
+    ASSERT_TRUE(KioskManager::GetInstance().SynthesizeAndPrepareLaunch(conf));
+    EXPECT_NE(std::string::npos, conf.find("BOOT -l a"));
+    EXPECT_EQ(std::string::npos, conf.find("BOOT -l c"));
+    KioskManager::GetInstance().Shutdown();
+    KioskDatabase::GetInstance().Close();
+    std::remove(fmt_hdd.c_str());
 }
 
 TEST(KioskCarouselTest, ValidatesDriveMediaCompatibilityAndComputesMaxSlotOrder) {

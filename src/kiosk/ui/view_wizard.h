@@ -13,6 +13,12 @@ enum class WizardStep {
     STEP_REVIEW_CREATE = 3
 };
 
+enum class HddCreateStatus {
+    OK = 0,
+    ALREADY_EXISTS,
+    IO_ERROR
+};
+
 class ViewWizard {
 public:
     static ViewWizard& GetInstance();
@@ -31,7 +37,7 @@ public:
     bool SelectOSDistribution(const std::string& os_id, std::string& out_error);
     void SetHddSizeMb(int size_mb);
     void SetPrimaryHddPath(const std::string& path);
-    void SetCustomHddChsOverride(const std::string& chs);
+    bool SetCustomHddChsOverride(const std::string& chs);
     void SetCreateBlankHddOnDisk(bool enable);
     bool GetCreateBlankHddOnDisk() const { return m_create_blank_hdd_file; }
     void SetInstallerFloppyMediaId(const std::string& media_id) { m_installer_floppy_media_id = media_id; }
@@ -41,8 +47,10 @@ public:
     // Returns true on success and populates out_machine_id.
     bool CommitMachine(std::string& out_machine_id, std::string& out_error);
 
-    // Pure helpers for deterministic CHS geometry and sparse-friendly blank HDD image creation
+    // Pure helpers for deterministic CHS geometry, validation, and exclusive blank HDD creation
     static std::string ComputeHddChsGeometry(int size_mb);
+    static bool ParseAndNormalizeChs(const std::string& input, std::string& out_normalized);
+    static HddCreateStatus CreateBlankHddImageEx(const std::string& file_path, int size_mb, std::string& out_chs);
     static bool CreateBlankHddImage(const std::string& file_path, int size_mb, std::string& out_chs);
 
     const MachineRecord& GetDraftMachine() const { return m_draft; }

@@ -36,6 +36,8 @@ void KioskInputRouter::InitializeControllers() {
     for (int i = 0; i < num_joysticks; ++i) {
         if (SDL_IsGameController(i)) {
             OpenControllerByDeviceIndex(i);
+        } else {
+            OpenJoystickByDeviceIndex(i);
         }
     }
 }
@@ -47,8 +49,14 @@ void KioskInputRouter::ShutdownControllers() {
         }
     }
     m_controllers.clear();
+    for (size_t i = 0; i < m_joysticks.size(); ++i) {
+        if (m_joysticks[i] != nullptr) {
+            SDL_JoystickClose(m_joysticks[i]);
+        }
+    }
+    m_joysticks.clear();
     m_axis_states.clear();
-    m_last_hat_state = 0;
+    m_hat_states.clear();
     m_action_queue.clear();
 }
 
@@ -82,6 +90,46 @@ void KioskInputRouter::CloseControllerByInstanceId(int32_t instance_id) {
             SDL_GameControllerClose(*it);
             m_controllers.erase(it);
             LOG_MSG("KIOSK InputRouter: Closed disconnected game controller (id=%d)", instance_id);
+            return;
+        }
+    }
+}
+
+void KioskInputRouter::OpenJoystickByDeviceIndex(int device_index) {
+    if (SDL_IsGameController(device_index)) {
+        return;
+    }
+    SDL_JoystickID target_id = SDL_JoystickGetDeviceInstanceID(device_index);
+    for (size_t i = 0; i < m_joysticks.size(); ++i) {
+        if (m_joysticks[i] && SDL_JoystickInstanceID(m_joysticks[i]) == target_id) {
+            return; // Already open
+        }
+    }
+    SDL_Joystick* joy = SDL_JoystickOpen(device_index);
+    if (joy != nullptr) {
+        m_joysticks.push_back(joy);
+        const char* name = SDL_JoystickName(joy);
+        LOG_MSG("KIOSK InputRouter: Opened unmanaged joystick '%s'", name ? name : "Unknown");
+    }
+}
+
+void KioskInputRouter::CloseJoystickByInstanceId(int32_t instance_id) {
+    // Clear all tracked hat states for this disconnecting joystick instance
+    for (std::map<std::pair<int32_t, uint8_t>, uint8_t>::iterator it = m_hat_states.begin();
+         it != m_hat_states.end(); ) {
+        if (it->first.first == instance_id) {
+            it = m_hat_states.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (std::vector<SDL_Joystick*>::iterator it = m_joysticks.begin();
+         it != m_joysticks.end(); ++it) {
+        if (*it && SDL_JoystickInstanceID(*it) == static_cast<SDL_JoystickID>(instance_id)) {
+            SDL_JoystickClose(*it);
+            m_joysticks.erase(it);
+            LOG_MSG("KIOSK InputRouter: Closed disconnected joystick (id=%d)", instance_id);
             return;
         }
     }
@@ -189,6 +237,14 @@ bool KioskInputRouter::ProcessSDLEvent(
             CloseControllerByInstanceId(event.cdevice.which);
             return true;
 
+        case SDL_JOYDEVICEADDED:
+            OpenJoystickByDeviceIndex(event.jdevice.which);
+            return true;
+
+        case SDL_JOYDEVICEREMOVED:
+            CloseJoystickByInstanceId(event.jdevice.which);
+            return true;
+
         case SDL_CONTROLLERAXISMOTION:
             // Always update physical stick deflection/release state even when actions are suppressed
             HandleAnalogAxis(event.caxis.which, event.caxis.axis, event.caxis.value, now_ms, suppress_actions);
@@ -199,9 +255,15 @@ bool KioskInputRouter::ProcessSDLEvent(
             if (SDL_GameControllerFromInstanceID(event.jhat.which) != nullptr) {
                 return false;
             }
+            const std::pair<int32_t, uint8_t> key(static_cast<int32_t>(event.jhat.which), event.jhat.hat);
+            const uint8_t prev = m_hat_states[key];
             const uint8_t val = event.jhat.value;
-            const uint8_t newly_pressed = static_cast<uint8_t>(val & (~m_last_hat_state));
-            m_last_hat_state = val;
+            const uint8_t newly_pressed = static_cast<uint8_t>(val & (~prev));
+            if (val == SDL_HAT_CENTERED) {
+                m_hat_states.erase(key);
+            } else {
+                m_hat_states[key] = val;
+            }
             if (suppress_actions) {
                 return false;
             }

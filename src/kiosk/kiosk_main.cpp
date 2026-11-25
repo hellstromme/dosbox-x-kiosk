@@ -292,7 +292,8 @@ bool KioskManager::HandlePreBootInputEvent(const SDL_Event& event) {
         return true;
     }
 
-    if (event.type == SDL_CONTROLLERDEVICEADDED || event.type == SDL_CONTROLLERDEVICEREMOVED) {
+    if (event.type == SDL_CONTROLLERDEVICEADDED || event.type == SDL_CONTROLLERDEVICEREMOVED ||
+        event.type == SDL_JOYDEVICEADDED || event.type == SDL_JOYDEVICEREMOVED) {
         KioskInputRouter::GetInstance().ProcessSDLEvent(event, false);
         return false;
     }
@@ -655,24 +656,20 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
             }
         }
 
-        // For !os_installed machines with bound installer media, try hooking the HDD first:
-        // if the HDD exists on disk but is either blank OR partitioned-but-unformatted
-        // (EnsureOneTimeAutoexecHook fails), boot the bound installer media (A: or El Torito D:).
+        // If OS installation is still pending (!os_installed) and installer media is bound
+        // for a Machine-Only launch on an existing HDD image, always boot the installer media
+        // and bypass EnsureOneTimeAutoexecHook (covers blank, FDISK-partitioned, and formatted-
+        // but-incomplete HDDs so interrupted installs can always resume).
         bool hdd_file_exists = false;
         if (!machine.primary_hdd_path.empty()) {
             std::ifstream hdd_probe(machine.primary_hdd_path.c_str(), std::ios::binary);
             hdd_file_exists = hdd_probe.is_open();
         }
 
-        bool hook_ok = false;
-        if (hdd_file_exists) {
-            hook_ok = BootInjector::GetInstance().EnsureOneTimeAutoexecHook(machine.primary_hdd_path);
-        }
-
-        if (!hook_ok && !machine.os_installed && item_ptr == nullptr && has_installer_media && hdd_file_exists) {
+        if (!machine.os_installed && item_ptr == nullptr && has_installer_media && hdd_file_exists) {
             boot_installer_media = true;
-            LOG_MSG("KIOSK: Unformatted or blank HDD detected with installer media; booting installer without AUTOEXEC hook.");
-        } else if (!hook_ok) {
+            LOG_MSG("KIOSK: Pending OS installation (!os_installed) with bound installer media; booting installer without AUTOEXEC hook.");
+        } else if (!hdd_file_exists || !BootInjector::GetInstance().EnsureOneTimeAutoexecHook(machine.primary_hdd_path)) {
             LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to prepare primary HDD image '%s'.",
                     machine.primary_hdd_path.c_str());
             m_state.store(KioskState::STATE_SHELL_INTERACTIVE);

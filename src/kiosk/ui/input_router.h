@@ -4,11 +4,14 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <utility>
 #include <vector>
 
 typedef union SDL_Event SDL_Event;
 struct _SDL_GameController;
 typedef struct _SDL_GameController SDL_GameController;
+struct _SDL_Joystick;
+typedef struct _SDL_Joystick SDL_Joystick;
 
 enum class KioskInputAction {
     NONE = 0,
@@ -66,9 +69,12 @@ private:
     void HandleAnalogAxis(int32_t instance_id, int axis_index, int16_t value, uint32_t now_ms, bool suppress_actions);
     void OpenControllerByDeviceIndex(int device_index);
     void CloseControllerByInstanceId(int32_t instance_id);
+    void OpenJoystickByDeviceIndex(int device_index);
+    void CloseJoystickByInstanceId(int32_t instance_id);
 
     std::deque<KioskInputAction> m_action_queue;
     std::vector<SDL_GameController*> m_controllers;
+    std::vector<SDL_Joystick*> m_joysticks;
 
     // Per-controller analog stick debounce/repeat state (keyed by SDL_JoystickID)
     struct ControllerAxisState {
@@ -78,7 +84,8 @@ private:
         uint32_t next_repeat_y_ms = 0;
     };
     std::map<int32_t, ControllerAxisState> m_axis_states;
-    uint8_t m_last_hat_state = 0;
+    // Per-(joystick instance ID, hat index) raw hat state
+    std::map<std::pair<int32_t, uint8_t>, uint8_t> m_hat_states;
 
     static constexpr int16_t AXIS_DEADZONE = 16000;
     static constexpr int16_t AXIS_RELEASE_ZONE = 8000;

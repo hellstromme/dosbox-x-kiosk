@@ -31,12 +31,59 @@
 #endif
 #include <windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
 
 namespace {
+
+bool EnsureDirectoryRecursive(const std::string& dir_path) {
+    if (dir_path.empty()) return true;
+#if defined(_WIN32)
+    DWORD attrs = GetFileAttributesA(dir_path.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+    size_t slash = dir_path.find_last_of("\\/");
+    if (slash != std::string::npos && slash > 0) {
+        // Do not recurse into bare drive root like "C:"
+        if (!(slash == 2 && dir_path[1] == ':')) {
+            if (!EnsureDirectoryRecursive(dir_path.substr(0, slash))) {
+                return false;
+            }
+        }
+    }
+    if (CreateDirectoryA(dir_path.c_str(), NULL) != 0) {
+        return true;
+    }
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+#else
+    struct stat st;
+    if (::stat(dir_path.c_str(), &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+    size_t slash = dir_path.find_last_of('/');
+    if (slash != std::string::npos && slash > 0) {
+        if (!EnsureDirectoryRecursive(dir_path.substr(0, slash))) {
+            return false;
+        }
+    }
+    if (::mkdir(dir_path.c_str(), 0755) == 0) {
+        return true;
+    }
+    return errno == EEXIST;
+#endif
+}
+
+bool EnsureParentDirectoryExists(const std::string& file_path) {
+    size_t slash = file_path.find_last_of("\\/");
+    if (slash == std::string::npos || slash == 0) {
+        return true;
+    }
+    return EnsureDirectoryRecursive(file_path.substr(0, slash));
+}
 
 std::string SanitizeFilenameSlug(const std::string& input) {
     std::string out;
@@ -107,8 +154,13 @@ bool ViewWizard::SetStep(WizardStep step) {
             if (m_create_blank_hdd_file) {
                 m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
             } else {
-                // Imported existing HDD image: use optional explicit CHS override, or leave empty for auto-detect
-                m_draft.primary_hdd_chs = m_custom_chs_buf;
+                // Imported existing HDD image: validate optional explicit CHS override, or empty for auto-detect
+                std::string normalized_chs;
+                if (!ParseAndNormalizeChs(m_custom_chs_buf, normalized_chs)) {
+                    m_last_error = "Invalid CHS override format. Enter three positive integers 'C,H,S' (e.g., 1015,16,63) or leave blank.";
+                    return false;
+                }
+                m_draft.primary_hdd_chs = normalized_chs;
             }
         }
     }
@@ -204,11 +256,41 @@ void ViewWizard::SetCreateBlankHddOnDisk(bool enable) {
     }
 }
 
-void ViewWizard::SetCustomHddChsOverride(const std::string& chs) {
-    std::snprintf(m_custom_chs_buf, sizeof(m_custom_chs_buf), "%s", chs.c_str());
-    if (!m_create_blank_hdd_file) {
-        m_draft.primary_hdd_chs = m_custom_chs_buf;
+bool ViewWizard::ParseAndNormalizeChs(const std::string& input, std::string& out_normalized) {
+    size_t first = input.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        out_normalized.clear();
+        return true; // Blank = IMGMOUNT auto-detect
     }
+    size_t last = input.find_last_not_of(" \t\r\n");
+    const std::string trimmed = input.substr(first, last - first + 1);
+
+    int c = 0, h = 0, s = 0;
+    char extra = '\0';
+    if (std::sscanf(trimmed.c_str(), "%d , %d , %d %c", &c, &h, &s, &extra) != 3) {
+        return false;
+    }
+    if (c < 1 || c > 65535 || h < 1 || h > 255 || s < 1 || s > 63) {
+        return false;
+    }
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%d,%d,%d", c, h, s);
+    out_normalized = buf;
+    return true;
+}
+
+bool ViewWizard::SetCustomHddChsOverride(const std::string& chs) {
+    std::snprintf(m_custom_chs_buf, sizeof(m_custom_chs_buf), "%s", chs.c_str());
+    std::string normalized;
+    if (!ParseAndNormalizeChs(chs, normalized)) {
+        m_last_error = "Invalid CHS override format. Enter three positive integers 'C,H,S' (e.g., 1015,16,63) or leave blank.";
+        return false;
+    }
+    m_last_error.clear();
+    if (!m_create_blank_hdd_file) {
+        m_draft.primary_hdd_chs = normalized;
+    }
+    return true;
 }
 
 void ViewWizard::SetPrimaryHddPath(const std::string& path) {
@@ -234,17 +316,21 @@ std::string ViewWizard::ComputeHddChsGeometry(int size_mb) {
     return std::string(buf);
 }
 
-bool ViewWizard::CreateBlankHddImage(const std::string& file_path, int size_mb, std::string& out_chs) {
-    if (file_path.empty()) return false;
+HddCreateStatus ViewWizard::CreateBlankHddImageEx(const std::string& file_path, int size_mb, std::string& out_chs) {
+    if (file_path.empty()) return HddCreateStatus::IO_ERROR;
     out_chs = ComputeHddChsGeometry(size_mb);
 
     int c = 0, h = 16, s = 63;
     if (std::sscanf(out_chs.c_str(), "%d,%d,%d", &c, &h, &s) != 3 || c <= 0) {
-        return false;
+        return HddCreateStatus::IO_ERROR;
     }
     const int64_t exact_bytes = static_cast<int64_t>(c) * static_cast<int64_t>(h) * static_cast<int64_t>(s) * 512LL;
     if (exact_bytes <= 0) {
-        return false;
+        return HddCreateStatus::IO_ERROR;
+    }
+
+    if (!EnsureParentDirectoryExists(file_path)) {
+        return HddCreateStatus::IO_ERROR;
     }
 
 #if defined(_WIN32)
@@ -259,7 +345,10 @@ bool ViewWizard::CreateBlankHddImage(const std::string& file_path, int size_mb, 
         NULL
     );
     if (hFile == INVALID_HANDLE_VALUE) {
-        return false;
+        const DWORD err = ::GetLastError();
+        return (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS)
+                   ? HddCreateStatus::ALREADY_EXISTS
+                   : HddCreateStatus::IO_ERROR;
     }
     LARGE_INTEGER li;
     li.QuadPart = exact_bytes;
@@ -267,21 +356,27 @@ bool ViewWizard::CreateBlankHddImage(const std::string& file_path, int size_mb, 
     CloseHandle(hFile);
     if (!ok) {
         std::remove(file_path.c_str());
+        return HddCreateStatus::IO_ERROR;
     }
-    return ok;
+    return HddCreateStatus::OK;
 #else
     // Atomic exclusive creation (O_CREAT | O_EXCL) guarantees we never truncate an existing disk image
     int fd = ::open(file_path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
     if (fd < 0) {
-        return false;
+        return (errno == EEXIST) ? HddCreateStatus::ALREADY_EXISTS : HddCreateStatus::IO_ERROR;
     }
     bool ok = (::ftruncate(fd, static_cast<off_t>(exact_bytes)) == 0);
     ::close(fd);
     if (!ok) {
         std::remove(file_path.c_str());
+        return HddCreateStatus::IO_ERROR;
     }
-    return ok;
+    return HddCreateStatus::OK;
 #endif
+}
+
+bool ViewWizard::CreateBlankHddImage(const std::string& file_path, int size_mb, std::string& out_chs) {
+    return CreateBlankHddImageEx(file_path, size_mb, out_chs) == HddCreateStatus::OK;
 }
 
 std::string ViewWizard::GenerateDefaultHddPath(const std::string& machine_name, const std::string& machine_id) const {
@@ -293,16 +388,33 @@ std::string ViewWizard::GenerateDefaultHddPath(const std::string& machine_name, 
     }
     const std::string filename = slug + "_" + SanitizeFilenameSlug(suffix) + "_hdd_c.img";
 #if defined(_WIN32)
-    const char* temp_dir = std::getenv("LOCALAPPDATA");
-    if (!temp_dir || !*temp_dir) temp_dir = std::getenv("TEMP");
-    if (temp_dir && *temp_dir) {
-        std::string base(temp_dir);
+    const char* data_dir = std::getenv("LOCALAPPDATA");
+    if (!data_dir || !*data_dir) data_dir = std::getenv("TEMP");
+    if (data_dir && *data_dir) {
+        std::string base(data_dir);
         if (base.back() != '\\' && base.back() != '/') base += '\\';
-        return base + filename;
+        return base + "DOSBox-Kiosk\\machines\\" + filename;
     }
     return filename;
 #else
-    return "/var/lib/dosbox-kiosk/machines/" + filename;
+    // Prefer appliance directory if writable; otherwise fall back to XDG/HOME user data dir or /tmp
+    if (::access("/var/lib/dosbox-kiosk/machines", W_OK) == 0 ||
+        ::access("/var/lib/dosbox-kiosk", W_OK) == 0) {
+        return "/var/lib/dosbox-kiosk/machines/" + filename;
+    }
+    const char* xdg = std::getenv("XDG_DATA_HOME");
+    if (xdg && *xdg) {
+        std::string base(xdg);
+        if (base.back() != '/') base += '/';
+        return base + "dosbox-kiosk/machines/" + filename;
+    }
+    const char* home = std::getenv("HOME");
+    if (home && *home) {
+        std::string base(home);
+        if (base.back() != '/') base += '/';
+        return base + ".local/share/dosbox-kiosk/machines/" + filename;
+    }
+    return "/tmp/dosbox-kiosk-machines/" + filename;
 #endif
 }
 
@@ -388,26 +500,31 @@ bool ViewWizard::CommitMachine(std::string& out_machine_id, std::string& out_err
         if (m_create_blank_hdd_file) {
             const bool auto_generated_path = m_draft.primary_hdd_path.empty();
             std::string created_chs;
-            bool hdd_created = false;
+            HddCreateStatus st = HddCreateStatus::IO_ERROR;
 
             if (auto_generated_path) {
-                // Retry exclusive creation with fresh collision-resistant UUIDs if auto path collides
+                // Retry exclusive creation with fresh UUIDs only on actual file collision (ALREADY_EXISTS)
                 for (int attempt = 0; attempt < 5; ++attempt) {
                     if (attempt > 0) {
                         m_draft.id = GenerateMachineUuid(m_draft.display_name);
                     }
                     m_draft.primary_hdd_path = GenerateDefaultHddPath(m_draft.display_name, m_draft.id);
-                    if (CreateBlankHddImage(m_draft.primary_hdd_path, m_hdd_size_mb, created_chs)) {
-                        hdd_created = true;
+                    st = CreateBlankHddImageEx(m_draft.primary_hdd_path, m_hdd_size_mb, created_chs);
+                    if (st != HddCreateStatus::ALREADY_EXISTS) {
                         break;
                     }
                 }
             } else {
-                hdd_created = CreateBlankHddImage(m_draft.primary_hdd_path, m_hdd_size_mb, created_chs);
+                st = CreateBlankHddImageEx(m_draft.primary_hdd_path, m_hdd_size_mb, created_chs);
             }
 
-            if (!hdd_created) {
-                out_error = "Failed to create blank HDD image (file may already exist or path is invalid): " + m_draft.primary_hdd_path;
+            if (st == HddCreateStatus::ALREADY_EXISTS) {
+                out_error = "HDD image file already exists (refusing to overwrite): " + m_draft.primary_hdd_path;
+                m_last_error = out_error;
+                return false;
+            }
+            if (st != HddCreateStatus::OK) {
+                out_error = "Unable to create HDD image directory or file (check path permissions): " + m_draft.primary_hdd_path;
                 m_last_error = out_error;
                 return false;
             }
@@ -415,7 +532,7 @@ bool ViewWizard::CommitMachine(std::string& out_machine_id, std::string& out_err
             m_draft.os_installed = false;
             created_new_hdd_file = true;
         } else {
-            // Importing an existing HDD image: require existing file & preserve native geometry (or optional override)
+            // Importing an existing HDD image: require existing file & validated optional CHS override
             if (m_draft.primary_hdd_path.empty()) {
                 out_error = "Please specify an existing HDD image path or choose 'Create New Blank HDD Image'.";
                 m_last_error = out_error;
@@ -427,7 +544,13 @@ bool ViewWizard::CommitMachine(std::string& out_machine_id, std::string& out_err
                 m_last_error = out_error;
                 return false;
             }
-            m_draft.primary_hdd_chs = m_custom_chs_buf;
+            std::string normalized_chs;
+            if (!ParseAndNormalizeChs(m_custom_chs_buf, normalized_chs)) {
+                out_error = "Invalid CHS override format. Enter three positive integers 'C,H,S' (e.g., 1015,16,63) or leave blank.";
+                m_last_error = out_error;
+                return false;
+            }
+            m_draft.primary_hdd_chs = normalized_chs;
             m_draft.os_installed = true;
         }
     }
@@ -664,7 +787,7 @@ void ViewWizard::RenderStep3OsStorage() {
             ImGui::PopStyleColor();
             ImGui::SetNextItemWidth(220.0f);
             if (ImGui::InputTextWithHint("Optional CHS Override", "e.g. 1015,16,63 (blank = auto)", m_custom_chs_buf, sizeof(m_custom_chs_buf))) {
-                m_draft.primary_hdd_chs = m_custom_chs_buf;
+                SetCustomHddChsOverride(m_custom_chs_buf);
             }
         }
     }
