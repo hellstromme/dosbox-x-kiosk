@@ -8,6 +8,7 @@
 #include "machine/config_synthesizer.h"
 #include "machine/boot_injector.h"
 #include "ui/kiosk_ui.h"
+#include "ui/input_router.h"
 #include "ui/runtime_overlay.h"
 #include "ui/view_disk_caddy.h"
 #include "control.h"
@@ -47,6 +48,7 @@ KioskManager::KioskManager()
     // static lifetimes outlive KioskManager::~KioskManager() at process exit.
     (void)KioskDatabase::GetInstance();
     (void)KioskUI::GetInstance();
+    (void)KioskInputRouter::GetInstance();
     (void)DiskCaddyView::GetInstance();
     (void)RuntimeOverlay::GetInstance();
     (void)BootInjector::GetInstance();
@@ -151,6 +153,7 @@ void KioskManager::RunMainLoop() {
             SynthesizeAndPrepareLaunch(conf);
         }
     } else {
+        KioskInputRouter::GetInstance().InitializeControllers();
         uint32_t last_ticks = SDL_GetTicks();
         while (!m_exit_requested.load()) {
             KioskState cur = m_state.load();
@@ -177,6 +180,7 @@ void KioskManager::RunMainLoop() {
 
             Kiosk_PumpPreBootFrame();
         }
+        KioskInputRouter::GetInstance().ShutdownControllers();
     }
 }
 
@@ -202,6 +206,19 @@ void KioskManager::Shutdown() {
 KioskConfigRecord KioskManager::GetConfig() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_config;
+}
+
+bool KioskManager::ReloadConfig() {
+    KioskConfigRecord loaded_cfg;
+    if (!KioskDatabase::GetInstance().IsOpen() || !KioskDatabase::GetInstance().GetConfig(loaded_cfg)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_config = loaded_cfg;
+        UpdateParsedOverlayHotkeyLocked();
+    }
+    return true;
 }
 
 float KioskManager::GetWatchdogRemainingSec() const {
@@ -272,6 +289,11 @@ bool KioskManager::HandlePreBootInputEvent(const SDL_Event& event) {
     if (event.type == SDL_QUIT) {
         RequestApplianceExit();
         return true;
+    }
+
+    if (event.type == SDL_CONTROLLERDEVICEADDED || event.type == SDL_CONTROLLERDEVICEREMOVED) {
+        KioskInputRouter::GetInstance().ProcessSDLEvent(event, false);
+        return false;
     }
 
     KioskState cur = m_state.load();

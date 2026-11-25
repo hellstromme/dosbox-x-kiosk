@@ -9,6 +9,10 @@
 #include "machine/kioskext_bin.h"
 #include "machine/boot_injector.h"
 #include "ui/kiosk_ui.h"
+#include "ui/input_router.h"
+#include "ui/view_watchdog.h"
+#include "ui/view_carousel.h"
+#include "ui/view_wizard.h"
 #include "ui/view_disk_caddy.h"
 #include "ui/runtime_overlay.h"
 #include "kiosk_main.h"
@@ -1981,6 +1985,295 @@ TEST(KioskRuntimeSwapTest, AtapiReadOnlyLookupDoesNotMutateAssignedDriveIndex) {
 
     // Drive D: must remain intact and queryable
     EXPECT_TRUE(Kiosk_IDE_GetATAPISense(3, sk, asc, ascq, loading_mode));
+}
+
+// ============================================================================
+// Phase 5: Pre-Boot Shell & Big-Picture UI Unit Tests
+// ============================================================================
+
+TEST(KioskInputRouterTest, MapsKeyboardGamepadAndJoystickActions) {
+    KioskInputRouter& router = KioskInputRouter::GetInstance();
+    router.ClearPendingActions();
+
+    // 1. Keyboard arrows + action keys
+    SDL_Event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.type = SDL_KEYDOWN;
+    ev.key.repeat = 0;
+
+    ev.key.keysym.sym = SDLK_RIGHT;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 1000));
+    ev.key.keysym.sym = SDLK_RETURN;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 1010));
+    ev.key.keysym.sym = SDLK_c;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 1020));
+    ev.key.keysym.sym = SDLK_v;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 1030));
+    ev.key.keysym.sym = SDLK_f;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 1040));
+
+    KioskInputAction act = KioskInputAction::NONE;
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::NAV_RIGHT);
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::ACTION_CONFIRM);
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::ACTION_CADDY_QUEUE);
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::ACTION_VIEW_TOGGLE);
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::ACTION_FAVORITE);
+    EXPECT_FALSE(router.PollAction(act));
+
+    // 2. Gamepad D-Pad, buttons, and analog stick deadzone/repeat
+    std::memset(&ev, 0, sizeof(ev));
+    ev.type = SDL_CONTROLLERBUTTONDOWN;
+    ev.cbutton.button = SDL_CONTROLLER_BUTTON_DPAD_LEFT;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 2000));
+    ev.cbutton.button = SDL_CONTROLLER_BUTTON_RIGHTSHOULDER;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 2010));
+
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::NAV_LEFT);
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::NAV_TAB_NEXT);
+
+    // Analog stick inside deadzone -> ignored
+    std::memset(&ev, 0, sizeof(ev));
+    ev.type = SDL_CONTROLLERAXISMOTION;
+    ev.caxis.axis = SDL_CONTROLLER_AXIS_LEFTX;
+    ev.caxis.value = 5000;
+    router.ProcessSDLEvent(ev, false, 3000);
+    EXPECT_EQ(router.GetPendingActionCount(), 0u);
+
+    // Analog stick past deadzone -> emits NAV_RIGHT immediately, then repeats after delay
+    ev.caxis.value = 24000;
+    router.ProcessSDLEvent(ev, false, 3000);
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::NAV_RIGHT);
+
+    router.UpdateRepeat(3400);
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::NAV_RIGHT);
+
+    // Release stick
+    ev.caxis.value = 0;
+    router.ProcessSDLEvent(ev, false, 3500);
+    router.ClearPendingActions();
+
+    // 3. Joystick hat
+    std::memset(&ev, 0, sizeof(ev));
+    ev.type = SDL_JOYHATMOTION;
+    ev.jhat.value = SDL_HAT_UP;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 4000));
+    ASSERT_TRUE(router.PollAction(act)); EXPECT_EQ(act, KioskInputAction::NAV_UP);
+    ev.jhat.value = SDL_HAT_CENTERED;
+    router.ProcessSDLEvent(ev, false, 4010);
+}
+
+TEST(KioskInputRouterTest, SuppressesLetterHotkeysDuringTextInput) {
+    KioskInputRouter& router = KioskInputRouter::GetInstance();
+    router.ClearPendingActions();
+
+    SDL_Event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.type = SDL_KEYDOWN;
+    ev.key.repeat = 0;
+
+    // Letter hotkeys must NOT fire when an ImGui text input is focused
+    ev.key.keysym.sym = SDLK_a;
+    EXPECT_FALSE(router.ProcessSDLEvent(ev, true, 1000));
+    ev.key.keysym.sym = SDLK_c;
+    EXPECT_FALSE(router.ProcessSDLEvent(ev, true, 1010));
+    ev.key.keysym.sym = SDLK_SPACE;
+    EXPECT_FALSE(router.ProcessSDLEvent(ev, true, 1020));
+    EXPECT_EQ(router.GetPendingActionCount(), 0u);
+
+    // Escape and gamepad B still map to ACTION_BACK
+    ev.key.keysym.sym = SDLK_ESCAPE;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, true, 1030));
+    KioskInputAction act = KioskInputAction::NONE;
+    ASSERT_TRUE(router.PollAction(act));
+    EXPECT_EQ(act, KioskInputAction::ACTION_BACK);
+}
+
+TEST(KioskCarouselTest, FiltersSortsAndNavigatesItems) {
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(":memory:"));
+    KioskManager::GetInstance().Initialize("", "");
+    KioskManager::GetInstance().SetState(KioskState::STATE_SHELL_INTERACTIVE);
+
+    MachineRecord mach;
+    mach.id = "mach-carousel-1";
+    mach.display_name = "Test 486 Rig";
+    mach.archetype_id = KioskArchetypes::DX2_486;
+    mach.archetype_tier = 4;
+    mach.boot_mode = "INTEGRATED_DOS";
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMachine(mach));
+
+    CatalogItemRecord g1;
+    g1.id = "game-doom";
+    g1.machine_id = mach.id;
+    g1.item_type = "GAME";
+    g1.title = "Doom II";
+    g1.developer = "id Software";
+    g1.guest_working_dir = "C:\\DOOM2";
+    g1.guest_executable = "DOOM2.EXE";
+    g1.is_favorite = false;
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertCatalogItem(g1));
+
+    CatalogItemRecord g2;
+    g2.id = "game-keen";
+    g2.machine_id = mach.id;
+    g2.item_type = "GAME";
+    g2.title = "Commander Keen 4";
+    g2.developer = "id Software";
+    g2.guest_working_dir = "C:\\KEEN4";
+    g2.guest_executable = "KEEN4E.EXE";
+    g2.is_favorite = true;
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertCatalogItem(g2));
+
+    CatalogItemRecord app1;
+    app1.id = "app-wp";
+    app1.machine_id = mach.id;
+    app1.item_type = "APPLICATION";
+    app1.title = "WordPerfect 5.1";
+    app1.developer = "WordPerfect Corp";
+    app1.guest_working_dir = "C:\\WP51";
+    app1.guest_executable = "WP.EXE";
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertCatalogItem(app1));
+
+    KioskUI::GetInstance().InvalidateCatalogCache();
+    KioskUI::GetInstance().EnsureCatalogCacheLoaded();
+
+    // Verify filtering and favorites-first sorting
+    std::vector<CatalogItemRecord> games = ViewCarousel::FilterAndSortCatalogItems(
+        KioskUI::GetInstance().GetCachedItems(), "GAME", "");
+    ASSERT_EQ(games.size(), 2u);
+    EXPECT_EQ(games[0].id, "game-keen"); // Favorite comes first
+    EXPECT_EQ(games[1].id, "game-doom");
+
+    std::vector<CatalogItemRecord> search_res = ViewCarousel::FilterAndSortCatalogItems(
+        KioskUI::GetInstance().GetCachedItems(), "GAME", "doom");
+    ASSERT_EQ(search_res.size(), 1u);
+    EXPECT_EQ(search_res[0].id, "game-doom");
+
+    // Navigate with NAV_RIGHT and confirm launch
+    ViewCarousel& carousel = ViewCarousel::GetInstance();
+    carousel.SetSearchFilter("");
+    EXPECT_EQ(carousel.GetSelectedGameIndex(), 0);
+    EXPECT_TRUE(carousel.HandleAction(KioskHubTab::GAMES, KioskInputAction::NAV_RIGHT));
+    EXPECT_EQ(carousel.GetSelectedGameIndex(), 1);
+    EXPECT_TRUE(carousel.HandleAction(KioskHubTab::GAMES, KioskInputAction::ACTION_CONFIRM));
+    EXPECT_EQ(KioskManager::GetInstance().GetState(), KioskState::STATE_SYNTHESIZE_LAUNCH);
+    EXPECT_EQ(KioskManager::GetInstance().GetCurrentLaunchContext().catalog_item_id, "game-doom");
+
+    KioskManager::GetInstance().Shutdown();
+    KioskDatabase::GetInstance().Close();
+}
+
+TEST(KioskWizardTest, EnforcesArchetypeOsTierCompatibilityAndCreatesMachine) {
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(":memory:"));
+
+    // Add a floppy media record so we can verify installer caddy binding
+    MediaPoolRecord floppy;
+    floppy.id = "med-dos622-d1";
+    floppy.file_path = "dos622_disk1.img";
+    floppy.media_type = "FLOPPY_35_1440K";
+    floppy.label_title = "MS-DOS 6.22 Disk 1";
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMedia(floppy));
+
+    ViewWizard& wiz = ViewWizard::GetInstance();
+    wiz.Reset();
+
+    // 1. Select Tier 2 (286) and verify Windows 98 SE (Tier 5) is rejected
+    ASSERT_TRUE(wiz.SelectArchetype(KioskArchetypes::AT_286));
+    std::string err;
+    EXPECT_FALSE(wiz.SelectOSDistribution("WIN98_SE", err));
+    EXPECT_FALSE(err.empty());
+
+    // 2. Upgrade to Tier 5 (Pentium 3dfx) and verify Windows 98 SE is accepted
+    ASSERT_TRUE(wiz.SelectArchetype(KioskArchetypes::PENTIUM_3DFX));
+    EXPECT_TRUE(wiz.SelectOSDistribution("WIN98_SE", err));
+    EXPECT_TRUE(err.empty());
+
+    // 3. Configure identity, REAL_HDD_BOOT, CHS geometry, and installer media
+    wiz.SetDisplayName("My Win98 Voodoo Rig");
+    wiz.SetBootMode("REAL_HDD_BOOT");
+    wiz.SetHddSizeMb(512);
+    wiz.SetPrimaryHddPath("win98_test_hdd.img");
+    wiz.SetCreateBlankHddOnDisk(false);
+    wiz.SetInstallerFloppyMediaId(floppy.id);
+
+    const std::string chs = ViewWizard::ComputeHddChsGeometry(512);
+    EXPECT_FALSE(chs.empty());
+    EXPECT_NE(chs.find(",16,63"), std::string::npos);
+
+    ASSERT_TRUE(wiz.SetStep(WizardStep::STEP_REVIEW_CREATE));
+    std::string created_id;
+    ASSERT_TRUE(wiz.CommitMachine(created_id, err)) << err;
+    EXPECT_FALSE(created_id.empty());
+
+    // Verify persistence in SQLite
+    MachineRecord persisted;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMachine(created_id, persisted));
+    EXPECT_EQ(persisted.display_name, "My Win98 Voodoo Rig");
+    EXPECT_EQ(persisted.archetype_id, KioskArchetypes::PENTIUM_3DFX);
+    EXPECT_EQ(persisted.os_id, "WIN98_SE");
+    EXPECT_EQ(persisted.boot_mode, "REAL_HDD_BOOT");
+    EXPECT_EQ(persisted.primary_hdd_chs, chs);
+
+    auto bindings = KioskDatabase::GetInstance().GetCaddyBindingsForMachine(created_id);
+    ASSERT_EQ(bindings.size(), 1u);
+    EXPECT_EQ(bindings[0].media_id, floppy.id);
+    EXPECT_EQ(bindings[0].target_drive, "A");
+
+    KioskDatabase::GetInstance().Close();
+}
+
+TEST(KioskWatchdogTest, ResolvesPreviewAndRendersAllShellStatesHeadless) {
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(":memory:"));
+    KioskManager::GetInstance().Initialize("", "");
+
+    MachineRecord mach;
+    mach.id = "mach-watchdog-1";
+    mach.display_name = "My 1992 386 Rig";
+    mach.archetype_id = KioskArchetypes::DX_386;
+    mach.archetype_tier = 3;
+    mach.boot_mode = "REAL_HDD_BOOT";
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMachine(mach));
+
+    KioskConfigRecord cfg = KioskManager::GetInstance().GetConfig();
+    cfg.default_boot_action = "SPECIFIC_MACHINE";
+    cfg.default_target_uuid = mach.id;
+    cfg.boot_timeout_sec = 25;
+    cfg.theme_name = "crt_green";
+    ASSERT_TRUE(KioskDatabase::GetInstance().UpdateConfig(cfg));
+    ASSERT_TRUE(KioskManager::GetInstance().ReloadConfig());
+
+    KioskUI& ui = KioskUI::GetInstance();
+    ASSERT_TRUE(ui.InitializeContext());
+    ui.InvalidateCatalogCache();
+    ui.EnsureCatalogCacheLoaded();
+    EXPECT_EQ(ui.GetThemePalette().name, "crt_green");
+
+    ViewWatchdog& wd = ViewWatchdog::GetInstance();
+    wd.RefreshPreview();
+    EXPECT_EQ(wd.GetCachedPreview().title, "My 1992 386 Rig");
+    EXPECT_EQ(wd.GetCachedPreview().boot_mode_badge, "REAL HDD BOOT");
+    EXPECT_EQ(wd.GetCachedPreview().total_timeout_sec, 25);
+
+    // Exercise full headless ImGui rendering across Watchdog, all 6 Hub tabs, and Runtime Overlay
+    ui.NewFrame();
+    ui.RenderCountdownBanner(12.5f);
+    ui.RenderFrame();
+
+    const KioskHubTab tabs[6] = {
+        KioskHubTab::GAMES, KioskHubTab::APPLICATIONS, KioskHubTab::MACHINES,
+        KioskHubTab::MEDIA_POOL, KioskHubTab::NEW_MACHINE, KioskHubTab::SETTINGS
+    };
+    for (int i = 0; i < 6; ++i) {
+        ui.SetActiveTab(tabs[i]);
+        ui.NewFrame();
+        ui.RenderInteractiveShell();
+        ui.RenderFrame();
+    }
+
+    ui.ShowToast("Phase 5 Verification Toast", 2.0f);
+    EXPECT_EQ(ui.GetActiveToastMessage(), "Phase 5 Verification Toast");
+
+    KioskManager::GetInstance().Shutdown();
+    KioskDatabase::GetInstance().Close();
 }
 
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

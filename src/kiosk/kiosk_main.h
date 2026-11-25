@@ -29,6 +29,7 @@ public:
 
     // Configuration & Watchdog
     KioskConfigRecord GetConfig() const;
+    bool ReloadConfig();
     float GetWatchdogRemainingSec() const;
     void SetWatchdogRemainingSec(float sec);
     void UpdateWatchdog(float delta_sec);

@@ -1833,6 +1833,18 @@
     <ClCompile Include="..\src\kiosk\ui\runtime_overlay.cpp">
       <Filter>Sources\kiosk\ui</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\kiosk\ui\input_router.cpp">
+      <Filter>Sources\kiosk\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\kiosk\ui\view_watchdog.cpp">
+      <Filter>Sources\kiosk\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\kiosk\ui\view_carousel.cpp">
+      <Filter>Sources\kiosk\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\kiosk\ui\view_wizard.cpp">
+      <Filter>Sources\kiosk\ui</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\kiosk\ui\kiosk_ui.cpp">
       <Filter>Sources\kiosk\ui</Filter>
     </ClCompile>
@@ -2904,6 +2916,18 @@
       <Filter>Sources\kiosk\ui</Filter>
     </ClInclude>
     <ClInclude Include="..\src\kiosk\ui\runtime_overlay.h">
+      <Filter>Sources\kiosk\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\kiosk\ui\input_router.h">
+      <Filter>Sources\kiosk\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\kiosk\ui\view_watchdog.h">
+      <Filter>Sources\kiosk\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\kiosk\ui\view_carousel.h">
+      <Filter>Sources\kiosk\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\kiosk\ui\view_wizard.h">
       <Filter>Sources\kiosk\ui</Filter>
     </ClInclude>
     <ClInclude Include="..\src\kiosk\ui\kiosk_ui.h">
