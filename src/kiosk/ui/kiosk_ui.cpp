@@ -314,8 +314,31 @@ void KioskUI::RenderCrtBackdrop() {
     );
 }
 
+void KioskUI::UpdateImGuiNavFlagsForState(KioskState state) {
+    if (!m_context_initialized) return;
+    ImGuiIO& io = ImGui::GetIO();
+
+    bool allow_imgui_nav = true;
+    if (state == KioskState::STATE_SHELL_INTERACTIVE) {
+        const bool is_carousel_tab =
+            (m_active_tab == KioskHubTab::GAMES ||
+             m_active_tab == KioskHubTab::APPLICATIONS ||
+             m_active_tab == KioskHubTab::MACHINES);
+        allow_imgui_nav =
+            !is_carousel_tab || io.WantTextInput ||
+            ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
+    }
+
+    if (allow_imgui_nav) {
+        io.ConfigFlags |= (ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad);
+    } else {
+        io.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad);
+    }
+}
+
 void KioskUI::RenderCountdownBanner(float remaining_sec) {
     if (!m_context_initialized) return;
+    UpdateImGuiNavFlagsForState(KioskState::STATE_COUNTDOWN_IDLE);
     EnsureCatalogCacheLoaded();
     RenderCrtBackdrop();
     ViewWatchdog::GetInstance().Render(remaining_sec);
@@ -323,9 +346,10 @@ void KioskUI::RenderCountdownBanner(float remaining_sec) {
 
 void KioskUI::ProcessPendingInputActions() {
     KioskInputRouter& router = KioskInputRouter::GetInstance();
+    const bool popup_open = m_context_initialized && ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
     const bool suppress_repeat =
         m_context_initialized &&
-        (ImGui::IsAnyItemActive() || ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId));
+        (ImGui::IsAnyItemActive() || popup_open);
     router.UpdateRepeat(SDL_GetTicks(), suppress_repeat);
 
     KioskInputAction action = KioskInputAction::NONE;
@@ -333,6 +357,16 @@ void KioskUI::ProcessPendingInputActions() {
         // Reload cache before each queued action so consecutive mutations (e.g., double favorite)
         // observe the latest persisted state instead of stale cached records.
         EnsureCatalogCacheLoaded();
+
+        // While a modal popup is open, only route ACTION_BACK to dismiss the modal without
+        // switching hub tabs or dispatching actions to the underlying carousel.
+        if (popup_open) {
+            if (action == KioskInputAction::ACTION_BACK) {
+                ViewCarousel::GetInstance().HandleAction(m_active_tab, action);
+            }
+            continue;
+        }
+
         if (action == KioskInputAction::NAV_TAB_PREV) {
             int idx = static_cast<int>(m_active_tab);
             idx = (idx - 1 + 6) % 6;
@@ -538,25 +572,7 @@ void KioskUI::RenderToastOverlay(float delta_sec) {
 void KioskUI::RenderInteractiveShell() {
     if (!m_context_initialized) return;
 
-    // Enforce single directional/confirm input owner: disable ImGui keyboard/gamepad nav on
-    // carousel tabs when no popup/text input is active so Right/D-Pad cannot move both the
-    // carousel and ImGui button focus simultaneously.
-    {
-        ImGuiIO& io = ImGui::GetIO();
-        const bool is_carousel_tab =
-            (m_active_tab == KioskHubTab::GAMES ||
-             m_active_tab == KioskHubTab::APPLICATIONS ||
-             m_active_tab == KioskHubTab::MACHINES);
-        const bool allow_imgui_nav =
-            !is_carousel_tab || io.WantTextInput ||
-            ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
-        if (allow_imgui_nav) {
-            io.ConfigFlags |= (ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad);
-        } else {
-            io.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad);
-        }
-    }
-
+    UpdateImGuiNavFlagsForState(KioskState::STATE_SHELL_INTERACTIVE);
     EnsureCatalogCacheLoaded();
     ProcessPendingInputActions();
     RenderCrtBackdrop();
@@ -665,6 +681,7 @@ void KioskUI::RenderInteractiveShellPlaceholder() {
 
 void KioskUI::RenderRuntimeOverlayPlaceholder() {
     if (!m_context_initialized) return;
+    UpdateImGuiNavFlagsForState(KioskState::STATE_RUNTIME_OVERLAY);
     RuntimeOverlay::GetInstance().Render();
 }
 
@@ -678,6 +695,7 @@ void KioskUI::CompositeActiveState() {
         return;
     }
 
+    UpdateImGuiNavFlagsForState(state);
     NewFrame();
     if (state == KioskState::STATE_COUNTDOWN_IDLE) {
         RenderCountdownBanner(KioskManager::GetInstance().GetWatchdogRemainingSec());

@@ -45,6 +45,7 @@ public:
     void RenderInteractiveShellPlaceholder(); // Backwards-compatible alias -> RenderInteractiveShell()
     void RenderRuntimeOverlayPlaceholder();
     void CompositeActiveState();
+    void UpdateImGuiNavFlagsForState(KioskState state);
 
     // Theme & Visual Styling
     void ApplyTheme(const std::string& theme_name);

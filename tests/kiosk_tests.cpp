@@ -2431,6 +2431,15 @@ TEST(KioskInputRouterTest, ClearsHeldStickOnDisconnectAndSuppressesConfirmWhenFo
     ASSERT_TRUE(router.PollAction(act));
     EXPECT_EQ(act, KioskInputAction::ACTION_CONFIRM);
 
+    // Raw unmanaged joystick button 1 (ACTION_BACK) must pass through suppress_actions so
+    // users can dismiss modals, while button 0/2 remain suppressed while a modal is open.
+    ev.jbutton.button = 2;
+    EXPECT_FALSE(router.ProcessSDLEvent(ev, false, 3210, true /* suppress_actions */, false));
+    ev.jbutton.button = 1;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 3220, true /* suppress_actions */, false));
+    ASSERT_TRUE(router.PollAction(act));
+    EXPECT_EQ(act, KioskInputAction::ACTION_BACK);
+
     // Multi-joystick independent hat tracking: joystick 7 and joystick 8 both pressing RIGHT
     // must each produce NAV_RIGHT independently.
     std::memset(&ev, 0, sizeof(ev));
@@ -2590,6 +2599,16 @@ TEST(KioskWatchdogTest, ResolvesPreviewAndRendersAllShellStatesHeadless) {
         ui.RenderInteractiveShell();
         ui.RenderFrame();
     }
+
+    // Verify ImGui keyboard+gamepad nav flags are cleared on carousel tabs and restored
+    // when entering STATE_RUNTIME_OVERLAY or STATE_COUNTDOWN_IDLE (#25)
+    ui.SetActiveTab(KioskHubTab::GAMES);
+    ui.UpdateImGuiNavFlagsForState(KioskState::STATE_SHELL_INTERACTIVE);
+    EXPECT_EQ(ImGui::GetIO().ConfigFlags & (ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad), 0);
+
+    ui.UpdateImGuiNavFlagsForState(KioskState::STATE_RUNTIME_OVERLAY);
+    EXPECT_NE(ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard, 0);
+    EXPECT_NE(ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_NavEnableGamepad, 0);
 
     ui.ShowToast("Phase 5 Verification Toast", 2.0f);
     EXPECT_EQ(ui.GetActiveToastMessage(), "Phase 5 Verification Toast");

@@ -420,11 +420,13 @@ bool KioskInputRouter::ProcessSDLEvent(
         }
 
         case SDL_JOYBUTTONDOWN: {
-            if (suppress_actions) {
-                return false;
-            }
             // Only translate raw joystick buttons when no SDL_GameController is managing this instance
             if (SDL_GameControllerFromInstanceID(event.jbutton.which) != nullptr) {
+                return false;
+            }
+            // Allow button 1 (ACTION_BACK) even when suppress_actions is true so unmanaged joysticks
+            // (which ImGui's SDL_GameController backend does not read) can dismiss open modals.
+            if (suppress_actions && event.jbutton.button != 1) {
                 return false;
             }
             switch (event.jbutton.button) {
