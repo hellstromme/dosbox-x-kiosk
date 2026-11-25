@@ -89,6 +89,7 @@ private:
     KioskConfigRecord m_config;
     std::atomic<int> m_overlay_mod_scancode;
     std::atomic<int> m_overlay_key_sym;
+    mutable std::atomic<bool> m_overlay_chord_latched;
     LaunchContext m_launch_ctx;
     std::string m_base_conf_path;
     std::string m_last_synthesized_conf;

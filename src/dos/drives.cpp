@@ -796,12 +796,15 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 					Drives[drive] = driveInfos[drive].disks[existing_idx];
 				}
 				if (Drives[drive] != NULL) {
+					fatDrive* fdp = dynamic_cast<fatDrive*>(Drives[drive]);
+					if (fdp != NULL && fdp->loadedDisk != NULL && fdp->loadedDisk->kiosk_host_readonly) {
+						effective_wp = true;
+					}
 					Drives[drive]->readonly = effective_wp;
 					Drives[drive]->Activate();
 					Drives[drive]->UpdateDPB(drive);
 					Drives[drive]->EmptyCache();
 					Drives[drive]->MediaChange();
-					fatDrive* fdp = dynamic_cast<fatDrive*>(Drives[drive]);
 					if (fdp != NULL && fdp->loadedDisk != NULL && imageDiskList[drive] != fdp->loadedDisk) {
 						if (imageDiskList[drive] != NULL) imageDiskList[drive]->Release();
 						imageDiskList[drive] = fdp->loadedDisk;
@@ -810,17 +813,17 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 				}
 				mounted_via_fat = true;
 			} else {
+				// Open writable on the host whenever possible so runtime WP toggle can unlock later;
+				// enforce logical write protection via fatDrive::readonly and FDC/imageDisk flags.
 				std::vector<std::string> opts;
-				if (effective_wp) {
-					opts.push_back("readonly");
-				}
 				fatDrive* new_fd = new fatDrive(clean_path.c_str(), 0, 0, 0, 0, opts);
 				if (new_fd != NULL && new_fd->created_successfully && new_fd->loadedDisk != NULL) {
-					if (new_fd->readonly) {
+					const bool host_ro = new_fd->readonly;
+					new_fd->loadedDisk->kiosk_host_readonly = host_ro;
+					if (host_ro) {
 						effective_wp = true;
-					} else {
-						new_fd->readonly = effective_wp;
 					}
+					new_fd->readonly = effective_wp;
 					new_fd->loadedDisk->kiosk_write_protected = effective_wp;
 					const bool was_empty = driveInfos[drive].disks.empty();
 					AppendDisk(drive, new_fd);
@@ -863,11 +866,18 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 				if (imageDiskList[drive] != NULL) imageDiskList[drive]->Release();
 				imageDiskList[drive] = diskSwap[existing_swap];
 				imageDiskList[drive]->Addref();
+				if (imageDiskList[drive]->kiosk_host_readonly) {
+					effective_wp = true;
+				}
 			} else {
-				FILE* fp = fopen(clean_path.c_str(), effective_wp ? "rb" : "rb+");
-				if (!fp && !effective_wp) {
+				// Always try writable host stream first so logical WP can be toggled off later;
+				// fall back to "rb" only when the host file itself is read-only.
+				bool host_ro = false;
+				FILE* fp = fopen(clean_path.c_str(), "rb+");
+				if (!fp) {
 					fp = fopen(clean_path.c_str(), "rb");
 					if (fp) {
+						host_ro = true;
 						effective_wp = true;
 					}
 				}
@@ -884,6 +894,7 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 				}
 				imageDisk* new_disk = new imageDisk(fp, clean_path.c_str(), (uint64_t)fsz, false);
 				new_disk->drvnum = (unsigned int)drive;
+				new_disk->kiosk_host_readonly = host_ro;
 				new_disk->kiosk_write_protected = effective_wp;
 
 				if (imageDiskList[drive] != NULL) imageDiskList[drive]->Release();
@@ -901,6 +912,13 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 						}
 					}
 				}
+			}
+
+			// Keep integrated-DOS drive view consistent: do not leave a stale fatDrive
+			// bound to Drives[drive] when a raw/non-FAT floppy image is mounted.
+			if (!dos_kernel_disabled && Drives[drive] != NULL) {
+				Drives[drive]->EmptyCache();
+				Drives[drive] = NULL;
 			}
 		}
 
@@ -1027,5 +1045,28 @@ bool DriveManager::EjectDriveMedia(int drive, bool is_cdrom) {
 		kiosk_drive_ejected[drive] = true;
 	}
 	return ok;
+}
+
+bool DriveManager::SetKioskFloppyWriteProtect(int drive, bool write_protected) {
+	if (drive < 0 || drive >= 2) return false;
+	if (!write_protected) {
+		if (imageDiskList[drive] != NULL && imageDiskList[drive]->kiosk_host_readonly) {
+			return false;
+		}
+		if (Drives[drive] != NULL) {
+			fatDrive* fdp = dynamic_cast<fatDrive*>(Drives[drive]);
+			if (fdp != NULL && fdp->loadedDisk != NULL && fdp->loadedDisk->kiosk_host_readonly) {
+				return false;
+			}
+		}
+	}
+	FDC_SetWriteProtected(drive, write_protected);
+	if (imageDiskList[drive] != NULL) {
+		imageDiskList[drive]->kiosk_write_protected = write_protected;
+	}
+	if (Drives[drive] != NULL) {
+		Drives[drive]->readonly = write_protected;
+	}
+	return true;
 }
 #endif

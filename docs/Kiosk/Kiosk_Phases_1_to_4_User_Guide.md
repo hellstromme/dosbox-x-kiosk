@@ -18,7 +18,7 @@ This guide explains how to launch, configure, and manually test all Kiosk Editio
 After building the `Debug SDL2 | x64` (or `Release SDL2 | x64`) configuration:
 
 ```powershell
-.\bin\x64\Debug SDL2\dosbox-x.exe -kiosk-mode
+& ".\bin\x64\Debug SDL2\dosbox-x.exe" -kiosk-mode
 ```
 
 ### Kiosk Command-Line Flags
@@ -35,10 +35,10 @@ After building the `Debug SDL2 | x64` (or `Release SDL2 | x64`) configuration:
 
 ```powershell
 # 1. Launch with an ephemeral in-memory catalog and 30-second countdown banner
-.\bin\x64\Debug SDL2\dosbox-x.exe -kiosk-mode -fastlaunch
+& ".\bin\x64\Debug SDL2\dosbox-x.exe" -kiosk-mode -fastlaunch
 
 # 2. Launch directly into the Interactive Launcher with a persistent SQLite catalog
-.\bin\x64\Debug SDL2\dosbox-x.exe -kiosk-mode -kiosk-skip-countdown -kiosk-db "C:\temp\kiosk_test.db" -fastlaunch
+& ".\bin\x64\Debug SDL2\dosbox-x.exe" -kiosk-mode -kiosk-skip-countdown -kiosk-db "C:\temp\kiosk_test.db" -fastlaunch
 ```
 
 ---
@@ -47,19 +47,20 @@ After building the `Debug SDL2 | x64` (or `Release SDL2 | x64`) configuration:
 
 Because the graphical Machine/Media Setup Wizard is built in Phases 5–6, you can seed a persistent `catalog.db` with `sqlite3` (or Python's built-in `sqlite3` module) to test multi-disk games, hardware archetypes, and real HDD boots right away.
 
-1. **Initialize the schema** by launching once with `-kiosk-db` and `-exit`:
+1. **Create the target directory and initialize the schema** by launching once with `-kiosk-db` and `-exit`:
    ```powershell
-   .\bin\x64\Debug SDL2\dosbox-x.exe -kiosk-mode -kiosk-db "C:\temp\kiosk_test.db" -fastlaunch -exit
+   New-Item -ItemType Directory -Force -Path "C:\temp" | Out-Null
+   & ".\bin\x64\Debug SDL2\dosbox-x.exe" -kiosk-mode -kiosk-db "C:\temp\kiosk_test.db" -fastlaunch -exit
    ```
 2. **Seed sample machines, media, and caddy bindings** (replace the file paths with real `.img`, `.ima`, `.iso`, or `.cue` files on your machine):
    ```powershell
-   python -c "
+   $seedScript = @'
    import sqlite3
    con = sqlite3.connect(r'C:\temp\kiosk_test.db')
    cur = con.cursor()
 
    # Optional: shorten boot countdown to 10s and customize overlay hotkey
-   cur.execute(\"UPDATE kiosk_config SET boot_timeout_sec = 10, overlay_hotkey = 'F12+D', default_caddy_view = 'SKEUOMORPHIC' WHERE id = 1\")
+   cur.execute("UPDATE kiosk_config SET boot_timeout_sec = 10, overlay_hotkey = 'F12+D', default_caddy_view = 'SKEUOMORPHIC' WHERE id = 1")
 
    # Add an Integrated DOS 486DX2 machine
    cur.execute('''INSERT OR REPLACE INTO machines
@@ -75,12 +76,12 @@ Because the graphical Machine/Media Setup Wizard is built in Phases 5–6, you c
    cur.execute('''INSERT OR REPLACE INTO media_pool
        (id, file_path, media_type, physical_style, label_title, label_subtitle, is_write_protected)
        VALUES
-       ('med-fd1', 'C:\\temp\\disk1.img', 'FLOPPY_35_1440K', 'BEIGE_35', 'Install Disk 1', '3.5\" 1.44MB HD', 0),
-       ('med-fd2', 'C:\\temp\\disk2.img', 'FLOPPY_35_1440K', 'BLUE_35',  'Install Disk 2', '3.5\" 1.44MB HD', 1),
+       ('med-fd1', 'C:\\temp\\disk1.img', 'FLOPPY_35_1440K', 'BEIGE_35', 'Install Disk 1', '3.5" 1.44MB HD', 0),
+       ('med-fd2', 'C:\\temp\\disk2.img', 'FLOPPY_35_1440K', 'BLUE_35',  'Install Disk 2', '3.5" 1.44MB HD', 1),
        ('med-cd1', 'C:\\temp\\game.iso',  'CDROM_ISO',       'JEWEL_CD', 'Game Data CD',   'CD-ROM ISO9660', 1)''')
 
    # Bind media to the Catalog Item's Session Caddy
-   cur.execute(\"DELETE FROM session_caddy WHERE catalog_item_id = 'item-demo'\")
+   cur.execute("DELETE FROM session_caddy WHERE catalog_item_id = 'item-demo'")
    cur.execute('''INSERT INTO session_caddy (catalog_item_id, media_id, target_drive, slot_order) VALUES
        ('item-demo', 'med-fd1', 'A', 1),
        ('item-demo', 'med-fd2', 'A', 2),
@@ -88,8 +89,9 @@ Because the graphical Machine/Media Setup Wizard is built in Phases 5–6, you c
 
    con.commit()
    con.close()
-   print('Seeded C:\\temp\\kiosk_test.db successfully.')
-   "
+   print(r'Seeded C:\temp\kiosk_test.db successfully.')
+   '@
+   python -c $seedScript
    ```
 
 ---

@@ -141,6 +141,7 @@ class imageDisk {
 		bool diskChangeFlag = false;
 #if defined(C_KIOSK)
 		bool kiosk_write_protected = false;
+		bool kiosk_host_readonly = false;
 #endif
         uint64_t LBA = 0;
 

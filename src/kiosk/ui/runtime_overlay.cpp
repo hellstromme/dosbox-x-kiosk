@@ -418,9 +418,10 @@ bool RuntimeOverlay::ToggleDriveWriteProtect(const std::string& target_drive) {
     }
 
     const bool new_wp = !FDC_IsWriteProtected(drive_idx);
-    FDC_SetWriteProtected(drive_idx, new_wp);
-    if (drive_idx >= 0 && drive_idx < DOS_DRIVES && Drives[drive_idx] != NULL) {
-        Drives[drive_idx]->readonly = new_wp;
+    if (!DriveManager::SetKioskFloppyWriteProtect(drive_idx, new_wp)) {
+        RefreshDriveStatuses();
+        m_status_message = "Drive " + drv_letter + ": Host image is read-only; Write Protection remains ENABLED.";
+        return false;
     }
 
     const std::string active_path = DriveManager::GetKioskActiveDiskPath(drive_idx);

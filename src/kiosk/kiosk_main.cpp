@@ -35,6 +35,7 @@ KioskManager::KioskManager()
     : m_state(KioskState::DISABLED),
       m_overlay_mod_scancode(SDL_SCANCODE_F12),
       m_overlay_key_sym(SDLK_d),
+      m_overlay_chord_latched(false),
       m_watchdog_timer(30.0f),
       m_initialized(false),
       m_kiosk_active(false),
@@ -326,6 +327,30 @@ bool KioskManager::IsOverlayHotkeyEvent(const SDL_Event& event, const uint8_t* k
         event.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE) {
         return true;
     }
+
+    const int custom_mod = m_overlay_mod_scancode.load();
+    const int custom_key = m_overlay_key_sym.load();
+
+    // Track whether any multi-key chord is currently held so that two queued
+    // KEYDOWN events in the same SDL pump cannot toggle the overlay twice.
+    bool any_chord_held = false;
+    if (kb_state != nullptr) {
+        const bool f12_d_held = (kb_state[SDL_SCANCODE_F12] != 0 && kb_state[SDL_SCANCODE_D] != 0);
+        const bool f11_o_held = (kb_state[SDL_SCANCODE_F11] != 0 && kb_state[SDL_SCANCODE_O] != 0);
+        bool custom_chord_held = false;
+        if (custom_mod > 0 && custom_mod < SDL_NUM_SCANCODES && custom_key != SDLK_UNKNOWN) {
+            const SDL_Scancode custom_key_sc = SDL_GetScancodeFromKey(static_cast<SDL_Keycode>(custom_key));
+            if (custom_key_sc > 0 && custom_key_sc < SDL_NUM_SCANCODES) {
+                custom_chord_held = (kb_state[custom_mod] != 0 && kb_state[custom_key_sc] != 0);
+            }
+        }
+        any_chord_held = f12_d_held || f11_o_held || custom_chord_held;
+    }
+
+    if (!any_chord_held) {
+        m_overlay_chord_latched.store(false);
+    }
+
     if (event.type != SDL_KEYDOWN || event.key.repeat != 0) {
         return false;
     }
@@ -334,25 +359,32 @@ bool KioskManager::IsOverlayHotkeyEvent(const SDL_Event& event, const uint8_t* k
 
     // Built-in default (F12+D) and disk-swapper alias (F11+O), tolerant of key press order
     if (kb_state != nullptr) {
-        if ((sym == SDLK_d && kb_state[SDL_SCANCODE_F12]) ||
-            (sym == SDLK_F12 && kb_state[SDL_SCANCODE_D])) {
-            return true;
-        }
-        if ((sym == SDLK_o && kb_state[SDL_SCANCODE_F11]) ||
-            (sym == SDLK_F11 && kb_state[SDL_SCANCODE_O])) {
-            return true;
+        const bool is_f12_d =
+            (sym == SDLK_d && kb_state[SDL_SCANCODE_F12]) ||
+            (sym == SDLK_F12 && kb_state[SDL_SCANCODE_D]);
+        const bool is_f11_o =
+            (sym == SDLK_o && kb_state[SDL_SCANCODE_F11]) ||
+            (sym == SDLK_F11 && kb_state[SDL_SCANCODE_O]);
+        if (is_f12_d || is_f11_o) {
+            return !m_overlay_chord_latched.exchange(true);
         }
     }
 
     // Configurable kiosk_config.overlay_hotkey
-    const int custom_mod = m_overlay_mod_scancode.load();
-    const int custom_key = m_overlay_key_sym.load();
     if (static_cast<int>(sym) == custom_key) {
         if (custom_mod == SDL_SCANCODE_UNKNOWN) {
             return true;
         }
         if (kb_state != nullptr && custom_mod > 0 && custom_mod < SDL_NUM_SCANCODES && kb_state[custom_mod]) {
-            return true;
+            return !m_overlay_chord_latched.exchange(true);
+        }
+    }
+    if (kb_state != nullptr && custom_mod > 0 && custom_mod < SDL_NUM_SCANCODES &&
+        event.key.keysym.scancode == static_cast<SDL_Scancode>(custom_mod) &&
+        custom_key != SDLK_UNKNOWN) {
+        const SDL_Scancode custom_key_sc = SDL_GetScancodeFromKey(static_cast<SDL_Keycode>(custom_key));
+        if (custom_key_sc > 0 && custom_key_sc < SDL_NUM_SCANCODES && kb_state[custom_key_sc]) {
+            return !m_overlay_chord_latched.exchange(true);
         }
     }
     return false;

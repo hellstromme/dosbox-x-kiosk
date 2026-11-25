@@ -61,6 +61,7 @@ public:
 	static std::vector<std::string> GetKioskDrivePaths(int drive);
 	static bool AppendAndSwapDisk(int drive, const std::string& host_path, bool is_cdrom, bool write_protected = false);
 	static bool EjectDriveMedia(int drive, bool is_cdrom);
+	static bool SetKioskFloppyWriteProtect(int drive, bool write_protected);
 #endif
 	
 private:
