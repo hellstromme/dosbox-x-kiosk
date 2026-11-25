@@ -28,6 +28,7 @@ public:
     std::vector<MachineRecord> GetAllMachines();
     bool GetMachine(const std::string& id, MachineRecord& out_machine);
     bool InsertMachine(const MachineRecord& machine);
+    bool InsertMachineWithBindings(const MachineRecord& machine, const std::vector<CaddyBindingRecord>& bindings);
     bool UpdateMachine(const MachineRecord& machine);
     bool DeleteMachine(const std::string& id);
 

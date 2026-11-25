@@ -8,6 +8,7 @@
 #include "machine/config_synthesizer.h"
 #include "machine/boot_injector.h"
 #include "ui/kiosk_ui.h"
+#include "ui/input_router.h"
 #include "ui/runtime_overlay.h"
 #include "ui/view_disk_caddy.h"
 #include "control.h"
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <fstream>
 #include <vector>
 
 #if defined(_WIN32)
@@ -47,6 +49,7 @@ KioskManager::KioskManager()
     // static lifetimes outlive KioskManager::~KioskManager() at process exit.
     (void)KioskDatabase::GetInstance();
     (void)KioskUI::GetInstance();
+    (void)KioskInputRouter::GetInstance();
     (void)DiskCaddyView::GetInstance();
     (void)RuntimeOverlay::GetInstance();
     (void)BootInjector::GetInstance();
@@ -151,6 +154,7 @@ void KioskManager::RunMainLoop() {
             SynthesizeAndPrepareLaunch(conf);
         }
     } else {
+        KioskInputRouter::GetInstance().InitializeControllers();
         uint32_t last_ticks = SDL_GetTicks();
         while (!m_exit_requested.load()) {
             KioskState cur = m_state.load();
@@ -177,6 +181,7 @@ void KioskManager::RunMainLoop() {
 
             Kiosk_PumpPreBootFrame();
         }
+        KioskInputRouter::GetInstance().ShutdownControllers();
     }
 }
 
@@ -202,6 +207,19 @@ void KioskManager::Shutdown() {
 KioskConfigRecord KioskManager::GetConfig() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_config;
+}
+
+bool KioskManager::ReloadConfig() {
+    KioskConfigRecord loaded_cfg;
+    if (!KioskDatabase::GetInstance().IsOpen() || !KioskDatabase::GetInstance().GetConfig(loaded_cfg)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_config = loaded_cfg;
+        UpdateParsedOverlayHotkeyLocked();
+    }
+    return true;
 }
 
 float KioskManager::GetWatchdogRemainingSec() const {
@@ -272,6 +290,12 @@ bool KioskManager::HandlePreBootInputEvent(const SDL_Event& event) {
     if (event.type == SDL_QUIT) {
         RequestApplianceExit();
         return true;
+    }
+
+    if (event.type == SDL_CONTROLLERDEVICEADDED || event.type == SDL_CONTROLLERDEVICEREMOVED ||
+        event.type == SDL_JOYDEVICEADDED || event.type == SDL_JOYDEVICEREMOVED) {
+        KioskInputRouter::GetInstance().ProcessSDLEvent(event, false);
+        return false;
     }
 
     KioskState cur = m_state.load();
@@ -620,47 +644,68 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
         caddy.insert(caddy.begin(), custom_floppy);
     }
 
-    // Phase 3: Ephemeral Boot Injector for REAL_HDD_BOOT machines
+    // Phase 3 / Phase 5: Ephemeral Boot Injector or Pending OS Installer Boot for REAL_HDD_BOOT
     std::string active_dispatch_path;
+    bool boot_installer_media = false;
     if (machine.boot_mode == "REAL_HDD_BOOT") {
-        if (machine.primary_hdd_path.empty() ||
-            !BootInjector::GetInstance().EnsureOneTimeAutoexecHook(machine.primary_hdd_path)) {
+        bool has_installer_media = false;
+        for (size_t i = 0; i < caddy.size(); ++i) {
+            if (caddy[i].target_drive == "A" || caddy[i].target_drive == "D") {
+                has_installer_media = true;
+                break;
+            }
+        }
+
+        // If OS installation is still pending (!os_installed) and installer media is bound
+        // for a Machine-Only launch on an existing HDD image, always boot the installer media
+        // and bypass EnsureOneTimeAutoexecHook (covers blank, FDISK-partitioned, and formatted-
+        // but-incomplete HDDs so interrupted installs can always resume).
+        bool hdd_file_exists = false;
+        if (!machine.primary_hdd_path.empty()) {
+            std::ifstream hdd_probe(machine.primary_hdd_path.c_str(), std::ios::binary);
+            hdd_file_exists = hdd_probe.is_open();
+        }
+
+        if (!machine.os_installed && item_ptr == nullptr && has_installer_media && hdd_file_exists) {
+            boot_installer_media = true;
+            LOG_MSG("KIOSK: Pending OS installation (!os_installed) with bound installer media; booting installer without AUTOEXEC hook.");
+        } else if (!hdd_file_exists || !BootInjector::GetInstance().EnsureOneTimeAutoexecHook(machine.primary_hdd_path)) {
             LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to prepare primary HDD image '%s'.",
                     machine.primary_hdd_path.c_str());
             m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
             return false;
-        }
-
-        std::string dispatch_path = BootInjector::GetInstance().GetDefaultDispatchImagePath();
-        for (const auto& b : caddy) {
-            if (b.target_drive == "B") {
-                LOG_MSG("KIOSK: Drive B: is reserved for ephemeral dispatch floppy during REAL_HDD_BOOT; redirecting B: caddy media '%s' to Drive A: swap queue.",
-                        b.resolved_file_path.c_str());
-            }
-        }
-        if (item_ptr != nullptr) {
-            // Mode A: Carousel Game/App Launch -> KIOSKGO.BAT + KIOSKEXT.COM
-            if (!BootInjector::GetInstance().BuildDispatchVolume(dispatch_path, machine, *item_ptr)) {
-                LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to build dispatch volume '%s'.",
-                        dispatch_path.c_str());
-                m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
-                return false;
-            }
-            active_dispatch_path = dispatch_path;
         } else {
-            // Mode B: Machine-Only Boot -> Idle floppy (KIOSKEXT.COM only, no KIOSKGO.BAT)
-            if (!BootInjector::GetInstance().BuildIdleDispatchVolume(dispatch_path)) {
-                LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to build idle dispatch volume '%s'.",
-                        dispatch_path.c_str());
-                m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
-                return false;
+            std::string dispatch_path = BootInjector::GetInstance().GetDefaultDispatchImagePath();
+            for (const auto& b : caddy) {
+                if (b.target_drive == "B") {
+                    LOG_MSG("KIOSK: Drive B: is reserved for ephemeral dispatch floppy during REAL_HDD_BOOT; redirecting B: caddy media '%s' to Drive A: swap queue.",
+                            b.resolved_file_path.c_str());
+                }
             }
-            active_dispatch_path = dispatch_path;
+            if (item_ptr != nullptr) {
+                // Mode A: Carousel Game/App Launch -> KIOSKGO.BAT + KIOSKEXT.COM
+                if (!BootInjector::GetInstance().BuildDispatchVolume(dispatch_path, machine, *item_ptr)) {
+                    LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to build dispatch volume '%s'.",
+                            dispatch_path.c_str());
+                    m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+                    return false;
+                }
+                active_dispatch_path = dispatch_path;
+            } else {
+                // Mode B: Machine-Only Boot -> Idle floppy (KIOSKEXT.COM only, no KIOSKGO.BAT)
+                if (!BootInjector::GetInstance().BuildIdleDispatchVolume(dispatch_path)) {
+                    LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to build idle dispatch volume '%s'.",
+                            dispatch_path.c_str());
+                    m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+                    return false;
+                }
+                active_dispatch_path = dispatch_path;
+            }
         }
     }
 
     out_synthesized_conf = ConfigSynthesizer::GetInstance().SynthesizeConfig(
-        machine, item_ptr, caddy, base_conf, active_dispatch_path
+        machine, item_ptr, caddy, base_conf, active_dispatch_path, boot_installer_media
     );
 
     std::string session_conf_path;
