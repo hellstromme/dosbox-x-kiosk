@@ -48,6 +48,7 @@ public:
     static int ComputeNextSlotOrder(const std::vector<CaddyBindingRecord>& bindings, const std::string& target_drive);
 
     void ResetTransientModals();
+    bool IsContextModalOpen() const { return m_show_context_modal; }
 
 private:
     ViewCarousel() = default;
@@ -66,6 +67,7 @@ private:
         const MachineRecord& machine,
         bool is_focused
     );
+    void RenderContextActionsModal();
     void RenderCaddyManagerModal();
     void RenderDeleteConfirmModal();
 
@@ -91,6 +93,12 @@ private:
     std::vector<CaddyBindingRecord> m_caddy_modal_bindings;
     int m_caddy_modal_selected_drive = 0; // 0=A, 1=B, 2=D, 3=E
     int m_caddy_modal_selected_media = 0;
+
+    // Context Actions modal state (M / Gamepad Start — controller-reachable Set Default / Remove / etc.)
+    bool m_show_context_modal = false;
+    bool m_context_modal_is_item = false;
+    std::string m_context_modal_target_id;
+    std::string m_context_modal_target_name;
 
     // Delete confirmation modal state
     bool m_show_delete_modal = false;

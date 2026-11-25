@@ -86,6 +86,7 @@ void ViewCarousel::SetSearchFilter(const std::string& filter) {
 }
 
 void ViewCarousel::ResetTransientModals() {
+    m_show_context_modal = false;
     m_show_caddy_modal = false;
     m_show_delete_modal = false;
 }
@@ -147,8 +148,9 @@ int ViewCarousel::ComputeNextSlotOrder(const std::vector<CaddyBindingRecord>& bi
 }
 
 bool ViewCarousel::HandleAction(KioskHubTab active_tab, KioskInputAction action) {
-    if (m_show_caddy_modal || m_show_delete_modal) {
+    if (m_show_context_modal || m_show_caddy_modal || m_show_delete_modal) {
         if (action == KioskInputAction::ACTION_BACK) {
+            m_show_context_modal = false;
             m_show_caddy_modal = false;
             m_show_delete_modal = false;
             return true;
@@ -203,6 +205,14 @@ bool ViewCarousel::HandleAction(KioskHubTab active_tab, KioskInputAction action)
             m_caddy_modal_bindings = KioskDatabase::GetInstance().GetCaddyBindingsForItem(focused.id);
             return true;
         }
+        if (action == KioskInputAction::ACTION_CONTEXT_MENU) {
+            const CatalogItemRecord& focused = items[static_cast<size_t>(sel)];
+            m_show_context_modal = true;
+            m_context_modal_is_item = true;
+            m_context_modal_target_id = focused.id;
+            m_context_modal_target_name = focused.title;
+            return true;
+        }
     } else if (active_tab == KioskHubTab::MACHINES) {
         const std::vector<MachineRecord>& machines = ui.GetCachedMachines();
         // Virtual slot 0 = Quick Start Default DOSBox-X; 1..N = custom machines
@@ -234,6 +244,14 @@ bool ViewCarousel::HandleAction(KioskHubTab active_tab, KioskInputAction action)
             m_caddy_modal_target_id = mach.id;
             m_caddy_modal_target_name = mach.display_name;
             m_caddy_modal_bindings = KioskDatabase::GetInstance().GetCaddyBindingsForMachine(mach.id);
+            return true;
+        }
+        if (action == KioskInputAction::ACTION_CONTEXT_MENU && m_selected_machine_idx > 0) {
+            const MachineRecord& mach = machines[static_cast<size_t>(m_selected_machine_idx - 1)];
+            m_show_context_modal = true;
+            m_context_modal_is_item = false;
+            m_context_modal_target_id = mach.id;
+            m_context_modal_target_name = mach.display_name;
             return true;
         }
     } else if (active_tab == KioskHubTab::MEDIA_POOL) {
@@ -640,6 +658,7 @@ void ViewCarousel::RenderCatalogCarousel(const std::string& item_type, int& sele
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
 
+    RenderContextActionsModal();
     RenderCaddyManagerModal();
     RenderDeleteConfirmModal();
 }
@@ -820,6 +839,7 @@ void ViewCarousel::RenderMachinesTab() {
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
 
+    RenderContextActionsModal();
     RenderCaddyManagerModal();
     RenderDeleteConfirmModal();
 }
@@ -940,6 +960,102 @@ void ViewCarousel::RenderMediaPoolTab() {
         }
     }
     ImGui::EndChild();
+}
+
+void ViewCarousel::RenderContextActionsModal() {
+    static const char* kCtxPopupId = "Actions###KioskContextActionsModal";
+    if (m_show_context_modal && !ImGui::IsPopupOpen(kCtxPopupId)) {
+        ImGui::OpenPopup(kCtxPopupId);
+    }
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    if (vp) {
+        const float mw = (std::min)(380.0f, (std::max)(260.0f, vp->WorkSize.x - 24.0f));
+        const float mh = (std::min)(295.0f, (std::max)(220.0f, vp->WorkSize.y - 24.0f));
+        ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(mw, mh), ImGuiCond_Always);
+    }
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
+    if (ImGui::BeginPopupModal(kCtxPopupId, &m_show_context_modal, flags)) {
+        if (!m_show_context_modal) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+
+        KioskUI& ui = KioskUI::GetInstance();
+        ImGui::TextUnformatted(m_context_modal_target_name.c_str());
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (ImGui::Button(m_context_modal_is_item ? "Launch Now" : "Boot Machine", ImVec2(-1.0f, 32.0f))) {
+            if (m_context_modal_is_item) {
+                KioskManager::GetInstance().RequestLaunchItem(m_context_modal_target_id);
+            } else {
+                KioskManager::GetInstance().RequestLaunchMachine(m_context_modal_target_id);
+            }
+            m_show_context_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        if (m_context_modal_is_item) {
+            if (ImGui::Button("Toggle Favorite", ImVec2(-1.0f, 32.0f))) {
+                CatalogItemRecord rec;
+                if (KioskDatabase::GetInstance().GetItem(m_context_modal_target_id, rec)) {
+                    rec.is_favorite = !rec.is_favorite;
+                    if (KioskDatabase::GetInstance().UpdateCatalogItem(rec)) {
+                        ui.InvalidateCatalogCache();
+                        ui.ShowToast(rec.is_favorite ? "Added to Favorites" : "Removed from Favorites");
+                    }
+                }
+                m_show_context_modal = false;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+
+        if (ImGui::Button("Session Media Caddy", ImVec2(-1.0f, 32.0f))) {
+            m_show_context_modal = false;
+            ImGui::CloseCurrentPopup();
+            m_show_caddy_modal = true;
+            m_caddy_modal_is_item = m_context_modal_is_item;
+            m_caddy_modal_target_id = m_context_modal_target_id;
+            m_caddy_modal_target_name = m_context_modal_target_name;
+            m_caddy_modal_bindings = m_context_modal_is_item
+                                         ? KioskDatabase::GetInstance().GetCaddyBindingsForItem(m_context_modal_target_id)
+                                         : KioskDatabase::GetInstance().GetCaddyBindingsForMachine(m_context_modal_target_id);
+        }
+
+        if (ImGui::Button("Set as Default Boot", ImVec2(-1.0f, 32.0f))) {
+            KioskConfigRecord cfg = ui.GetCachedConfig();
+            cfg.default_boot_action = m_context_modal_is_item ? "SPECIFIC_ITEM" : "SPECIFIC_MACHINE";
+            cfg.default_target_uuid = m_context_modal_target_id;
+            if (KioskDatabase::GetInstance().UpdateConfig(cfg)) {
+                KioskManager::GetInstance().ReloadConfig();
+                ui.InvalidateCatalogCache();
+                ui.ShowToast("Set '" + m_context_modal_target_name + "' as default auto-boot target");
+            }
+            m_show_context_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        if (ImGui::Button(m_context_modal_is_item ? "Remove from Catalog..." : "Delete Machine...", ImVec2(-1.0f, 32.0f))) {
+            m_show_context_modal = false;
+            ImGui::CloseCurrentPopup();
+            m_show_delete_modal = true;
+            m_delete_modal_is_item = m_context_modal_is_item;
+            m_delete_modal_target_id = m_context_modal_target_id;
+            m_delete_modal_target_name = m_context_modal_target_name;
+        }
+
+        ImGui::Spacing();
+        if (ImGui::Button("Cancel [Esc/B]", ImVec2(-1.0f, 30.0f))) {
+            m_show_context_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
 }
 
 void ViewCarousel::RenderCaddyManagerModal() {

@@ -2148,12 +2148,16 @@ TEST(KioskCarouselTest, FiltersSortsAndNavigatesItems) {
     ASSERT_EQ(search_res.size(), 1u);
     EXPECT_EQ(search_res[0].id, "game-doom");
 
-    // Navigate with NAV_RIGHT and confirm launch
+    // Navigate with NAV_RIGHT, verify ACTION_CONTEXT_MENU opens/closes modal cleanly, then launch
     ViewCarousel& carousel = ViewCarousel::GetInstance();
     carousel.SetSearchFilter("");
     EXPECT_EQ(carousel.GetSelectedGameIndex(), 0);
     EXPECT_TRUE(carousel.HandleAction(KioskHubTab::GAMES, KioskInputAction::NAV_RIGHT));
     EXPECT_EQ(carousel.GetSelectedGameIndex(), 1);
+    EXPECT_TRUE(carousel.HandleAction(KioskHubTab::GAMES, KioskInputAction::ACTION_CONTEXT_MENU));
+    EXPECT_TRUE(carousel.IsContextModalOpen());
+    EXPECT_TRUE(carousel.HandleAction(KioskHubTab::GAMES, KioskInputAction::ACTION_BACK));
+    EXPECT_FALSE(carousel.IsContextModalOpen());
     EXPECT_TRUE(carousel.HandleAction(KioskHubTab::GAMES, KioskInputAction::ACTION_CONFIRM));
     EXPECT_EQ(KioskManager::GetInstance().GetState(), KioskState::STATE_SYNTHESIZE_LAUNCH);
     EXPECT_EQ(KioskManager::GetInstance().GetCurrentLaunchContext().catalog_item_id, "game-doom");

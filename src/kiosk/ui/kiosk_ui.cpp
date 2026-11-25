@@ -655,8 +655,8 @@ void KioskUI::RenderInteractiveShell() {
         // --- 3. Bottom Control Hint Footer (adapts to narrow 640x480 viewports) ---
         ImGui::Separator();
         const char* hint_text = (vp_size.x >= 960.0f)
-            ? "Arrows/D-Pad: Browse  |  Q/E or LB/RB: Tabs  |  Enter/A: Launch  |  C/X: Caddy  |  F/Back: Favorite  |  F12+D: Disks"
-            : "Arrows/D-Pad: Browse | Q/E: Tabs | Enter/A: Launch | F12+D: Disks";
+            ? "Arrows/D-Pad: Browse  |  Q/E or LB/RB: Tabs  |  Enter/A: Launch  |  M/Start: Actions  |  C/X: Caddy  |  F12+D: Disks"
+            : "Arrows/D-Pad: Browse | Enter/A: Launch | M/Start: Actions | F12+D: Disks";
         ImGui::PushStyleColor(ImGuiCol_Text, m_theme.text_muted);
         ImGui::TextUnformatted(hint_text);
         ImGui::PopStyleColor();
