@@ -100,6 +100,9 @@ imageDiskVFD::vfdentry *imageDiskVFD::findSector(uint8_t head,uint8_t track,uint
 }
 
 Int13Status imageDiskVFD::Write_Sector(uint32_t head,uint32_t cylinder,uint32_t sector,const void * data,unsigned int req_sector_size) {
+#if defined(C_KIOSK)
+    if (this->kiosk_write_protected) return Int13Status::WriteProtected;
+#endif
     unsigned long new_offset;
     unsigned char tmp[12];
     vfdentry *ent;

@@ -999,10 +999,18 @@ void FloppyController::on_fdc_in_command() {
 						break;
 					}
 
+#if defined(C_KIOSK)
+					if (FDC_IsWriteProtected(devidx) || image->kiosk_write_protected) {
+						ST[0] = (ST[0] & 0x1F) | 0x40;
+						ST[1] = (1 << 1)/*not writeable (WP)*/;
+						ST[2] = 0;
+						break;
+					}
+#endif
 					/* write sector */
 					Int13Status err = image->Write_Sector(in_cmd[3]/*head*/,in_cmd[2]/*cylinder*/,in_cmd[4]/*sector*/,sector,sector_size_bytes);
 #if defined(C_KIOSK)
-					if (err == Int13Status::WriteProtected || FDC_IsWriteProtected(devidx)) {
+					if (err == Int13Status::WriteProtected) {
 						ST[0] = (ST[0] & 0x1F) | 0x40;
 						ST[1] = (1 << 1)/*not writeable (WP)*/;
 						ST[2] = 0;

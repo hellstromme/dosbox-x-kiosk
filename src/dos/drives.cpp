@@ -942,7 +942,7 @@ bool DriveManager::AppendAndSwapDisk(int drive, const std::string& host_path, bo
 
 	int existing_cd_idx = -1;
 	for (size_t i = 0; i < driveInfos[drive].disks.size(); ++i) {
-		if (Kiosk_ExtractDriveHostPath(driveInfos[drive].disks[i], -1) == clean_path) {
+		if (Kiosk_PathsEqual(Kiosk_ExtractDriveHostPath(driveInfos[drive].disks[i], -1), clean_path)) {
 			existing_cd_idx = (int)i;
 			break;
 		}

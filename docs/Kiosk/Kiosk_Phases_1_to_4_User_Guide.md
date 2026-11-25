@@ -69,8 +69,8 @@ Because the graphical Machine/Media Setup Wizard is built in Phases 5–6, you c
 
    # Add a Catalog Item (Game)
    cur.execute('''INSERT OR REPLACE INTO catalog_items
-       (id, machine_id, item_type, title, launch_mechanism, host_container_dir, guest_executable, return_on_exit)
-       VALUES ('item-demo', 'mach-486', 'GAME', 'Multi-Disk Demo', 'INTEGRATED_AUTOEXEC', 'C:\\temp\\dosgames', 'COMMAND.COM', 1)''')
+       (id, machine_id, item_type, title, launch_mechanism, host_container_dir, guest_working_dir, guest_executable, return_on_exit)
+       VALUES ('item-demo', 'mach-486', 'GAME', 'Multi-Disk Demo', 'INTEGRATED_AUTOEXEC', 'C:\\temp\\dosgames', 'C:\\', 'COMMAND.COM', 1)''')
 
    # Register floppy & CD-ROM images in the Global Media Pool
    cur.execute('''INSERT OR REPLACE INTO media_pool
@@ -81,8 +81,8 @@ Because the graphical Machine/Media Setup Wizard is built in Phases 5–6, you c
        ('med-cd1', 'C:\\temp\\game.iso',  'CDROM_ISO',       'JEWEL_CD', 'Game Data CD',   'CD-ROM ISO9660', 1)''')
 
    # Bind media to the Catalog Item's Session Caddy
-   cur.execute("DELETE FROM session_caddy WHERE catalog_item_id = 'item-demo'")
-   cur.execute('''INSERT INTO session_caddy (catalog_item_id, media_id, target_drive, slot_order) VALUES
+   cur.execute("DELETE FROM caddy_bindings WHERE catalog_item_id = 'item-demo'")
+   cur.execute('''INSERT INTO caddy_bindings (catalog_item_id, media_id, target_drive, slot_order) VALUES
        ('item-demo', 'med-fd1', 'A', 1),
        ('item-demo', 'med-fd2', 'A', 2),
        ('item-demo', 'med-cd1', 'D', 1)''')
@@ -91,7 +91,7 @@ Because the graphical Machine/Media Setup Wizard is built in Phases 5–6, you c
    con.close()
    print(r'Seeded C:\temp\kiosk_test.db successfully.')
    '@
-   python -c $seedScript
+   $seedScript | python -
    ```
 
 ---

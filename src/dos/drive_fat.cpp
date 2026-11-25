@@ -1585,6 +1585,12 @@ fatDrive::fatDrive(const char* sysFilename, uint32_t bytesector, uint32_t cylsec
 			loadedDisk = new imageDisk(diskfile, fname, rawsize, (is_hdd | (rawsize > 2880 * 1024)));
 	}
 
+#if defined(C_KIOSK)
+	if (loadedDisk != NULL && (readonly || roflag)) {
+		loadedDisk->kiosk_host_readonly = true;
+	}
+#endif
+
 	fatDriveInit(sysFilename, bytesector, cylsector, headscyl, cylinders, filesize, options);
 }
 
