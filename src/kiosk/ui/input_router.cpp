@@ -47,10 +47,7 @@ void KioskInputRouter::ShutdownControllers() {
         }
     }
     m_controllers.clear();
-    m_axis_x_dir = 0;
-    m_axis_y_dir = 0;
-    m_axis_x_owner = -1;
-    m_axis_y_owner = -1;
+    m_axis_states.clear();
     m_last_hat_state = 0;
     m_action_queue.clear();
 }
@@ -75,15 +72,8 @@ void KioskInputRouter::OpenControllerByDeviceIndex(int device_index) {
 }
 
 void KioskInputRouter::CloseControllerByInstanceId(int32_t instance_id) {
-    // Clear any held analog stick direction owned by the disconnecting controller
-    if (m_axis_x_owner == instance_id) {
-        m_axis_x_dir = 0;
-        m_axis_x_owner = -1;
-    }
-    if (m_axis_y_owner == instance_id) {
-        m_axis_y_dir = 0;
-        m_axis_y_owner = -1;
-    }
+    // Clear only the disconnecting controller's held-axis state; keep other controllers intact
+    m_axis_states.erase(instance_id);
 
     for (std::vector<SDL_GameController*>::iterator it = m_controllers.begin();
          it != m_controllers.end(); ++it) {
@@ -112,52 +102,52 @@ void KioskInputRouter::HandleAnalogAxis(
     uint32_t now_ms,
     bool suppress_actions
 ) {
+    ControllerAxisState& st = m_axis_states[instance_id];
+
     if (axis_index == SDL_CONTROLLER_AXIS_LEFTX) {
-        int new_dir = m_axis_x_dir;
+        int new_dir = st.dir_x;
         if (value <= -AXIS_DEADZONE) {
             new_dir = -1;
         } else if (value >= AXIS_DEADZONE) {
             new_dir = 1;
         } else if (std::abs(static_cast<int>(value)) < AXIS_RELEASE_ZONE) {
-            if (m_axis_x_owner == instance_id || m_axis_x_owner == -1) {
-                new_dir = 0;
-            }
+            new_dir = 0;
         }
 
-        if (new_dir != m_axis_x_dir) {
-            m_axis_x_dir = new_dir;
-            m_axis_x_owner = (new_dir != 0) ? instance_id : -1;
+        if (new_dir != st.dir_x) {
+            st.dir_x = new_dir;
             if (!suppress_actions && new_dir < 0) {
                 PushAction(KioskInputAction::NAV_LEFT);
-                m_axis_x_next_repeat_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
+                st.next_repeat_x_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
             } else if (!suppress_actions && new_dir > 0) {
                 PushAction(KioskInputAction::NAV_RIGHT);
-                m_axis_x_next_repeat_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
+                st.next_repeat_x_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
             }
         }
     } else if (axis_index == SDL_CONTROLLER_AXIS_LEFTY) {
-        int new_dir = m_axis_y_dir;
+        int new_dir = st.dir_y;
         if (value <= -AXIS_DEADZONE) {
             new_dir = -1;
         } else if (value >= AXIS_DEADZONE) {
             new_dir = 1;
         } else if (std::abs(static_cast<int>(value)) < AXIS_RELEASE_ZONE) {
-            if (m_axis_y_owner == instance_id || m_axis_y_owner == -1) {
-                new_dir = 0;
-            }
+            new_dir = 0;
         }
 
-        if (new_dir != m_axis_y_dir) {
-            m_axis_y_dir = new_dir;
-            m_axis_y_owner = (new_dir != 0) ? instance_id : -1;
+        if (new_dir != st.dir_y) {
+            st.dir_y = new_dir;
             if (!suppress_actions && new_dir < 0) {
                 PushAction(KioskInputAction::NAV_UP);
-                m_axis_y_next_repeat_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
+                st.next_repeat_y_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
             } else if (!suppress_actions && new_dir > 0) {
                 PushAction(KioskInputAction::NAV_DOWN);
-                m_axis_y_next_repeat_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
+                st.next_repeat_y_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
             }
         }
+    }
+
+    if (st.dir_x == 0 && st.dir_y == 0) {
+        m_axis_states.erase(instance_id);
     }
 }
 
@@ -165,13 +155,17 @@ void KioskInputRouter::UpdateRepeat(uint32_t now_ms, bool suppress_actions) {
     if (suppress_actions) {
         return;
     }
-    if (m_axis_x_dir != 0 && SDL_TICKS_PASSED(now_ms, m_axis_x_next_repeat_ms)) {
-        PushAction(m_axis_x_dir < 0 ? KioskInputAction::NAV_LEFT : KioskInputAction::NAV_RIGHT);
-        m_axis_x_next_repeat_ms = now_ms + REPEAT_INTERVAL_MS;
-    }
-    if (m_axis_y_dir != 0 && SDL_TICKS_PASSED(now_ms, m_axis_y_next_repeat_ms)) {
-        PushAction(m_axis_y_dir < 0 ? KioskInputAction::NAV_UP : KioskInputAction::NAV_DOWN);
-        m_axis_y_next_repeat_ms = now_ms + REPEAT_INTERVAL_MS;
+    for (std::map<int32_t, ControllerAxisState>::iterator it = m_axis_states.begin();
+         it != m_axis_states.end(); ++it) {
+        ControllerAxisState& st = it->second;
+        if (st.dir_x != 0 && SDL_TICKS_PASSED(now_ms, st.next_repeat_x_ms)) {
+            PushAction(st.dir_x < 0 ? KioskInputAction::NAV_LEFT : KioskInputAction::NAV_RIGHT);
+            st.next_repeat_x_ms = now_ms + REPEAT_INTERVAL_MS;
+        }
+        if (st.dir_y != 0 && SDL_TICKS_PASSED(now_ms, st.next_repeat_y_ms)) {
+            PushAction(st.dir_y < 0 ? KioskInputAction::NAV_UP : KioskInputAction::NAV_DOWN);
+            st.next_repeat_y_ms = now_ms + REPEAT_INTERVAL_MS;
+        }
     }
 }
 
@@ -373,7 +367,8 @@ bool KioskInputRouter::ProcessSDLEvent(
             }
             switch (event.jbutton.button) {
                 case 0:
-                    if (suppress_confirm) return false;
+                    // Raw unmanaged joysticks are not handled by ImGui's SDL_GameController backend,
+                    // so do not apply suppress_confirm here.
                     PushAction(KioskInputAction::ACTION_CONFIRM);
                     return true;
                 case 1: PushAction(KioskInputAction::ACTION_BACK); return true;

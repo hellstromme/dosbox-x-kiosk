@@ -31,6 +31,7 @@ public:
     bool SelectOSDistribution(const std::string& os_id, std::string& out_error);
     void SetHddSizeMb(int size_mb);
     void SetPrimaryHddPath(const std::string& path);
+    void SetCustomHddChsOverride(const std::string& chs);
     void SetCreateBlankHddOnDisk(bool enable);
     bool GetCreateBlankHddOnDisk() const { return m_create_blank_hdd_file; }
     void SetInstallerFloppyMediaId(const std::string& media_id) { m_installer_floppy_media_id = media_id; }
@@ -70,6 +71,7 @@ private:
 
     char m_name_buf[128] = {0};
     char m_hdd_path_buf[512] = {0};
+    char m_custom_chs_buf[48] = {0};
 };
 
 #endif // DOSBOX_KIOSK_VIEW_WIZARD_H

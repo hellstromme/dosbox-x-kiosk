@@ -2290,6 +2290,74 @@ TEST(KioskWizardTest, ImportedHddPreservesNativeGeometryAndRejectsInvalidBinding
     EXPECT_TRUE(persisted.primary_hdd_chs.empty());
     EXPECT_TRUE(persisted.os_installed);
 
+    // Optional explicit CHS override for imported HDD must be preserved without slider overwrite
+    wiz.Reset();
+    ASSERT_TRUE(wiz.SelectArchetype(KioskArchetypes::DX2_486));
+    wiz.SetDisplayName("Imported Custom CHS Rig");
+    wiz.SetBootMode("REAL_HDD_BOOT");
+    wiz.SetCreateBlankHddOnDisk(false);
+    wiz.SetPrimaryHddPath(existing_hdd);
+    wiz.SetCustomHddChsOverride("1015,16,63");
+    wiz.SetHddSizeMb(250);
+    std::string id_chs;
+    ASSERT_TRUE(wiz.CommitMachine(id_chs, err)) << err;
+    MachineRecord persisted_chs;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMachine(id_chs, persisted_chs));
+    EXPECT_EQ(persisted_chs.primary_hdd_chs, "1015,16,63");
+
+    // Atomic transaction test: 1st binding valid, 2nd binding invalid -> rolls back machine & 1st binding
+    MediaPoolRecord valid_flp;
+    valid_flp.id = "med-atomic-flp";
+    valid_flp.file_path = "atomic_flp.img";
+    valid_flp.media_type = "FLOPPY_35_1440K";
+    valid_flp.label_title = "Atomic Floppy";
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMedia(valid_flp));
+
+    MachineRecord atomic_mach;
+    atomic_mach.id = "mach-atomic-rollback";
+    atomic_mach.display_name = "Atomic Test";
+    atomic_mach.archetype_id = KioskArchetypes::DX_386;
+    atomic_mach.archetype_tier = 3;
+    atomic_mach.boot_mode = "INTEGRATED_DOS";
+    std::vector<CaddyBindingRecord> bad_bindings;
+    CaddyBindingRecord good_b; good_b.media_id = valid_flp.id; good_b.target_drive = "A"; good_b.slot_order = 1;
+    CaddyBindingRecord bad_b;  bad_b.media_id = "missing-cd-id"; bad_b.target_drive = "D"; bad_b.slot_order = 1;
+    bad_bindings.push_back(good_b);
+    bad_bindings.push_back(bad_b);
+    EXPECT_FALSE(KioskDatabase::GetInstance().InsertMachineWithBindings(atomic_mach, bad_bindings));
+    MachineRecord rollback_probe;
+    EXPECT_FALSE(KioskDatabase::GetInstance().GetMachine(atomic_mach.id, rollback_probe));
+    EXPECT_TRUE(KioskDatabase::GetInstance().GetCaddyBindingsForMachine(atomic_mach.id).empty());
+
+    // Partitioned-but-unformatted HDD (0x55AA signature, no valid FAT) + CD-ROM on D: -> BOOT -el-torito D:
+    MediaPoolRecord cd_rec;
+    cd_rec.id = "med-eltorito-cd";
+    cd_rec.file_path = "freedos_install.iso";
+    cd_rec.media_type = "CDROM_ISO";
+    cd_rec.label_title = "FreeDOS 1.3 LiveCD";
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMedia(cd_rec));
+
+    MachineRecord unfmt_mach;
+    unfmt_mach.id = "mach-unformatted-cd";
+    unfmt_mach.display_name = "Unformatted CD Install Rig";
+    unfmt_mach.archetype_id = KioskArchetypes::DX_386;
+    unfmt_mach.archetype_tier = 3;
+    unfmt_mach.boot_mode = "REAL_HDD_BOOT";
+    unfmt_mach.os_installed = false;
+    unfmt_mach.primary_hdd_path = existing_hdd; // has 0x55AA but no valid FAT BPB
+    std::vector<CaddyBindingRecord> cd_bindings;
+    CaddyBindingRecord cd_b; cd_b.media_id = cd_rec.id; cd_b.target_drive = "D"; cd_b.slot_order = 1;
+    cd_bindings.push_back(cd_b);
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMachineWithBindings(unfmt_mach, cd_bindings));
+
+    KioskManager::GetInstance().Initialize("", "");
+    ASSERT_TRUE(KioskManager::GetInstance().RequestLaunchMachine(unfmt_mach.id));
+    std::string cd_conf;
+    ASSERT_TRUE(KioskManager::GetInstance().SynthesizeAndPrepareLaunch(cd_conf));
+    EXPECT_NE(std::string::npos, cd_conf.find("BOOT -el-torito D:"));
+    EXPECT_EQ(std::string::npos, cd_conf.find("BOOT -l c"));
+    KioskManager::GetInstance().Shutdown();
+
     KioskDatabase::GetInstance().Close();
     std::remove(existing_hdd.c_str());
 }
@@ -2316,9 +2384,17 @@ TEST(KioskInputRouterTest, ClearsHeldStickOnDisconnectAndSuppressesConfirmWhenFo
     router.UpdateRepeat(2000, false);
     EXPECT_EQ(router.GetPendingActionCount(), 0u);
 
-    // Re-deflect and disconnect controller 7 -> UpdateRepeat must not fire
+    // Multi-controller same-direction test: controllers 7 and 8 both hold left;
+    // disconnecting 7 must preserve 8's repeat!
+    ev.caxis.which = 7;
     ev.caxis.value = -24000;
     router.ProcessSDLEvent(ev, false, 2100, false, false);
+    ASSERT_TRUE(router.PollAction(act));
+    EXPECT_EQ(act, KioskInputAction::NAV_LEFT);
+
+    ev.caxis.which = 8;
+    ev.caxis.value = -24000;
+    router.ProcessSDLEvent(ev, false, 2150, false, false);
     ASSERT_TRUE(router.PollAction(act));
     EXPECT_EQ(act, KioskInputAction::NAV_LEFT);
 
@@ -2326,6 +2402,16 @@ TEST(KioskInputRouterTest, ClearsHeldStickOnDisconnectAndSuppressesConfirmWhenFo
     ev.type = SDL_CONTROLLERDEVICEREMOVED;
     ev.cdevice.which = 7;
     router.ProcessSDLEvent(ev, false, 2200, false, false);
+
+    // Controller 8 must still emit NAV_LEFT on UpdateRepeat
+    router.UpdateRepeat(2600, false);
+    ASSERT_TRUE(router.PollAction(act));
+    EXPECT_EQ(act, KioskInputAction::NAV_LEFT);
+
+    // Disconnect controller 8 -> repeats stop
+    ev.cdevice.which = 8;
+    router.ProcessSDLEvent(ev, false, 2650, false, false);
+    router.ClearPendingActions();
     router.UpdateRepeat(3000, false);
     EXPECT_EQ(router.GetPendingActionCount(), 0u);
 
@@ -2335,6 +2421,15 @@ TEST(KioskInputRouterTest, ClearsHeldStickOnDisconnectAndSuppressesConfirmWhenFo
     ev.key.keysym.sym = SDLK_RETURN;
     EXPECT_FALSE(router.ProcessSDLEvent(ev, false, 3100, false, true /* suppress_confirm */));
     EXPECT_EQ(router.GetPendingActionCount(), 0u);
+
+    // Raw unmanaged joystick button 0 with suppress_confirm=true MUST still queue ACTION_CONFIRM
+    std::memset(&ev, 0, sizeof(ev));
+    ev.type = SDL_JOYBUTTONDOWN;
+    ev.jbutton.which = 99;
+    ev.jbutton.button = 0;
+    EXPECT_TRUE(router.ProcessSDLEvent(ev, false, 3200, false, true /* suppress_confirm */));
+    ASSERT_TRUE(router.PollAction(act));
+    EXPECT_EQ(act, KioskInputAction::ACTION_CONFIRM);
 }
 
 TEST(KioskCarouselTest, ValidatesDriveMediaCompatibilityAndComputesMaxSlotOrder) {

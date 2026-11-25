@@ -655,31 +655,29 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
             }
         }
 
-        // Detect an existing blank/unformatted HDD image (sector 0 lacks 0x55AA) when OS install is pending
-        bool hdd_exists_and_blank = false;
-        if (!machine.os_installed && item_ptr == nullptr && has_installer_media && !machine.primary_hdd_path.empty()) {
+        // For !os_installed machines with bound installer media, try hooking the HDD first:
+        // if the HDD exists on disk but is either blank OR partitioned-but-unformatted
+        // (EnsureOneTimeAutoexecHook fails), boot the bound installer media (A: or El Torito D:).
+        bool hdd_file_exists = false;
+        if (!machine.primary_hdd_path.empty()) {
             std::ifstream hdd_probe(machine.primary_hdd_path.c_str(), std::ios::binary);
-            if (hdd_probe.is_open()) {
-                uint8_t sec0[512] = {0};
-                hdd_probe.read(reinterpret_cast<char*>(sec0), sizeof(sec0));
-                if (hdd_probe.gcount() >= 512 && !(sec0[510] == 0x55 && sec0[511] == 0xAA)) {
-                    hdd_exists_and_blank = true;
-                }
-            }
+            hdd_file_exists = hdd_probe.is_open();
         }
 
-        if (hdd_exists_and_blank) {
-            boot_installer_media = true;
-            LOG_MSG("KIOSK: Blank unformatted HDD detected with installer media; booting installer without AUTOEXEC hook.");
-        } else {
-            if (machine.primary_hdd_path.empty() ||
-                !BootInjector::GetInstance().EnsureOneTimeAutoexecHook(machine.primary_hdd_path)) {
-                LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to prepare primary HDD image '%s'.",
-                        machine.primary_hdd_path.c_str());
-                m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
-                return false;
-            }
+        bool hook_ok = false;
+        if (hdd_file_exists) {
+            hook_ok = BootInjector::GetInstance().EnsureOneTimeAutoexecHook(machine.primary_hdd_path);
+        }
 
+        if (!hook_ok && !machine.os_installed && item_ptr == nullptr && has_installer_media && hdd_file_exists) {
+            boot_installer_media = true;
+            LOG_MSG("KIOSK: Unformatted or blank HDD detected with installer media; booting installer without AUTOEXEC hook.");
+        } else if (!hook_ok) {
+            LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to prepare primary HDD image '%s'.",
+                    machine.primary_hdd_path.c_str());
+            m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+            return false;
+        } else {
             std::string dispatch_path = BootInjector::GetInstance().GetDefaultDispatchImagePath();
             for (const auto& b : caddy) {
                 if (b.target_drive == "B") {

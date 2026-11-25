@@ -151,8 +151,9 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
                 ss << "# Boot OS installer from Floppy Drive A:\n"
                    << "BOOT -l a\n";
             } else if (drive_bindings.find("D") != drive_bindings.end() && !drive_bindings["D"].empty()) {
-                ss << "# Boot OS installer from Optical Drive D:\n"
-                   << "BOOT -l d\n";
+                // El Torito CD-ROM boot uses BOOT -el-torito D: (BOOT -l d boots 2nd HDD)
+                ss << "# Boot OS installer from El Torito Optical Drive D:\n"
+                   << "BOOT -el-torito D:\n";
             } else {
                 ss << "# Boot from primary hard drive\n"
                    << "BOOT -l c\n";

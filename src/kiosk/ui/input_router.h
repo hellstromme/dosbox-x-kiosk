@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <vector>
 
 typedef union SDL_Event SDL_Event;
@@ -69,13 +70,14 @@ private:
     std::deque<KioskInputAction> m_action_queue;
     std::vector<SDL_GameController*> m_controllers;
 
-    // Analog stick debounce/repeat state (tracked per owning controller instance ID)
-    int m_axis_x_dir = 0; // -1, 0, +1
-    int m_axis_y_dir = 0; // -1, 0, +1
-    int32_t m_axis_x_owner = -1;
-    int32_t m_axis_y_owner = -1;
-    uint32_t m_axis_x_next_repeat_ms = 0;
-    uint32_t m_axis_y_next_repeat_ms = 0;
+    // Per-controller analog stick debounce/repeat state (keyed by SDL_JoystickID)
+    struct ControllerAxisState {
+        int dir_x = 0; // -1, 0, +1
+        int dir_y = 0; // -1, 0, +1
+        uint32_t next_repeat_x_ms = 0;
+        uint32_t next_repeat_y_ms = 0;
+    };
+    std::map<int32_t, ControllerAxisState> m_axis_states;
     uint8_t m_last_hat_state = 0;
 
     static constexpr int16_t AXIS_DEADZONE = 16000;

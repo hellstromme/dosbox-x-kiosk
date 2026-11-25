@@ -425,6 +425,77 @@ bool KioskDatabase::InsertMachine(const MachineRecord& machine) {
     return false;
 }
 
+bool KioskDatabase::InsertMachineWithBindings(
+    const MachineRecord& machine,
+    const std::vector<CaddyBindingRecord>& bindings
+) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_db || machine.id.empty()) return false;
+
+    if (!ExecuteSqlInternal("BEGIN IMMEDIATE;")) {
+        return false;
+    }
+
+    bool ok = true;
+    {
+        const char* sql = "INSERT INTO machines (id, display_name, archetype_id, archetype_tier, os_id, "
+                          "os_installed, boot_mode, primary_hdd_path, primary_hdd_chs, custom_conf_overrides) "
+                          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            ok = false;
+        } else {
+            sqlite3_bind_text(stmt, 1, machine.id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, machine.display_name.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, machine.archetype_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(stmt, 4, machine.archetype_tier);
+            BindTextOrNull(stmt, 5, machine.os_id);
+            sqlite3_bind_int(stmt, 6, machine.os_installed ? 1 : 0);
+            sqlite3_bind_text(stmt, 7, machine.boot_mode.c_str(), -1, SQLITE_TRANSIENT);
+            BindTextOrNull(stmt, 8, machine.primary_hdd_path);
+            BindTextOrNull(stmt, 9, machine.primary_hdd_chs);
+            BindTextOrNull(stmt, 10, machine.custom_conf_overrides);
+            if (sqlite3_step(stmt) != SQLITE_DONE) {
+                ok = false;
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    if (ok) {
+        const char* bsql = "INSERT INTO caddy_bindings (machine_id, catalog_item_id, media_id, target_drive, slot_order) "
+                           "VALUES (?, NULL, ?, ?, ?);";
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            sqlite3_stmt* bstmt = nullptr;
+            if (sqlite3_prepare_v2(m_db, bsql, -1, &bstmt, nullptr) != SQLITE_OK) {
+                ok = false;
+                break;
+            }
+            sqlite3_bind_text(bstmt, 1, machine.id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(bstmt, 2, bindings[i].media_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(bstmt, 3, bindings[i].target_drive.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(bstmt, 4, bindings[i].slot_order);
+            if (sqlite3_step(bstmt) != SQLITE_DONE) {
+                ok = false;
+            }
+            sqlite3_finalize(bstmt);
+            if (!ok) break;
+        }
+    }
+
+    if (ok) {
+        if (!ExecuteSqlInternal("COMMIT;")) {
+            ExecuteSqlInternal("ROLLBACK;");
+            return false;
+        }
+        KioskUI::GetInstance().InvalidateCatalogCache();
+        return true;
+    }
+
+    ExecuteSqlInternal("ROLLBACK;");
+    return false;
+}
+
 bool KioskDatabase::UpdateMachine(const MachineRecord& machine) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_db || machine.id.empty()) return false;

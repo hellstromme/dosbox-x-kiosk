@@ -15,12 +15,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <limits>
+#include <random>
 #include <sstream>
 
 #if defined(_WIN32)
@@ -81,6 +83,7 @@ void ViewWizard::Reset() {
 
     std::snprintf(m_name_buf, sizeof(m_name_buf), "%s", m_draft.display_name.c_str());
     m_hdd_path_buf[0] = '\0';
+    m_custom_chs_buf[0] = '\0';
 }
 
 bool ViewWizard::SetStep(WizardStep step) {
@@ -104,8 +107,8 @@ bool ViewWizard::SetStep(WizardStep step) {
             if (m_create_blank_hdd_file) {
                 m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
             } else {
-                // Imported existing HDD image: preserve image's own geometry (omit -size)
-                m_draft.primary_hdd_chs.clear();
+                // Imported existing HDD image: use optional explicit CHS override, or leave empty for auto-detect
+                m_draft.primary_hdd_chs = m_custom_chs_buf;
             }
         }
     }
@@ -197,7 +200,14 @@ void ViewWizard::SetCreateBlankHddOnDisk(bool enable) {
     if (m_create_blank_hdd_file) {
         m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
     } else {
-        m_draft.primary_hdd_chs.clear();
+        m_draft.primary_hdd_chs = m_custom_chs_buf;
+    }
+}
+
+void ViewWizard::SetCustomHddChsOverride(const std::string& chs) {
+    std::snprintf(m_custom_chs_buf, sizeof(m_custom_chs_buf), "%s", chs.c_str());
+    if (!m_create_blank_hdd_file) {
+        m_draft.primary_hdd_chs = m_custom_chs_buf;
     }
 }
 
@@ -297,20 +307,27 @@ std::string ViewWizard::GenerateDefaultHddPath(const std::string& machine_name, 
 }
 
 std::string ViewWizard::GenerateMachineUuid(const std::string& seed) {
-    const uint32_t t = static_cast<uint32_t>(std::time(nullptr));
-    static std::atomic<uint32_t> counter(0);
-    const uint32_t seq = ++counter;
-    std::ostringstream ss;
-    ss << seed << "_" << t << "_" << seq;
-    const uint32_t h1 = DiskCaddyView::ComputeStringCrc32(ss.str());
-    const uint32_t h2 = DiskCaddyView::ComputeStringCrc32(ss.str() + "_mach");
-    char buf[40];
-    std::snprintf(buf, sizeof(buf), "mach-%08x-%04x-4%03x-8%03x-%08x",
-                  h1,
-                  (h2 >> 16) & 0xFFFFu,
-                  (h2 >> 4) & 0x0FFFu,
-                  (h1 ^ h2) & 0x0FFFu,
-                  h2 ^ (seq * 2654435761u));
+    static std::atomic<uint64_t> counter(0);
+    const uint64_t seq = ++counter;
+    const uint64_t now_ns = static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count()
+    );
+    std::random_device rd;
+    const uint64_t r1 = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+    const uint64_t r2 = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+    const uint64_t h = static_cast<uint64_t>(DiskCaddyView::ComputeStringCrc32(seed));
+    const uint64_t hi = r1 ^ now_ns ^ (seq * 0x9E3779B97F4A7C15ULL);
+    const uint64_t lo = r2 ^ (h << 32) ^ (seq * 0xBF58476D1CE4E5B9ULL);
+
+    char buf[44];
+    std::snprintf(buf, sizeof(buf), "mach-%08x-%04x-4%03x-%x%03x-%08x%04x",
+                  static_cast<unsigned int>((hi >> 32) & 0xFFFFFFFFu),
+                  static_cast<unsigned int>((hi >> 16) & 0xFFFFu),
+                  static_cast<unsigned int>(hi & 0x0FFFu),
+                  static_cast<unsigned int>(8u | ((lo >> 60) & 0x3u)),
+                  static_cast<unsigned int>((lo >> 48) & 0x0FFFu),
+                  static_cast<unsigned int>((lo >> 16) & 0xFFFFFFFFu),
+                  static_cast<unsigned int>(lo & 0xFFFFu));
     return std::string(buf);
 }
 
@@ -369,11 +386,27 @@ bool ViewWizard::CommitMachine(std::string& out_machine_id, std::string& out_err
 
     if (m_draft.boot_mode == "REAL_HDD_BOOT") {
         if (m_create_blank_hdd_file) {
-            if (m_draft.primary_hdd_path.empty()) {
-                m_draft.primary_hdd_path = GenerateDefaultHddPath(m_draft.display_name, m_draft.id);
-            }
+            const bool auto_generated_path = m_draft.primary_hdd_path.empty();
             std::string created_chs;
-            if (!CreateBlankHddImage(m_draft.primary_hdd_path, m_hdd_size_mb, created_chs)) {
+            bool hdd_created = false;
+
+            if (auto_generated_path) {
+                // Retry exclusive creation with fresh collision-resistant UUIDs if auto path collides
+                for (int attempt = 0; attempt < 5; ++attempt) {
+                    if (attempt > 0) {
+                        m_draft.id = GenerateMachineUuid(m_draft.display_name);
+                    }
+                    m_draft.primary_hdd_path = GenerateDefaultHddPath(m_draft.display_name, m_draft.id);
+                    if (CreateBlankHddImage(m_draft.primary_hdd_path, m_hdd_size_mb, created_chs)) {
+                        hdd_created = true;
+                        break;
+                    }
+                }
+            } else {
+                hdd_created = CreateBlankHddImage(m_draft.primary_hdd_path, m_hdd_size_mb, created_chs);
+            }
+
+            if (!hdd_created) {
                 out_error = "Failed to create blank HDD image (file may already exist or path is invalid): " + m_draft.primary_hdd_path;
                 m_last_error = out_error;
                 return false;
@@ -382,7 +415,7 @@ bool ViewWizard::CommitMachine(std::string& out_machine_id, std::string& out_err
             m_draft.os_installed = false;
             created_new_hdd_file = true;
         } else {
-            // Importing an existing HDD image: require existing file & preserve its native geometry
+            // Importing an existing HDD image: require existing file & preserve native geometry (or optional override)
             if (m_draft.primary_hdd_path.empty()) {
                 out_error = "Please specify an existing HDD image path or choose 'Create New Blank HDD Image'.";
                 m_last_error = out_error;
@@ -394,49 +427,35 @@ bool ViewWizard::CommitMachine(std::string& out_machine_id, std::string& out_err
                 m_last_error = out_error;
                 return false;
             }
-            m_draft.primary_hdd_chs.clear();
+            m_draft.primary_hdd_chs = m_custom_chs_buf;
             m_draft.os_installed = true;
         }
     }
 
-    if (!db.InsertMachine(m_draft)) {
-        if (created_new_hdd_file) {
-            std::remove(m_draft.primary_hdd_path.c_str());
-        }
-        out_error = "Failed to save machine record to catalog database.";
-        m_last_error = out_error;
-        return false;
-    }
-
-    // Bind optional installer media atomically (roll back machine if any binding fails)
-    bool bindings_ok = true;
+    // Build installer bindings list and persist machine + bindings atomically in a single SQLite transaction
+    std::vector<CaddyBindingRecord> requested_bindings;
     if (!m_installer_floppy_media_id.empty()) {
         CaddyBindingRecord b;
         b.machine_id = m_draft.id;
         b.media_id = m_installer_floppy_media_id;
         b.target_drive = "A";
         b.slot_order = 1;
-        if (!db.AddCaddyBinding(b)) {
-            bindings_ok = false;
-        }
+        requested_bindings.push_back(b);
     }
-    if (bindings_ok && !m_installer_cd_media_id.empty()) {
+    if (!m_installer_cd_media_id.empty()) {
         CaddyBindingRecord b;
         b.machine_id = m_draft.id;
         b.media_id = m_installer_cd_media_id;
         b.target_drive = "D";
         b.slot_order = 1;
-        if (!db.AddCaddyBinding(b)) {
-            bindings_ok = false;
-        }
+        requested_bindings.push_back(b);
     }
 
-    if (!bindings_ok) {
-        db.DeleteMachine(m_draft.id);
+    if (!db.InsertMachineWithBindings(m_draft, requested_bindings)) {
         if (created_new_hdd_file) {
             std::remove(m_draft.primary_hdd_path.c_str());
         }
-        out_error = "Failed to attach selected installer media; machine creation was rolled back.";
+        out_error = "Failed to save machine and installer bindings atomically to catalog database.";
         m_last_error = out_error;
         return false;
     }
@@ -641,8 +660,12 @@ void ViewWizard::RenderStep3OsStorage() {
             ImGui::PopStyleColor();
         } else {
             ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
-            ImGui::TextWrapped("Existing HDD image will keep its native MBR/partition geometry (DOSBox-X auto-detect).");
+            ImGui::TextWrapped("Existing HDD image uses DOSBox-X auto-detect by default; enter an explicit C,H,S override below only if your image lacks detectable geometry.");
             ImGui::PopStyleColor();
+            ImGui::SetNextItemWidth(220.0f);
+            if (ImGui::InputTextWithHint("Optional CHS Override", "e.g. 1015,16,63 (blank = auto)", m_custom_chs_buf, sizeof(m_custom_chs_buf))) {
+                m_draft.primary_hdd_chs = m_custom_chs_buf;
+            }
         }
     }
 
