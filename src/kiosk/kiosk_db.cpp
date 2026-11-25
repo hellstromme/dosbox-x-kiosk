@@ -275,6 +275,22 @@ bool KioskDatabase::SeedDefaultData() {
         sqlite3_finalize(check_stmt);
     }
 
+    // 3. Seed starter software_signatures for known DOS utilities / extenders (idempotent)
+    check_stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "SELECT COUNT(*) FROM software_signatures;", -1, &check_stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(check_stmt) == SQLITE_ROW && sqlite3_column_int(check_stmt, 0) == 0) {
+            const char* seed_sig_sql =
+                "INSERT OR IGNORE INTO software_signatures (exec_filename, file_size_bytes, header_crc32, detected_title, item_type, recommended_archetype) VALUES\n"
+                "('DOS4GW.EXE',   0, '00000000', 'DOS/4GW Protected Mode Extender', 'IGNORE_SYSTEM', NULL),\n"
+                "('DOS32A.EXE',   0, '00000000', 'DOS/32A Protected Mode Extender', 'IGNORE_SYSTEM', NULL),\n"
+                "('CWSDPMI.EXE',  0, '00000000', 'CWSDPMI DPMI Server',             'IGNORE_SYSTEM', NULL),\n"
+                "('UNIVBE.EXE',   0, '00000000', 'SciTech UniVBE Display Driver',   'IGNORE_SYSTEM', NULL),\n"
+                "('SETSOUND.EXE', 0, '00000000', 'Miles Sound System Config',       'IGNORE_SYSTEM', NULL);\n";
+            ExecuteSqlInternal(seed_sig_sql);
+        }
+        sqlite3_finalize(check_stmt);
+    }
+
     return true;
 }
 

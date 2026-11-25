@@ -8,6 +8,7 @@
 #include "../kiosk_main.h"
 #include "../kiosk_db.h"
 #include "../machine/archetypes.h"
+#include "../ingest/image_crawler.h"
 #include "logging.h"
 #include "imgui.h"
 
@@ -807,6 +808,38 @@ void ViewCarousel::RenderMachinesTab() {
             if (ImGui::Button("Boot Machine [Enter/A]", ImVec2(175.0f, 34.0f))) {
                 KioskManager::GetInstance().RequestLaunchMachine(mach.id);
             }
+            if (!mach.primary_hdd_path.empty()) {
+                wrap_mach(135.0f);
+                if (ImGui::Button("Scan Software", ImVec2(135.0f, 34.0f))) {
+                    ImageCrawler::CrawlSummary summary;
+                    if (ImageCrawler::ScanAndCatalogMachine(mach.id, "", summary)) {
+                        ui.InvalidateCatalogCache();
+                        char toast_buf[192];
+                        if (summary.newly_inserted > 0) {
+                            std::snprintf(toast_buf, sizeof(toast_buf),
+                                          "Scanned '%s': +%d new title%s (%d icon%s)",
+                                          mach.display_name.c_str(),
+                                          summary.newly_inserted,
+                                          summary.newly_inserted == 1 ? "" : "s",
+                                          summary.icons_extracted,
+                                          summary.icons_extracted == 1 ? "" : "s");
+                        } else if (summary.skipped_duplicates > 0) {
+                            std::snprintf(toast_buf, sizeof(toast_buf),
+                                          "Scanned '%s': all %d title%s already cataloged",
+                                          mach.display_name.c_str(),
+                                          summary.skipped_duplicates,
+                                          summary.skipped_duplicates == 1 ? "" : "s");
+                        } else {
+                            std::snprintf(toast_buf, sizeof(toast_buf),
+                                          "Scanned '%s': no new software found",
+                                          mach.display_name.c_str());
+                        }
+                        ui.ShowToast(toast_buf, 4.0f);
+                    } else {
+                        ui.ShowToast("Scan failed: " + summary.error_message, 4.0f);
+                    }
+                }
+            }
             wrap_mach(145.0f);
             if (ImGui::Button("Session Caddy [C]", ImVec2(145.0f, 34.0f))) {
                 m_show_caddy_modal = true;
@@ -1008,6 +1041,33 @@ void ViewCarousel::RenderContextActionsModal() {
                         ui.InvalidateCatalogCache();
                         ui.ShowToast(rec.is_favorite ? "Added to Favorites" : "Removed from Favorites");
                     }
+                }
+                m_show_context_modal = false;
+                ImGui::CloseCurrentPopup();
+            }
+        } else {
+            if (ImGui::Button("Scan Disk for Software", ImVec2(-1.0f, 32.0f))) {
+                ImageCrawler::CrawlSummary summary;
+                if (ImageCrawler::ScanAndCatalogMachine(m_context_modal_target_id, "", summary)) {
+                    ui.InvalidateCatalogCache();
+                    char toast_buf[192];
+                    if (summary.newly_inserted > 0) {
+                        std::snprintf(toast_buf, sizeof(toast_buf),
+                                      "Scanned '%s': +%d new title%s (%d icon%s)",
+                                      m_context_modal_target_name.c_str(),
+                                      summary.newly_inserted,
+                                      summary.newly_inserted == 1 ? "" : "s",
+                                      summary.icons_extracted,
+                                      summary.icons_extracted == 1 ? "" : "s");
+                    } else {
+                        std::snprintf(toast_buf, sizeof(toast_buf),
+                                      "Scanned '%s': no new software found (%d already cataloged)",
+                                      m_context_modal_target_name.c_str(),
+                                      summary.skipped_duplicates);
+                    }
+                    ui.ShowToast(toast_buf, 4.0f);
+                } else {
+                    ui.ShowToast("Scan failed: " + summary.error_message, 4.0f);
                 }
                 m_show_context_modal = false;
                 ImGui::CloseCurrentPopup();

@@ -8,6 +8,8 @@
 #include "machine/config_synthesizer.h"
 #include "machine/kioskext_bin.h"
 #include "machine/boot_injector.h"
+#include "ingest/signature_matcher.h"
+#include "ingest/image_crawler.h"
 #include "ui/kiosk_ui.h"
 #include "ui/input_router.h"
 #include "ui/view_watchdog.h"
@@ -2618,6 +2620,682 @@ TEST(KioskWatchdogTest, ResolvesPreviewAndRendersAllShellStatesHeadless) {
     EXPECT_EQ(ui.GetActiveToastMessage(), "Phase 5 Verification Toast");
 
     KioskManager::GetInstance().Shutdown();
+    KioskDatabase::GetInstance().Close();
+}
+
+// ============================================================================
+// Phase 6: Non-Destructive FAT Disk Crawler, Shortcut & Icon Extractors
+// ============================================================================
+
+namespace {
+
+void TestWriteLe16(uint8_t* p, uint16_t v) {
+    p[0] = static_cast<uint8_t>(v & 0xFFu);
+    p[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+}
+
+void TestWriteLe32(uint8_t* p, uint32_t v) {
+    p[0] = static_cast<uint8_t>(v & 0xFFu);
+    p[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+    p[2] = static_cast<uint8_t>((v >> 16) & 0xFFu);
+    p[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
+}
+
+uint8_t TestFat83Checksum(const uint8_t name11[11]) {
+    uint8_t sum = 0;
+    for (int i = 0; i < 11; ++i) {
+        sum = static_cast<uint8_t>(((sum & 1u) ? 0x80u : 0u) + (sum >> 1) + name11[i]);
+    }
+    return sum;
+}
+
+void TestWriteDirEntry83(
+    uint8_t* slot,
+    const char name11[11],
+    uint8_t attr,
+    uint32_t first_cluster,
+    uint32_t file_size
+) {
+    std::memset(slot, 0, 32);
+    std::memcpy(slot, name11, 11);
+    slot[11] = attr;
+    TestWriteLe16(slot + 20, static_cast<uint16_t>((first_cluster >> 16) & 0xFFFFu));
+    TestWriteLe16(slot + 26, static_cast<uint16_t>(first_cluster & 0xFFFFu));
+    TestWriteLe32(slot + 28, file_size);
+}
+
+void TestWriteSingleLfnEntry(
+    uint8_t* slot,
+    const std::string& ascii_lfn,
+    uint8_t short_checksum
+) {
+    std::memset(slot, 0xFF, 32);
+    slot[0] = 0x41; // Last & first LFN entry (ord = 1 | 0x40)
+    slot[11] = 0x0F;
+    slot[12] = 0x00;
+    slot[13] = short_checksum;
+    slot[26] = 0x00;
+    slot[27] = 0x00;
+
+    uint16_t chars[13];
+    for (int i = 0; i < 13; ++i) {
+        if (static_cast<size_t>(i) < ascii_lfn.size()) {
+            chars[i] = static_cast<uint8_t>(ascii_lfn[static_cast<size_t>(i)]);
+        } else if (static_cast<size_t>(i) == ascii_lfn.size()) {
+            chars[i] = 0x0000;
+        } else {
+            chars[i] = 0xFFFF;
+        }
+    }
+    for (int k = 0; k < 5; ++k)  TestWriteLe16(slot + 1 + k * 2, chars[k]);
+    for (int k = 0; k < 6; ++k)  TestWriteLe16(slot + 14 + k * 2, chars[5 + k]);
+    for (int k = 0; k < 2; ++k)  TestWriteLe16(slot + 28 + k * 2, chars[11 + k]);
+}
+
+std::vector<uint8_t> BuildSynthetic4bppIconDib(int w, int h) {
+    // 40-byte BITMAPINFOHEADER + 16*4 palette + XOR (4bpp) + AND (1bpp)
+    const size_t xor_stride = ((static_cast<size_t>(w) * 4U + 31U) / 32U) * 4U;
+    const size_t and_stride = ((static_cast<size_t>(w) + 31U) / 32U) * 4U;
+    const size_t total = 40U + 64U + xor_stride * h + and_stride * h;
+    std::vector<uint8_t> dib(total, 0);
+
+    TestWriteLe32(dib.data() + 0, 40);
+    TestWriteLe32(dib.data() + 4, static_cast<uint32_t>(w));
+    TestWriteLe32(dib.data() + 8, static_cast<uint32_t>(h * 2));
+    TestWriteLe16(dib.data() + 12, 1);
+    TestWriteLe16(dib.data() + 14, 4);
+    TestWriteLe32(dib.data() + 32, 16);
+
+    // Palette entry 1 = bright red (B=0, G=0, R=255)
+    dib[40 + 4 + 0] = 0x00;
+    dib[40 + 4 + 1] = 0x00;
+    dib[40 + 4 + 2] = 0xFF;
+
+    // Fill XOR pixels with palette index 1
+    std::memset(dib.data() + 104, 0x11, xor_stride * h);
+    // Leave AND mask 0 (opaque), except top-left pixel transparent (bottom-up row h-1, bit 7)
+    dib[104 + xor_stride * h + (h - 1) * and_stride] = 0x80;
+    return dib;
+}
+
+std::vector<uint8_t> BuildSynthetic8bppIconDib(int w, int h) {
+    const size_t xor_stride = ((static_cast<size_t>(w) * 8U + 31U) / 32U) * 4U;
+    const size_t and_stride = ((static_cast<size_t>(w) + 31U) / 32U) * 4U;
+    const size_t total = 40U + 256U * 4U + xor_stride * h + and_stride * h;
+    std::vector<uint8_t> dib(total, 0);
+
+    TestWriteLe32(dib.data() + 0, 40);
+    TestWriteLe32(dib.data() + 4, static_cast<uint32_t>(w));
+    TestWriteLe32(dib.data() + 8, static_cast<uint32_t>(h * 2));
+    TestWriteLe16(dib.data() + 12, 1);
+    TestWriteLe16(dib.data() + 14, 8);
+    TestWriteLe32(dib.data() + 32, 256);
+
+    // Palette entry 2 = bright green (B=0, G=255, R=0)
+    dib[40 + 8 + 1] = 0xFF;
+    std::memset(dib.data() + 40 + 1024, 0x02, xor_stride * h);
+    return dib;
+}
+
+bool VerifyPngHeaderAndDimensions(const std::string& png_path, uint32_t expected_w, uint32_t expected_h) {
+    std::FILE* f = std::fopen(png_path.c_str(), "rb");
+    if (!f) return false;
+    uint8_t hdr[24];
+    size_t n = std::fread(hdr, 1, sizeof(hdr), f);
+    std::fclose(f);
+    if (n < 24) return false;
+    static const uint8_t kSig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (std::memcmp(hdr, kSig, 8) != 0) return false;
+    uint32_t w = (static_cast<uint32_t>(hdr[16]) << 24) | (static_cast<uint32_t>(hdr[17]) << 16) |
+                 (static_cast<uint32_t>(hdr[18]) << 8) | hdr[19];
+    uint32_t h = (static_cast<uint32_t>(hdr[20]) << 24) | (static_cast<uint32_t>(hdr[21]) << 16) |
+                 (static_cast<uint32_t>(hdr[22]) << 8) | hdr[23];
+    return (w == expected_w && h == expected_h);
+}
+
+// Helper to build a minimal MBR + FAT16 image on disk with custom directory layout
+bool WriteSyntheticFat16HddImage(const std::string& out_path) {
+    // 64 sectors MBR gap + 10000 sectors FAT16 partition (~5.1MB, > 4085 clusters)
+    const uint32_t part_lba = 63;
+    const uint32_t part_secs = 9000;
+    const uint32_t total_secs = part_lba + part_secs;
+    std::vector<uint8_t> img(static_cast<size_t>(total_secs) * 512U, 0);
+
+    // 1. MBR at LBA 0
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    uint8_t* p0 = img.data() + 0x1BE;
+    p0[0] = 0x80; // Active
+    p0[4] = 0x06; // FAT16
+    TestWriteLe32(p0 + 8, part_lba);
+    TestWriteLe32(p0 + 12, part_secs);
+
+    // 2. FAT16 VBR at part_lba: 1 sec/cluster, 1 reserved, 2 FATs x 36 secs, 256 root entries (16 secs)
+    // Data sectors = 9000 - (1 + 72 + 16) = 8911 clusters (> 4085, < 65525 -> FAT16)
+    uint8_t* vbr = img.data() + static_cast<size_t>(part_lba) * 512U;
+    vbr[0] = 0xEB; vbr[1] = 0x3C; vbr[2] = 0x90;
+    TestWriteLe16(vbr + 11, 512);
+    vbr[13] = 1;
+    TestWriteLe16(vbr + 14, 1);
+    vbr[16] = 2;
+    TestWriteLe16(vbr + 17, 256);
+    TestWriteLe16(vbr + 19, static_cast<uint16_t>(part_secs));
+    vbr[21] = 0xF8;
+    TestWriteLe16(vbr + 22, 36);
+    vbr[510] = 0x55; vbr[511] = 0xAA;
+
+    const uint32_t fat_lba = part_lba + 1;
+    const uint32_t root_lba = fat_lba + 72;
+    const uint32_t data_lba = root_lba + 16;
+
+    auto set_fat16 = [&](uint16_t clus, uint16_t val) {
+        TestWriteLe16(img.data() + static_cast<size_t>(fat_lba) * 512U + clus * 2U, val);
+    };
+    auto clus_ptr = [&](uint16_t clus) -> uint8_t* {
+        return img.data() + static_cast<size_t>(data_lba + (clus - 2)) * 512U;
+    };
+
+    set_fat16(0, 0xFFF8);
+    set_fat16(1, 0xFFFF);
+
+    // Root entries:
+    //  - \DOS (cluster 2) -> pruned system dir
+    //  - \DOOM2 (cluster 3) -> game dir with DOOM2.EXE (clus 4), SETUP.EXE (clus 5), DOS4GW.EXE (clus 6)
+    //  - \MYAPP (cluster 7, with VFAT LFN "My Retro App") -> MYAPP.BAT (clus 8) calling CORE.EXE (clus 9)
+    uint8_t* root = img.data() + static_cast<size_t>(root_lba) * 512U;
+    TestWriteDirEntry83(root + 0,  "DOS        ", 0x10, 2, 0);
+    TestWriteDirEntry83(root + 32, "DOOM2      ", 0x10, 3, 0);
+
+    uint8_t lfn_short[11];
+    std::memcpy(lfn_short, "MYAPP      ", 11);
+    TestWriteSingleLfnEntry(root + 64, "My Retro App", TestFat83Checksum(lfn_short));
+    TestWriteDirEntry83(root + 96, "MYAPP      ", 0x10, 7, 0);
+
+    // Cluster 2 (\DOS): EDIT.COM (cluster 10) - should be pruned
+    set_fat16(2, 0xFFFF);
+    TestWriteDirEntry83(clus_ptr(2), "EDIT    COM", 0x20, 10, 16);
+    set_fat16(10, 0xFFFF);
+    std::memcpy(clus_ptr(10), "EDIT_DOS_UTILITY", 16);
+
+    // Cluster 3 (\DOOM2): DOOM2.EXE (clus 4), SETUP.EXE (clus 5), DOS4GW.EXE (clus 6)
+    set_fat16(3, 0xFFFF);
+    TestWriteDirEntry83(clus_ptr(3) + 0,  "DOOM2   EXE", 0x20, 4, 256);
+    TestWriteDirEntry83(clus_ptr(3) + 32, "SETUP   EXE", 0x20, 5, 128);
+    TestWriteDirEntry83(clus_ptr(3) + 64, "DOS4GW  EXE", 0x20, 6, 128);
+
+    set_fat16(4, 0xFFFF);
+    uint8_t* doom = clus_ptr(4);
+    doom[0] = 'M'; doom[1] = 'Z';
+    TestWriteLe32(doom + 0x3C, 0x80);
+    doom[0x80] = 'L'; doom[0x81] = 'E';
+    std::memcpy(doom + 0x90, "Copyright (C) 1994 id Software.", 31);
+
+    set_fat16(5, 0xFFFF);
+    clus_ptr(5)[0] = 'M'; clus_ptr(5)[1] = 'Z';
+    set_fat16(6, 0xFFFF);
+    clus_ptr(6)[0] = 'M'; clus_ptr(6)[1] = 'Z';
+
+    // Cluster 7 (\My Retro App): PLAY.BAT (clus 8) calling CORE.EXE (clus 9)
+    set_fat16(7, 0xFFFF);
+    const char* bat_txt = "@ECHO OFF\r\nCORE.EXE /VGA\r\n";
+    TestWriteDirEntry83(clus_ptr(7) + 0,  "PLAY    BAT", 0x20, 8, static_cast<uint32_t>(std::strlen(bat_txt)));
+    TestWriteDirEntry83(clus_ptr(7) + 32, "CORE    EXE", 0x20, 9, 128);
+    set_fat16(8, 0xFFFF);
+    std::memcpy(clus_ptr(8), bat_txt, std::strlen(bat_txt));
+    set_fat16(9, 0xFFFF);
+    clus_ptr(9)[0] = 'M'; clus_ptr(9)[1] = 'Z';
+
+    std::FILE* f = std::fopen(out_path.c_str(), "wb");
+    if (!f) return false;
+    size_t written = std::fwrite(img.data(), 1, img.size(), f);
+    std::fclose(f);
+    return written == img.size();
+}
+
+} // anonymous namespace
+
+TEST(KioskCrawlerTest, Fat12SuperfloppyAndReadOnlyVfs) {
+    // Synthesize a valid 1.44MB FAT12 dispatch floppy via BootInjector
+    std::string img_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fat12.img";
+    std::string bat = "@ECHO OFF\r\nECHO HELLO FAT12\r\n";
+    DispatchFileEntry dfe;
+    dfe.filename_8_3 = "KIOSKGO.BAT";
+    dfe.data.assign(bat.begin(), bat.end());
+    std::vector<uint8_t> fat12_bytes;
+    ASSERT_TRUE(BootInjector::GetInstance().BuildFat12ImageInMemory({dfe}, fat12_bytes));
+    std::FILE* f = std::fopen(img_path.c_str(), "wb");
+    ASSERT_NE(f, nullptr);
+    ASSERT_EQ(std::fwrite(fat12_bytes.data(), 1, fat12_bytes.size(), f), fat12_bytes.size());
+    std::fclose(f);
+
+    FatReadOnlyVfs vfs;
+    ASSERT_TRUE(vfs.OpenImageFile(img_path));
+    EXPECT_TRUE(vfs.IsWriteProtected());
+    EXPECT_EQ(vfs.GetFilesystemType(), FilesystemType::FAT12);
+    EXPECT_EQ(vfs.GetPartitionLbaStart(), 0u);
+
+    FatDirEntry entry;
+    ASSERT_TRUE(vfs.FindPath("C:\\KIOSKGO.BAT", entry));
+    EXPECT_FALSE(entry.is_directory);
+    std::vector<uint8_t> content;
+    ASSERT_TRUE(vfs.ReadFile(entry, content));
+    std::string text(reinterpret_cast<const char*>(content.data()), content.size());
+    EXPECT_NE(text.find("HELLO FAT12"), std::string::npos);
+
+    vfs.Close();
+    std::remove(img_path.c_str());
+}
+
+TEST(KioskCrawlerTest, Fat16MbrVfatLfnPruningAndScoring) {
+    KioskDatabase::GetInstance().Open(":memory:");
+    const std::string hdd_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fat16.img";
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd_path));
+
+    FatReadOnlyVfs vfs;
+    ASSERT_TRUE(vfs.OpenImageFile(hdd_path));
+    EXPECT_EQ(vfs.GetFilesystemType(), FilesystemType::FAT16);
+    EXPECT_EQ(vfs.GetPartitionLbaStart(), 63u);
+
+    // Verify VFAT LFN reconstruction
+    FatDirEntry lfn_dir;
+    ASSERT_TRUE(vfs.FindPath("C:\\My Retro App", lfn_dir));
+    EXPECT_TRUE(lfn_dir.is_directory);
+    EXPECT_EQ(lfn_dir.name, "My Retro App");
+    EXPECT_EQ(lfn_dir.short_name, "MYAPP");
+
+    // Run full crawler on the synthetic image
+    std::vector<ImageCrawler::CrawlResult> found = ImageCrawler::ScanMountedVfs(vfs);
+    ASSERT_EQ(found.size(), 2U);
+
+    bool saw_doom = false;
+    bool saw_bat = false;
+    for (size_t i = 0; i < found.size(); ++i) {
+        EXPECT_NE(found[i].executable, "EDIT.COM");
+        EXPECT_NE(found[i].executable, "SETUP.EXE");
+        EXPECT_NE(found[i].executable, "DOS4GW.EXE");
+        if (found[i].executable == "DOOM2.EXE") {
+            saw_doom = true;
+            EXPECT_EQ(found[i].release_year, 1994);
+            EXPECT_EQ(found[i].developer, "id Software");
+        }
+        if (found[i].executable == "PLAY.BAT") {
+            saw_bat = true;
+            EXPECT_EQ(found[i].working_dir, "C:\\My Retro App");
+        }
+    }
+    EXPECT_TRUE(saw_doom);
+    EXPECT_TRUE(saw_bat);
+
+    vfs.Close();
+    std::remove(hdd_path.c_str());
+    KioskDatabase::GetInstance().Close();
+}
+
+TEST(KioskCrawlerTest, Fat32MbrClusterChainAndCycleProtection) {
+    // Build a minimal in-memory FAT32 disk image (via imageDiskMemory or temp file)
+    // FAT32 requires >= 65525 clusters. We create a sparse/small raw file of 300 sectors
+    // with BPB reporting 70000 clusters so FatReadOnlyVfs classifies FAT32 without allocating 35MB.
+    const std::string img_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fat32.img";
+    const uint32_t part_lba = 32;
+    const uint32_t rsvd_secs = 32;
+    const uint32_t fat_secs = 16;
+    const uint32_t data_lba = part_lba + rsvd_secs + fat_secs; // 80
+    std::vector<uint8_t> img(200U * 512U, 0);
+
+    // MBR
+    img[510] = 0x55; img[511] = 0xAA;
+    img[0x1BE + 0] = 0x80;
+    img[0x1BE + 4] = 0x0C; // FAT32 LBA
+    TestWriteLe32(img.data() + 0x1BE + 8, part_lba);
+    TestWriteLe32(img.data() + 0x1BE + 12, 70100);
+
+    // FAT32 VBR
+    uint8_t* vbr = img.data() + part_lba * 512U;
+    vbr[0] = 0xEB; vbr[1] = 0x58; vbr[2] = 0x90;
+    TestWriteLe16(vbr + 11, 512);
+    vbr[13] = 1;
+    TestWriteLe16(vbr + 14, rsvd_secs);
+    vbr[16] = 1; // 1 FAT
+    TestWriteLe16(vbr + 17, 0); // FAT32 root entries = 0
+    TestWriteLe32(vbr + 32, 70100);
+    TestWriteLe32(vbr + 36, fat_secs);
+    TestWriteLe32(vbr + 44, 2); // Root cluster = 2
+    vbr[510] = 0x55; vbr[511] = 0xAA;
+
+    // FAT32 table at part_lba + rsvd_secs
+    uint8_t* fat = img.data() + (part_lba + rsvd_secs) * 512U;
+    TestWriteLe32(fat + 0 * 4, 0x0FFFFFF8u);
+    TestWriteLe32(fat + 1 * 4, 0x0FFFFFFFu);
+    TestWriteLe32(fat + 2 * 4, 0x0FFFFFFFu); // Root dir ends after cluster 2
+    TestWriteLe32(fat + 3 * 4, 4);           // GOOD.TXT: cluster 3 -> cluster 4 -> EOC
+    TestWriteLe32(fat + 4 * 4, 0x0FFFFFFFu);
+    TestWriteLe32(fat + 5 * 4, 6);           // LOOP.BIN: cluster 5 -> 6 -> 5 (intentional cycle!)
+    TestWriteLe32(fat + 6 * 4, 5);
+
+    // Root dir at cluster 2 (data_lba + 0)
+    uint8_t* root = img.data() + data_lba * 512U;
+    TestWriteDirEntry83(root + 0,  "GOOD    TXT", 0x20, 3, 600);
+    TestWriteDirEntry83(root + 32, "LOOP    BIN", 0x20, 5, 4096);
+
+    // Cluster 3 + Cluster 4 payload
+    std::memset(img.data() + (data_lba + 1) * 512U, 'A', 512);
+    std::memset(img.data() + (data_lba + 2) * 512U, 'B', 512);
+
+    std::FILE* f = std::fopen(img_path.c_str(), "wb");
+    ASSERT_NE(f, nullptr);
+    ASSERT_EQ(std::fwrite(img.data(), 1, img.size(), f), img.size());
+    std::fclose(f);
+
+    FatReadOnlyVfs vfs;
+    ASSERT_TRUE(vfs.OpenImageFile(img_path));
+    EXPECT_EQ(vfs.GetFilesystemType(), FilesystemType::FAT32);
+
+    FatDirEntry good_entry;
+    ASSERT_TRUE(vfs.FindPath("\\GOOD.TXT", good_entry));
+    std::vector<uint8_t> good_data;
+    ASSERT_TRUE(vfs.ReadFile(good_entry, good_data));
+    ASSERT_EQ(good_data.size(), 600U);
+    EXPECT_EQ(good_data[0], 'A');
+    EXPECT_EQ(good_data[512], 'B');
+
+    // Cycle-protected read terminates cleanly after 2 unique clusters (1024 bytes)
+    FatDirEntry loop_entry;
+    ASSERT_TRUE(vfs.FindPath("\\LOOP.BIN", loop_entry));
+    std::vector<uint8_t> loop_data;
+    ASSERT_TRUE(vfs.ReadFile(loop_entry, loop_data));
+    EXPECT_EQ(loop_data.size(), 1024U);
+
+    vfs.Close();
+    std::remove(img_path.c_str());
+}
+
+TEST(KioskCrawlerTest, Dos4gwStubStrippingFingerprintAndSignatureMatch) {
+    KioskDatabase::GetInstance().Open(":memory:");
+
+    // Build two synthetic 32KB EXEs with an IDENTICAL 26KB DOS/4GW stub,
+    // differing only in their embedded LE payload at offset 26624 (0x6800).
+    const size_t stub_size = 26624;
+    std::vector<uint8_t> exe_a(stub_size + 4096, 0x90);
+    exe_a[0] = 'M'; exe_a[1] = 'Z';
+    TestWriteLe16(exe_a.data() + 0x02, 0);
+    TestWriteLe16(exe_a.data() + 0x04, static_cast<uint16_t>(stub_size / 512));
+    TestWriteLe32(exe_a.data() + 0x3C, static_cast<uint32_t>(stub_size));
+    std::memcpy(exe_a.data() + 0x100, "DOS/4GW Protected Mode Run-time", 31);
+
+    std::vector<uint8_t> exe_b = exe_a;
+
+    // Distinct LE payloads
+    exe_a[stub_size] = 'L'; exe_a[stub_size + 1] = 'E';
+    std::memcpy(exe_a.data() + stub_size + 16, "DOOM_II_ENGINE_CODE", 19);
+
+    exe_b[stub_size] = 'L'; exe_b[stub_size + 1] = 'E';
+    std::memcpy(exe_b.data() + stub_size + 16, "DUKE3D_BUILD_ENGINE", 19);
+
+    ExecutableFingerprint fp_a, fp_b;
+    ASSERT_TRUE(SignatureMatcher::ComputeExecutableFingerprint(exe_a.data(), exe_a.size(), "GAME.EXE", fp_a));
+    ASSERT_TRUE(SignatureMatcher::ComputeExecutableFingerprint(exe_b.data(), exe_b.size(), "GAME.EXE", fp_b));
+
+    EXPECT_EQ(fp_a.format, KioskExecFormat::DOS_LE);
+    EXPECT_TRUE(fp_a.has_dos_extender_stub);
+    EXPECT_EQ(fp_a.payload_offset, stub_size);
+    EXPECT_NE(fp_a.header_crc32, fp_b.header_crc32);
+
+    // Register fp_a in software_signatures and confirm Tier 1 match
+    SoftwareSignatureRecord sig;
+    sig.exec_filename = "GAME.EXE";
+    sig.file_size_bytes = static_cast<int64_t>(exe_a.size());
+    sig.header_crc32 = fp_a.header_crc32;
+    sig.detected_title = "DOOM II: Hell on Earth";
+    sig.item_type = "GAME";
+    sig.recommended_archetype = KioskArchetypes::DX2_486;
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertSoftwareSignature(sig));
+
+    SoftwareSignatureRecord matched;
+    EXPECT_TRUE(SignatureMatcher::MatchSignature("C:\\DOOM2\\game.exe", fp_a, matched));
+    EXPECT_EQ(matched.detected_title, "DOOM II: Hell on Earth");
+    EXPECT_FALSE(SignatureMatcher::MatchSignature("C:\\DUKE3D\\game.exe", fp_b, matched));
+
+    KioskDatabase::GetInstance().Close();
+}
+
+TEST(KioskCrawlerTest, Win31GrpParserAndEmbeddedIcon) {
+    // Build a minimal valid Windows 3.1 "PMCC" .GRP buffer with 1 item + 16x16 embedded 4bpp icon
+    std::vector<uint8_t> grp(512, 0);
+    std::memcpy(grp.data(), "PMCC", 4);
+    TestWriteLe16(grp.data() + 6, static_cast<uint16_t>(grp.size()));
+    TestWriteLe16(grp.data() + 20, 40); // pName = offset 40 ("Games")
+    TestWriteLe16(grp.data() + 30, 1);  // cItems = 1
+    TestWriteLe16(grp.data() + 32, 64); // Item 0 offset = 64
+
+    std::memcpy(grp.data() + 40, "Games", 6);
+
+    // Win31ItemData at offset 64 (24 bytes)
+    uint8_t* it = grp.data() + 64;
+    TestWriteLe16(it + 4, 0);    // iIcon
+    TestWriteLe16(it + 6, 12);   // cbHeader
+    TestWriteLe16(it + 8, 32);   // cbANDPlane (16x16 @ 1bpp = 32 bytes)
+    TestWriteLe16(it + 10, 128); // cbXORPlane (16x16 @ 4bpp = 128 bytes)
+    TestWriteLe16(it + 12, 160); // pHeader
+    TestWriteLe16(it + 14, 172); // pANDPlane
+    TestWriteLe16(it + 16, 204); // pXORPlane
+    TestWriteLe16(it + 18, 96);  // pName
+    TestWriteLe16(it + 20, 112); // pCommand
+    TestWriteLe16(it + 22, 140); // pIconPath
+
+    std::memcpy(grp.data() + 96, "Civilization", 13);
+    std::memcpy(grp.data() + 112, "C:\\CIV\\CIV.EXE /VGA", 20);
+    std::memcpy(grp.data() + 140, "C:\\CIV\\CIV.EXE", 15);
+
+    // CURSORSHAPE header at 160: w=16, h=16, widthBytes=8, planes=1, bpp=4
+    TestWriteLe16(grp.data() + 164, 16);
+    TestWriteLe16(grp.data() + 166, 16);
+    TestWriteLe16(grp.data() + 168, 8);
+    grp[170] = 1;
+    grp[171] = 4;
+    std::memset(grp.data() + 204, 0x99, 128); // Bright red pixels
+
+    std::vector<Win31GrpItem> items;
+    ASSERT_TRUE(ImageCrawler::ParseWin31GrpBuffer(grp.data(), grp.size(), items));
+    ASSERT_EQ(items.size(), 1U);
+    EXPECT_EQ(items[0].group_title, "Games");
+    EXPECT_EQ(items[0].title, "Civilization");
+    EXPECT_EQ(items[0].executable, "C:\\CIV\\CIV.EXE");
+    EXPECT_EQ(items[0].arguments, "/VGA");
+    EXPECT_EQ(items[0].embedded_icon_w, 16);
+    EXPECT_EQ(items[0].embedded_icon_h, 16);
+    EXPECT_EQ(items[0].embedded_rgba.size(), 16U * 16U * 4U);
+
+    const std::string out_png = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".grp.png";
+    ASSERT_TRUE(ImageCrawler::WriteRgbaPng(out_png, 16, 16, items[0].embedded_rgba));
+    EXPECT_TRUE(VerifyPngHeaderAndDimensions(out_png, 16, 16));
+    std::remove(out_png.c_str());
+}
+
+TEST(KioskCrawlerTest, Win9xLnkParserAnsiAndUnicode) {
+    // Build a valid [MS-SHLLINK] .LNK buffer with IDList + LinkInfo + Unicode StringData
+    std::vector<uint8_t> lnk(0x4C, 0);
+    TestWriteLe32(lnk.data() + 0, 0x4C);
+    static const uint8_t kClsid[16] = {
+        0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46
+    };
+    std::memcpy(lnk.data() + 4, kClsid, 16);
+    // Flags: HasIDList(0x01) | HasLinkInfo(0x02) | HasWorkingDir(0x10) | HasArgs(0x20) | HasIcon(0x40) | IsUnicode(0x80)
+    TestWriteLe32(lnk.data() + 0x14, 0x01u | 0x02u | 0x10u | 0x20u | 0x40u | 0x80u);
+    TestWriteLe32(lnk.data() + 0x38, 2); // IconIndex = 2
+
+    // Dummy 4-byte IDList
+    lnk.push_back(0x04); lnk.push_back(0x00);
+    lnk.insert(lnk.end(), 4, 0x00);
+
+    // LinkInfo block with LocalBasePath = "C:\\GRIM\\GRIM.EXE"
+    const std::string base_path = "C:\\GRIM\\GRIM.EXE";
+    const uint32_t li_hdr_sz = 0x1C;
+    const uint32_t li_sz = li_hdr_sz + static_cast<uint32_t>(base_path.size()) + 2;
+    size_t li_pos = lnk.size();
+    lnk.resize(li_pos + li_sz, 0);
+    TestWriteLe32(lnk.data() + li_pos + 0, li_sz);
+    TestWriteLe32(lnk.data() + li_pos + 4, li_hdr_sz);
+    TestWriteLe32(lnk.data() + li_pos + 8, 0x01u); // VolumeIDAndLocalBasePath
+    TestWriteLe32(lnk.data() + li_pos + 16, li_hdr_sz);
+    TestWriteLe32(lnk.data() + li_pos + 24, li_hdr_sz + static_cast<uint32_t>(base_path.size()) + 1);
+    std::memcpy(lnk.data() + li_pos + li_hdr_sz, base_path.c_str(), base_path.size() + 1);
+
+    auto append_u16_str = [&](const std::string& s) {
+        size_t p = lnk.size();
+        lnk.resize(p + 2 + s.size() * 2, 0);
+        TestWriteLe16(lnk.data() + p, static_cast<uint16_t>(s.size()));
+        for (size_t i = 0; i < s.size(); ++i) {
+            lnk[p + 2 + i * 2] = static_cast<uint8_t>(s[i]);
+        }
+    };
+    append_u16_str("C:\\GRIM");
+    append_u16_str("-fullscreen");
+    append_u16_str("C:\\GRIM\\GRIM.ICO");
+
+    Win9xLnkInfo info;
+    ASSERT_TRUE(ImageCrawler::ParseWin9xLnkBuffer(lnk.data(), lnk.size(), info));
+    EXPECT_EQ(info.target_path, "C:\\GRIM\\GRIM.EXE");
+    EXPECT_EQ(info.working_dir, "C:\\GRIM");
+    EXPECT_EQ(info.arguments, "-fullscreen");
+    EXPECT_EQ(info.icon_location, "C:\\GRIM\\GRIM.ICO");
+    EXPECT_EQ(info.icon_index, 2);
+}
+
+TEST(KioskCrawlerTest, NeAndPeIconExtractionSelectsBestVariant) {
+    const std::vector<uint8_t> dib_16x16 = BuildSynthetic4bppIconDib(16, 16);
+    const std::vector<uint8_t> dib_32x32 = BuildSynthetic8bppIconDib(32, 32);
+
+    // --- 1. Synthetic 16-bit NE executable with RT_GROUP_ICON (16x16 4bpp + 32x32 8bpp) ---
+    std::vector<uint8_t> ne(8192, 0);
+    ne[0] = 'M'; ne[1] = 'Z';
+    TestWriteLe32(ne.data() + 0x3C, 0x80);
+    ne[0x80] = 'N'; ne[0x81] = 'E';
+    TestWriteLe16(ne.data() + 0x80 + 0x24, 0x40); // ne_rsrctab = 0xC0
+
+    // Resource table at 0xC0, align_shift = 4 (16-byte alignment)
+    size_t rt = 0xC0;
+    TestWriteLe16(ne.data() + rt, 4);
+    size_t p = rt + 2;
+    // Type 0x800E (RT_GROUP_ICON), count = 1, offset = 0x200 >> 4 = 0x20, len = 0x40 >> 4 = 4
+    TestWriteLe16(ne.data() + p + 0, 0x800Eu);
+    TestWriteLe16(ne.data() + p + 2, 1);
+    p += 8;
+    TestWriteLe16(ne.data() + p + 0, 0x20);
+    TestWriteLe16(ne.data() + p + 2, 4);
+    TestWriteLe16(ne.data() + p + 6, 0x8001u);
+    p += 12;
+
+    // Type 0x8003 (RT_ICON), count = 2 (ID 1 = 16x16 at 0x400, ID 2 = 32x32 at 0x800)
+    TestWriteLe16(ne.data() + p + 0, 0x8003u);
+    TestWriteLe16(ne.data() + p + 2, 2);
+    p += 8;
+    TestWriteLe16(ne.data() + p + 0, 0x40);
+    TestWriteLe16(ne.data() + p + 2, static_cast<uint16_t>((dib_16x16.size() + 15) >> 4));
+    TestWriteLe16(ne.data() + p + 6, 0x8001u);
+    p += 12;
+    TestWriteLe16(ne.data() + p + 0, 0x80);
+    TestWriteLe16(ne.data() + p + 2, static_cast<uint16_t>((dib_32x32.size() + 15) >> 4));
+    TestWriteLe16(ne.data() + p + 6, 0x8002u);
+
+    // GRPICONDIR at 0x200 listing both variants (should pick 32x32 8bpp ID 2)
+    TestWriteLe16(ne.data() + 0x200 + 0, 0);
+    TestWriteLe16(ne.data() + 0x200 + 2, 1);
+    TestWriteLe16(ne.data() + 0x200 + 4, 2);
+    // Entry 0: 16x16 4bpp -> nID = 1
+    ne[0x206 + 0] = 16; ne[0x206 + 1] = 16; ne[0x206 + 2] = 16;
+    TestWriteLe16(ne.data() + 0x206 + 6, 4);
+    TestWriteLe16(ne.data() + 0x206 + 12, 1);
+    // Entry 1: 32x32 8bpp -> nID = 2
+    ne[0x206 + 14 + 0] = 32; ne[0x206 + 14 + 1] = 32;
+    TestWriteLe16(ne.data() + 0x206 + 14 + 6, 8);
+    TestWriteLe16(ne.data() + 0x206 + 14 + 12, 2);
+
+    std::memcpy(ne.data() + 0x400, dib_16x16.data(), dib_16x16.size());
+    std::memcpy(ne.data() + 0x800, dib_32x32.data(), dib_32x32.size());
+
+    const std::string ne_png = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".ne.png";
+    ASSERT_TRUE(ImageCrawler::ExtractPeNeIcon(ne.data(), ne.size(), ne_png));
+    EXPECT_TRUE(VerifyPngHeaderAndDimensions(ne_png, 32, 32));
+    std::remove(ne_png.c_str());
+
+    // --- 2. Synthetic 32-bit PE executable with .rsrc section containing RT_ICON (32x32 8bpp) ---
+    std::vector<uint8_t> pe(8192, 0);
+    pe[0] = 'M'; pe[1] = 'Z';
+    TestWriteLe32(pe.data() + 0x3C, 0x80);
+    pe[0x80] = 'P'; pe[0x81] = 'E';
+    TestWriteLe16(pe.data() + 0x80 + 6, 1);    // NumberOfSections = 1
+    TestWriteLe16(pe.data() + 0x80 + 20, 224); // SizeOfOptionalHeader (PE32)
+    size_t opt = 0x80 + 24;
+    TestWriteLe16(pe.data() + opt, 0x010Bu);   // PE32 magic
+    // Data Directory 2 (Resource): RVA = 0x2000, Size = 0x1000
+    TestWriteLe32(pe.data() + opt + 96 + 16, 0x2000);
+    TestWriteLe32(pe.data() + opt + 96 + 20, 0x1000);
+
+    // Section 0 (.rsrc): VirtualSize = 0x1000, VirtualAddress = 0x2000, RawSize = 0x1000, RawPtr = 0x400
+    size_t sec = opt + 224;
+    std::memcpy(pe.data() + sec, ".rsrc", 5);
+    TestWriteLe32(pe.data() + sec + 8, 0x1000);
+    TestWriteLe32(pe.data() + sec + 12, 0x2000);
+    TestWriteLe32(pe.data() + sec + 16, 0x1000);
+    TestWriteLe32(pe.data() + sec + 20, 0x400);
+
+    // Resource tree at file offset 0x400 (RVA 0x2000):
+    // Root dir (0x00): 1 ID entry -> Type 3 (RT_ICON) -> subdir at 0x20
+    size_t rr = 0x400;
+    TestWriteLe16(pe.data() + rr + 14, 1);
+    TestWriteLe32(pe.data() + rr + 16, 3);
+    TestWriteLe32(pe.data() + rr + 20, 0x80000020u);
+    // Name dir (0x20): 1 ID entry -> Name 1 -> subdir at 0x40
+    TestWriteLe16(pe.data() + rr + 0x20 + 14, 1);
+    TestWriteLe32(pe.data() + rr + 0x20 + 16, 1);
+    TestWriteLe32(pe.data() + rr + 0x20 + 20, 0x80000040u);
+    // Lang dir (0x40): 1 ID entry -> Lang 1033 -> data entry at 0x60
+    TestWriteLe16(pe.data() + rr + 0x40 + 14, 1);
+    TestWriteLe32(pe.data() + rr + 0x40 + 16, 1033);
+    TestWriteLe32(pe.data() + rr + 0x40 + 20, 0x60);
+    // Data entry (0x60): DataRVA = 0x2100 (file off 0x500), Size = dib_32x32.size()
+    TestWriteLe32(pe.data() + rr + 0x60 + 0, 0x2100);
+    TestWriteLe32(pe.data() + rr + 0x60 + 4, static_cast<uint32_t>(dib_32x32.size()));
+    std::memcpy(pe.data() + 0x500, dib_32x32.data(), dib_32x32.size());
+
+    const std::string pe_png = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".pe.png";
+    ASSERT_TRUE(ImageCrawler::ExtractPeNeIcon(pe.data(), pe.size(), pe_png));
+    EXPECT_TRUE(VerifyPngHeaderAndDimensions(pe_png, 32, 32));
+    std::remove(pe_png.c_str());
+}
+
+TEST(KioskCrawlerTest, ScanAndCatalogMachineDeduplicatesOnRescan) {
+    KioskDatabase::GetInstance().Open(":memory:");
+    const std::string hdd_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".scan_mach.img";
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd_path));
+
+    MachineRecord mach;
+    mach.id = "mach-phase6-scan";
+    mach.display_name = "486DX2 Test Rig";
+    mach.archetype_id = KioskArchetypes::DX2_486;
+    mach.archetype_tier = 4;
+    mach.boot_mode = "REAL_HDD_BOOT";
+    mach.primary_hdd_path = hdd_path;
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMachine(mach));
+
+    ImageCrawler::CrawlSummary sum1;
+    ASSERT_TRUE(ImageCrawler::ScanAndCatalogMachine(mach.id, "", sum1));
+    EXPECT_EQ(sum1.total_discovered, 2);
+    EXPECT_EQ(sum1.newly_inserted, 2);
+    EXPECT_EQ(sum1.skipped_duplicates, 0);
+
+    // Second scan must be idempotent (0 new inserts, 2 skipped duplicates)
+    ImageCrawler::CrawlSummary sum2;
+    ASSERT_TRUE(ImageCrawler::ScanAndCatalogMachine(mach.id, "", sum2));
+    EXPECT_EQ(sum2.total_discovered, 2);
+    EXPECT_EQ(sum2.newly_inserted, 0);
+    EXPECT_EQ(sum2.skipped_duplicates, 2);
+
+    std::vector<CatalogItemRecord> items = KioskDatabase::GetInstance().GetItemsForMachine(mach.id);
+    EXPECT_EQ(items.size(), 2U);
+
+    std::remove(hdd_path.c_str());
     KioskDatabase::GetInstance().Close();
 }
 
