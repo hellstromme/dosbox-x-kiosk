@@ -175,11 +175,16 @@ bool KioskUI::ProcessEvent(const SDL_Event* event) {
 
     if (KioskManager::GetInstance().GetState() == KioskState::STATE_SHELL_INTERACTIVE) {
         const bool want_text = m_context_initialized ? ImGui::GetIO().WantTextInput : false;
-        const bool widget_or_popup_active =
+        const bool suppress_actions =
             m_context_initialized &&
             (ImGui::IsAnyItemActive() || ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId));
-        if (!widget_or_popup_active &&
-            KioskInputRouter::GetInstance().ProcessSDLEvent(*event, want_text)) {
+        // When ImGui keyboard/gamepad nav has a focused widget, let ImGui handle Enter/Space/A
+        // instead of double-dispatching ACTION_CONFIRM to the active carousel tab.
+        const bool suppress_confirm =
+            m_context_initialized &&
+            (ImGui::IsAnyItemFocused() || ImGui::GetIO().NavVisible);
+        if (KioskInputRouter::GetInstance().ProcessSDLEvent(
+                *event, want_text, 0, suppress_actions, suppress_confirm)) {
             handled = true;
         }
     }
@@ -310,7 +315,10 @@ void KioskUI::RenderCountdownBanner(float remaining_sec) {
 
 void KioskUI::ProcessPendingInputActions() {
     KioskInputRouter& router = KioskInputRouter::GetInstance();
-    router.UpdateRepeat(SDL_GetTicks());
+    const bool suppress_repeat =
+        m_context_initialized &&
+        (ImGui::IsAnyItemActive() || ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId));
+    router.UpdateRepeat(SDL_GetTicks(), suppress_repeat);
 
     KioskInputAction action = KioskInputAction::NONE;
     while (router.PollAction(action)) {
@@ -359,6 +367,67 @@ void KioskUI::RenderSettingsTab() {
     ImGui::SetNextItemWidth(240.0f);
     if (ImGui::Combo("Default Auto-Boot Action", &boot_idx, kBootActions, 4)) {
         m_settings_draft.default_boot_action = kBootActions[boot_idx];
+        if (m_settings_draft.default_boot_action == "SPECIFIC_MACHINE") {
+            bool valid = false;
+            for (size_t i = 0; i < m_cached_machines.size(); ++i) {
+                if (m_cached_machines[i].id == m_settings_draft.default_target_uuid) valid = true;
+            }
+            if (!valid) {
+                m_settings_draft.default_target_uuid = m_cached_machines.empty() ? "" : m_cached_machines[0].id;
+            }
+        } else if (m_settings_draft.default_boot_action == "SPECIFIC_ITEM") {
+            bool valid = false;
+            for (size_t i = 0; i < m_cached_items.size(); ++i) {
+                if (m_cached_items[i].id == m_settings_draft.default_target_uuid) valid = true;
+            }
+            if (!valid) {
+                m_settings_draft.default_target_uuid = m_cached_items.empty() ? "" : m_cached_items[0].id;
+            }
+        } else {
+            m_settings_draft.default_target_uuid.clear();
+        }
+    }
+
+    if (m_settings_draft.default_boot_action == "SPECIFIC_MACHINE") {
+        std::string cur_mach = "(None Available)";
+        for (size_t i = 0; i < m_cached_machines.size(); ++i) {
+            if (m_cached_machines[i].id == m_settings_draft.default_target_uuid) {
+                cur_mach = m_cached_machines[i].display_name;
+                break;
+            }
+        }
+        ImGui::SetNextItemWidth(280.0f);
+        if (ImGui::BeginCombo("Target Machine", cur_mach.c_str())) {
+            for (size_t i = 0; i < m_cached_machines.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                if (ImGui::Selectable(m_cached_machines[i].display_name.c_str(),
+                                      m_cached_machines[i].id == m_settings_draft.default_target_uuid)) {
+                    m_settings_draft.default_target_uuid = m_cached_machines[i].id;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+    } else if (m_settings_draft.default_boot_action == "SPECIFIC_ITEM") {
+        std::string cur_item = "(None Available)";
+        for (size_t i = 0; i < m_cached_items.size(); ++i) {
+            if (m_cached_items[i].id == m_settings_draft.default_target_uuid) {
+                cur_item = m_cached_items[i].title;
+                break;
+            }
+        }
+        ImGui::SetNextItemWidth(280.0f);
+        if (ImGui::BeginCombo("Target Catalog Item", cur_item.c_str())) {
+            for (size_t i = 0; i < m_cached_items.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                if (ImGui::Selectable(m_cached_items[i].title.c_str(),
+                                      m_cached_items[i].id == m_settings_draft.default_target_uuid)) {
+                    m_settings_draft.default_target_uuid = m_cached_items[i].id;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
     }
 
     static const char* kCaddyViews[2] = {"SKEUOMORPHIC", "LIST"};
@@ -391,12 +460,29 @@ void KioskUI::RenderSettingsTab() {
     ImGui::Spacing();
 
     if (ImGui::Button("Save Settings", ImVec2(150.0f, 36.0f))) {
-        if (KioskDatabase::GetInstance().UpdateConfig(m_settings_draft)) {
-            KioskManager::GetInstance().ReloadConfig();
-            InvalidateCatalogCache();
-            ShowToast("Kiosk settings saved.");
-        } else {
-            ShowToast("Failed to save Kiosk settings.");
+        bool target_valid = true;
+        if (m_settings_draft.default_boot_action == "SPECIFIC_MACHINE") {
+            target_valid = false;
+            for (size_t i = 0; i < m_cached_machines.size(); ++i) {
+                if (m_cached_machines[i].id == m_settings_draft.default_target_uuid) target_valid = true;
+            }
+            if (!target_valid) ShowToast("Please select a valid Target Machine before saving.");
+        } else if (m_settings_draft.default_boot_action == "SPECIFIC_ITEM") {
+            target_valid = false;
+            for (size_t i = 0; i < m_cached_items.size(); ++i) {
+                if (m_cached_items[i].id == m_settings_draft.default_target_uuid) target_valid = true;
+            }
+            if (!target_valid) ShowToast("Please select a valid Target Catalog Item before saving.");
+        }
+
+        if (target_valid) {
+            if (KioskDatabase::GetInstance().UpdateConfig(m_settings_draft)) {
+                KioskManager::GetInstance().ReloadConfig();
+                InvalidateCatalogCache();
+                ShowToast("Kiosk settings saved.");
+            } else {
+                ShowToast("Failed to save Kiosk settings.");
+            }
         }
     }
     ImGui::SameLine();

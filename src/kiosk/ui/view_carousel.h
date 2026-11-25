@@ -38,12 +38,14 @@ public:
     int GetSelectedAppIndex() const { return m_selected_app_idx; }
     int GetSelectedMachineIndex() const { return m_selected_machine_idx; }
 
-    // Pure data helper: filters by item_type + search query and sorts favorites-first
+    // Pure data helpers (also used by unit tests)
     static std::vector<CatalogItemRecord> FilterAndSortCatalogItems(
         const std::vector<CatalogItemRecord>& all_items,
         const std::string& item_type,
         const std::string& search_filter
     );
+    static bool IsMediaCompatibleWithDrive(const std::string& media_type, const std::string& target_drive);
+    static int ComputeNextSlotOrder(const std::vector<CaddyBindingRecord>& bindings, const std::string& target_drive);
 
     void ResetTransientModals();
 

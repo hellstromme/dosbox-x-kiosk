@@ -23,6 +23,17 @@
 #include <limits>
 #include <sstream>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 std::string SanitizeFilenameSlug(const std::string& input) {
@@ -63,7 +74,7 @@ void ViewWizard::Reset() {
     m_draft.os_installed = false;
     m_hdd_size_mb = 250;
     m_name_edited_by_user = false;
-    m_create_blank_hdd_file = false;
+    m_create_blank_hdd_file = true;
     m_installer_floppy_media_id.clear();
     m_installer_cd_media_id.clear();
     m_last_error.clear();
@@ -90,11 +101,12 @@ bool ViewWizard::SetStep(WizardStep step) {
             }
         }
         if (m_draft.boot_mode == "REAL_HDD_BOOT") {
-            if (m_draft.primary_hdd_path.empty()) {
-                m_draft.primary_hdd_path = GenerateDefaultHddPath(m_draft.display_name);
-                std::snprintf(m_hdd_path_buf, sizeof(m_hdd_path_buf), "%s", m_draft.primary_hdd_path.c_str());
+            if (m_create_blank_hdd_file) {
+                m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
+            } else {
+                // Imported existing HDD image: preserve image's own geometry (omit -size)
+                m_draft.primary_hdd_chs.clear();
             }
-            m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
         }
     }
     m_last_error.clear();
@@ -175,7 +187,18 @@ void ViewWizard::SetHddSizeMb(int size_mb) {
     if (size_mb < 10) size_mb = 10;
     if (size_mb > 4096) size_mb = 4096;
     m_hdd_size_mb = size_mb;
-    m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
+    if (m_create_blank_hdd_file) {
+        m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
+    }
+}
+
+void ViewWizard::SetCreateBlankHddOnDisk(bool enable) {
+    m_create_blank_hdd_file = enable;
+    if (m_create_blank_hdd_file) {
+        m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
+    } else {
+        m_draft.primary_hdd_chs.clear();
+    }
 }
 
 void ViewWizard::SetPrimaryHddPath(const std::string& path) {
@@ -210,35 +233,66 @@ bool ViewWizard::CreateBlankHddImage(const std::string& file_path, int size_mb, 
         return false;
     }
     const int64_t exact_bytes = static_cast<int64_t>(c) * static_cast<int64_t>(h) * static_cast<int64_t>(s) * 512LL;
-    if (exact_bytes <= 0 ||
-        static_cast<uint64_t>(exact_bytes - 1) > static_cast<uint64_t>((std::numeric_limits<std::streamoff>::max)())) {
+    if (exact_bytes <= 0) {
         return false;
     }
 
-    std::ofstream out(file_path.c_str(), std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
+#if defined(_WIN32)
+    // Atomic exclusive creation (CREATE_NEW) guarantees we never truncate an existing disk image
+    HANDLE hFile = CreateFileA(
+        file_path.c_str(),
+        GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (hFile == INVALID_HANDLE_VALUE) {
         return false;
     }
-    // Sparse-friendly seek to last byte and write a single zero byte so allocation is instant
-    out.seekp(static_cast<std::streamoff>(exact_bytes - 1), std::ios::beg);
-    char zero = 0;
-    out.write(&zero, 1);
-    return out.good();
+    LARGE_INTEGER li;
+    li.QuadPart = exact_bytes;
+    bool ok = (SetFilePointerEx(hFile, li, NULL, FILE_BEGIN) != 0) && (SetEndOfFile(hFile) != 0);
+    CloseHandle(hFile);
+    if (!ok) {
+        std::remove(file_path.c_str());
+    }
+    return ok;
+#else
+    // Atomic exclusive creation (O_CREAT | O_EXCL) guarantees we never truncate an existing disk image
+    int fd = ::open(file_path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = (::ftruncate(fd, static_cast<off_t>(exact_bytes)) == 0);
+    ::close(fd);
+    if (!ok) {
+        std::remove(file_path.c_str());
+    }
+    return ok;
+#endif
 }
 
-std::string ViewWizard::GenerateDefaultHddPath(const std::string& machine_name) const {
+std::string ViewWizard::GenerateDefaultHddPath(const std::string& machine_name, const std::string& machine_id) const {
     const std::string slug = SanitizeFilenameSlug(machine_name);
+    // Include unique suffix from machine_id so names like "Doom Rig" and "doom-rig" never collide
+    std::string suffix = machine_id;
+    if (suffix.size() > 13) {
+        suffix = suffix.substr(0, 13);
+    }
+    const std::string filename = slug + "_" + SanitizeFilenameSlug(suffix) + "_hdd_c.img";
 #if defined(_WIN32)
     const char* temp_dir = std::getenv("LOCALAPPDATA");
     if (!temp_dir || !*temp_dir) temp_dir = std::getenv("TEMP");
     if (temp_dir && *temp_dir) {
         std::string base(temp_dir);
         if (base.back() != '\\' && base.back() != '/') base += '\\';
-        return base + slug + "_hdd_c.img";
+        return base + filename;
     }
-    return slug + "_hdd_c.img";
+    return filename;
 #else
-    return "/var/lib/dosbox-kiosk/machines/" + slug + "_hdd_c.img";
+    return "/var/lib/dosbox-kiosk/machines/" + filename;
 #endif
 }
 
@@ -292,45 +346,99 @@ bool ViewWizard::CommitMachine(std::string& out_machine_id, std::string& out_err
         }
     }
 
-    if (m_draft.boot_mode == "REAL_HDD_BOOT") {
-        if (m_draft.primary_hdd_path.empty()) {
-            m_draft.primary_hdd_path = GenerateDefaultHddPath(m_draft.display_name);
+    // Pre-validate optional installer media IDs before creating files or inserting machine
+    if (!m_installer_floppy_media_id.empty()) {
+        MediaPoolRecord probe;
+        if (!db.GetMedia(m_installer_floppy_media_id, probe)) {
+            out_error = "Selected Drive A: installer floppy no longer exists in Media Pool.";
+            m_last_error = out_error;
+            return false;
         }
-        m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
-        if (m_create_blank_hdd_file) {
-            std::string created_chs;
-            if (!CreateBlankHddImage(m_draft.primary_hdd_path, m_hdd_size_mb, created_chs)) {
-                out_error = "Failed to create blank HDD image at: " + m_draft.primary_hdd_path;
-                m_last_error = out_error;
-                return false;
-            }
-            m_draft.primary_hdd_chs = created_chs;
+    }
+    if (!m_installer_cd_media_id.empty()) {
+        MediaPoolRecord probe;
+        if (!db.GetMedia(m_installer_cd_media_id, probe)) {
+            out_error = "Selected Drive D: installer CD-ROM no longer exists in Media Pool.";
+            m_last_error = out_error;
+            return false;
         }
     }
 
     m_draft.id = GenerateMachineUuid(m_draft.display_name);
+    bool created_new_hdd_file = false;
+
+    if (m_draft.boot_mode == "REAL_HDD_BOOT") {
+        if (m_create_blank_hdd_file) {
+            if (m_draft.primary_hdd_path.empty()) {
+                m_draft.primary_hdd_path = GenerateDefaultHddPath(m_draft.display_name, m_draft.id);
+            }
+            std::string created_chs;
+            if (!CreateBlankHddImage(m_draft.primary_hdd_path, m_hdd_size_mb, created_chs)) {
+                out_error = "Failed to create blank HDD image (file may already exist or path is invalid): " + m_draft.primary_hdd_path;
+                m_last_error = out_error;
+                return false;
+            }
+            m_draft.primary_hdd_chs = created_chs;
+            m_draft.os_installed = false;
+            created_new_hdd_file = true;
+        } else {
+            // Importing an existing HDD image: require existing file & preserve its native geometry
+            if (m_draft.primary_hdd_path.empty()) {
+                out_error = "Please specify an existing HDD image path or choose 'Create New Blank HDD Image'.";
+                m_last_error = out_error;
+                return false;
+            }
+            std::ifstream existing_probe(m_draft.primary_hdd_path.c_str(), std::ios::binary);
+            if (!existing_probe.is_open()) {
+                out_error = "Existing HDD image file not found: " + m_draft.primary_hdd_path;
+                m_last_error = out_error;
+                return false;
+            }
+            m_draft.primary_hdd_chs.clear();
+            m_draft.os_installed = true;
+        }
+    }
+
     if (!db.InsertMachine(m_draft)) {
+        if (created_new_hdd_file) {
+            std::remove(m_draft.primary_hdd_path.c_str());
+        }
         out_error = "Failed to save machine record to catalog database.";
         m_last_error = out_error;
         return false;
     }
 
-    // Bind optional installer media to A: / D: caddy slots
+    // Bind optional installer media atomically (roll back machine if any binding fails)
+    bool bindings_ok = true;
     if (!m_installer_floppy_media_id.empty()) {
         CaddyBindingRecord b;
         b.machine_id = m_draft.id;
         b.media_id = m_installer_floppy_media_id;
         b.target_drive = "A";
         b.slot_order = 1;
-        db.AddCaddyBinding(b);
+        if (!db.AddCaddyBinding(b)) {
+            bindings_ok = false;
+        }
     }
-    if (!m_installer_cd_media_id.empty()) {
+    if (bindings_ok && !m_installer_cd_media_id.empty()) {
         CaddyBindingRecord b;
         b.machine_id = m_draft.id;
         b.media_id = m_installer_cd_media_id;
         b.target_drive = "D";
         b.slot_order = 1;
-        db.AddCaddyBinding(b);
+        if (!db.AddCaddyBinding(b)) {
+            bindings_ok = false;
+        }
+    }
+
+    if (!bindings_ok) {
+        db.DeleteMachine(m_draft.id);
+        if (created_new_hdd_file) {
+            std::remove(m_draft.primary_hdd_path.c_str());
+        }
+        out_error = "Failed to attach selected installer media; machine creation was rolled back.";
+        m_last_error = out_error;
+        return false;
     }
 
     out_machine_id = m_draft.id;
@@ -512,18 +620,30 @@ void ViewWizard::RenderStep3OsStorage() {
     ImGui::Spacing();
 
     if (m_draft.boot_mode == "REAL_HDD_BOOT") {
-        ImGui::Text("Hard Disk Capacity (MB):");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(220.0f);
-        if (ImGui::SliderInt("##WizHddSize", &m_hdd_size_mb, 20, 2048, "%d MB")) {
-            m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
+        if (ImGui::RadioButton("Create New Blank HDD Image", m_create_blank_hdd_file)) {
+            SetCreateBlankHddOnDisk(true);
         }
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
-        ImGui::Text("CHS: %s", ComputeHddChsGeometry(m_hdd_size_mb).c_str());
-        ImGui::PopStyleColor();
+        ImGui::SameLine(0.0f, 16.0f);
+        if (ImGui::RadioButton("Import Existing HDD Image", !m_create_blank_hdd_file)) {
+            SetCreateBlankHddOnDisk(false);
+        }
 
-        ImGui::Checkbox("Pre-create blank .img file on disk now", &m_create_blank_hdd_file);
+        if (m_create_blank_hdd_file) {
+            ImGui::Text("Hard Disk Capacity (MB):");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(220.0f);
+            if (ImGui::SliderInt("##WizHddSize", &m_hdd_size_mb, 20, 2048, "%d MB")) {
+                m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
+            }
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
+            ImGui::Text("CHS: %s", ComputeHddChsGeometry(m_hdd_size_mb).c_str());
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
+            ImGui::TextWrapped("Existing HDD image will keep its native MBR/partition geometry (DOSBox-X auto-detect).");
+            ImGui::PopStyleColor();
+        }
     }
 
     if (!pool.empty()) {
@@ -640,12 +760,20 @@ void ViewWizard::Render() {
             }
         }
         ImGui::SameLine();
+        const bool blank_without_installer =
+            (m_draft.boot_mode == "REAL_HDD_BOOT" && m_create_blank_hdd_file &&
+             m_installer_floppy_media_id.empty() && m_installer_cd_media_id.empty());
+        ImGui::BeginDisabled(blank_without_installer);
         if (ImGui::Button("Create & Boot Now", ImVec2(170.0f, 34.0f))) {
             std::string new_id, err;
             if (CommitMachine(new_id, err)) {
                 Reset();
                 KioskManager::GetInstance().RequestLaunchMachine(new_id);
             }
+        }
+        ImGui::EndDisabled();
+        if (blank_without_installer && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Attach an OS installer floppy (Drive A:) or CD-ROM (Drive D:) in Step 3 to boot a blank HDD.");
         }
     }
 

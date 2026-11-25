@@ -15,7 +15,8 @@ public:
         const CatalogItemRecord* item = nullptr,
         const std::vector<CaddyBindingRecord>& caddy = {},
         const std::string& base_conf_path = "",
-        const std::string& dispatch_image_path = ""
+        const std::string& dispatch_image_path = "",
+        bool boot_installer_media = false
     ) const;
 
     // Builds the dynamic [autoexec] section block
@@ -23,7 +24,8 @@ public:
         const MachineRecord& machine,
         const CatalogItemRecord* item = nullptr,
         const std::vector<CaddyBindingRecord>& caddy = {},
-        const std::string& dispatch_image_path = ""
+        const std::string& dispatch_image_path = "",
+        bool boot_installer_media = false
     ) const;
 
     // Writes synthesized config content to a target file

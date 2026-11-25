@@ -126,6 +126,26 @@ std::vector<CatalogItemRecord> ViewCarousel::FilterAndSortCatalogItems(
     return filtered;
 }
 
+bool ViewCarousel::IsMediaCompatibleWithDrive(const std::string& media_type, const std::string& target_drive) {
+    if (target_drive == "A" || target_drive == "B") {
+        return media_type.find("FLOPPY_") == 0;
+    }
+    if (target_drive == "D" || target_drive == "E") {
+        return (media_type == "CDROM_ISO" || media_type == "CDROM_CUE");
+    }
+    return false;
+}
+
+int ViewCarousel::ComputeNextSlotOrder(const std::vector<CaddyBindingRecord>& bindings, const std::string& target_drive) {
+    int max_slot = 0;
+    for (size_t i = 0; i < bindings.size(); ++i) {
+        if (bindings[i].target_drive == target_drive && bindings[i].slot_order > max_slot) {
+            max_slot = bindings[i].slot_order;
+        }
+    }
+    return max_slot + 1;
+}
+
 bool ViewCarousel::HandleAction(KioskHubTab active_tab, KioskInputAction action) {
     if (m_show_caddy_modal || m_show_delete_modal) {
         if (action == KioskInputAction::ACTION_BACK) {
@@ -822,22 +842,25 @@ void ViewCarousel::RenderMediaPoolTab() {
         std::string path(m_add_media_path_buf);
         if (!path.empty()) {
             InspectedMediaInfo info;
-            DiskCaddyView::InspectMediaFile(path, info);
-            MediaPoolRecord rec;
-            rec.id = GenerateSimpleMediaUuid(path);
-            rec.file_path = path;
-            rec.media_type = info.media_type;
-            rec.physical_style = info.physical_style;
-            rec.volume_label = info.volume_label;
-            rec.label_title = info.label_title.empty() ? path : info.label_title;
-            rec.label_subtitle = info.label_subtitle;
-            rec.has_redbook_audio = info.has_redbook_audio;
-            if (KioskDatabase::GetInstance().InsertMedia(rec)) {
-                m_add_media_path_buf[0] = '\0';
-                ui.InvalidateCatalogCache();
-                ui.ShowToast("Added '" + rec.label_title + "' to Global Media Pool");
+            if (!DiskCaddyView::InspectMediaFile(path, info)) {
+                ui.ShowToast("Could not inspect media file (missing or unsupported): " + path);
             } else {
-                ui.ShowToast("Media already exists or could not be saved");
+                MediaPoolRecord rec;
+                rec.id = GenerateSimpleMediaUuid(path);
+                rec.file_path = path;
+                rec.media_type = info.media_type;
+                rec.physical_style = info.physical_style;
+                rec.volume_label = info.volume_label;
+                rec.label_title = info.label_title.empty() ? path : info.label_title;
+                rec.label_subtitle = info.label_subtitle;
+                rec.has_redbook_audio = info.has_redbook_audio;
+                if (KioskDatabase::GetInstance().InsertMedia(rec)) {
+                    m_add_media_path_buf[0] = '\0';
+                    ui.InvalidateCatalogCache();
+                    ui.ShowToast("Added '" + rec.label_title + "' to Global Media Pool");
+                } else {
+                    ui.ShowToast("Media already exists or could not be saved");
+                }
             }
         }
     }
@@ -920,23 +943,32 @@ void ViewCarousel::RenderMediaPoolTab() {
 }
 
 void ViewCarousel::RenderCaddyManagerModal() {
-    if (!m_show_caddy_modal) return;
+    static const char* kPopupId = "Session Media Caddy###CaddyManagerModal";
+    if (m_show_caddy_modal && !ImGui::IsPopupOpen(kPopupId)) {
+        ImGui::OpenPopup(kPopupId);
+    }
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     if (vp) {
         const float mw = (std::min)(580.0f, (std::max)(320.0f, vp->WorkSize.x - 24.0f));
-        const float mh = (std::min)(380.0f, (std::max)(240.0f, vp->WorkSize.y - 24.0f));
+        const float mh = (std::min)(390.0f, (std::max)(240.0f, vp->WorkSize.y - 24.0f));
         ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(mw, mh), ImGuiCond_Always);
     }
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
-    std::string title = "Session Media Caddy: " + m_caddy_modal_target_name + "###CaddyManagerModal";
-    if (ImGui::Begin(title.c_str(), &m_show_caddy_modal, flags)) {
+    if (ImGui::BeginPopupModal(kPopupId, &m_show_caddy_modal, flags)) {
+        if (!m_show_caddy_modal) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
         const std::vector<MediaPoolRecord>& pool = KioskUI::GetInstance().GetCachedMedia();
 
-        ImGui::Text("Bound Disks (%u):", static_cast<unsigned int>(m_caddy_modal_bindings.size()));
-        ImGui::BeginChild("##BoundCaddyList", ImVec2(-1.0f, 175.0f), true);
+        ImGui::Text("Target: %s   |   Bound Disks (%u):",
+                    m_caddy_modal_target_name.c_str(),
+                    static_cast<unsigned int>(m_caddy_modal_bindings.size()));
+        ImGui::BeginChild("##BoundCaddyList", ImVec2(-1.0f, 170.0f), true);
         for (size_t i = 0; i < m_caddy_modal_bindings.size(); ++i) {
             const CaddyBindingRecord& b = m_caddy_modal_bindings[i];
             ImGui::Text("[%s: Slot %d] %s (%s)",
@@ -962,23 +994,42 @@ void ViewCarousel::RenderCaddyManagerModal() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        if (pool.empty()) {
-            ImGui::TextWrapped("No media in Global Media Pool yet. Add disk images in the Media Pool tab first.");
+        static const char* kDrives[4] = {"A", "B", "D", "E"};
+        if (m_caddy_modal_selected_drive < 0 || m_caddy_modal_selected_drive >= 4) {
+            m_caddy_modal_selected_drive = 0;
+        }
+        const std::string active_drive = kDrives[m_caddy_modal_selected_drive];
+
+        // Filter Global Media Pool strictly to media compatible with active_drive
+        std::vector<const MediaPoolRecord*> compatible;
+        for (size_t i = 0; i < pool.size(); ++i) {
+            if (IsMediaCompatibleWithDrive(pool[i].media_type, active_drive)) {
+                compatible.push_back(&pool[i]);
+            }
+        }
+
+        ImGui::SetNextItemWidth(70.0f);
+        if (ImGui::Combo("Drive", &m_caddy_modal_selected_drive, kDrives, 4)) {
+            m_caddy_modal_selected_media = 0;
+        }
+        ImGui::SameLine();
+
+        if (compatible.empty()) {
+            ImGui::TextWrapped((active_drive == "A" || active_drive == "B")
+                                   ? "No floppy images in Media Pool for Drive A:/B:."
+                                   : "No CD-ROM images in Media Pool for Drive D:/E:.");
         } else {
-            static const char* kDrives[4] = {"A", "B", "D", "E"};
-            ImGui::SetNextItemWidth(70.0f);
-            ImGui::Combo("Drive", &m_caddy_modal_selected_drive, kDrives, 4);
-            ImGui::SameLine();
-            if (m_caddy_modal_selected_media < 0 || m_caddy_modal_selected_media >= static_cast<int>(pool.size())) {
+            if (m_caddy_modal_selected_media < 0 || m_caddy_modal_selected_media >= static_cast<int>(compatible.size())) {
                 m_caddy_modal_selected_media = 0;
             }
+            const MediaPoolRecord* chosen = compatible[static_cast<size_t>(m_caddy_modal_selected_media)];
             const float combo_w = (std::min)(280.0f, (std::max)(120.0f, ImGui::GetContentRegionAvail().x - 120.0f));
             ImGui::SetNextItemWidth(combo_w);
-            if (ImGui::BeginCombo("Media", pool[static_cast<size_t>(m_caddy_modal_selected_media)].label_title.c_str())) {
-                for (size_t i = 0; i < pool.size(); ++i) {
+            if (ImGui::BeginCombo("Media", chosen->label_title.c_str())) {
+                for (size_t i = 0; i < compatible.size(); ++i) {
                     ImGui::PushID(static_cast<int>(i));
                     const bool is_sel = (static_cast<int>(i) == m_caddy_modal_selected_media);
-                    if (ImGui::Selectable(pool[i].label_title.c_str(), is_sel)) {
+                    if (ImGui::Selectable(compatible[i]->label_title.c_str(), is_sel)) {
                         m_caddy_modal_selected_media = static_cast<int>(i);
                     }
                     ImGui::PopID();
@@ -987,20 +1038,23 @@ void ViewCarousel::RenderCaddyManagerModal() {
             }
             ImGui::SameLine();
             if (ImGui::Button("Attach")) {
-                CaddyBindingRecord nb;
-                if (m_caddy_modal_is_item) {
-                    nb.catalog_item_id = m_caddy_modal_target_id;
-                } else {
-                    nb.machine_id = m_caddy_modal_target_id;
-                }
-                nb.media_id = pool[static_cast<size_t>(m_caddy_modal_selected_media)].id;
-                nb.target_drive = kDrives[m_caddy_modal_selected_drive];
-                nb.slot_order = static_cast<int>(m_caddy_modal_bindings.size()) + 1;
-                if (KioskDatabase::GetInstance().AddCaddyBinding(nb)) {
-                    m_caddy_modal_bindings = m_caddy_modal_is_item
-                                                 ? KioskDatabase::GetInstance().GetCaddyBindingsForItem(m_caddy_modal_target_id)
-                                                 : KioskDatabase::GetInstance().GetCaddyBindingsForMachine(m_caddy_modal_target_id);
-                    KioskUI::GetInstance().ShowToast("Attached disk to Drive " + nb.target_drive + ":");
+                chosen = compatible[static_cast<size_t>(m_caddy_modal_selected_media)];
+                if (IsMediaCompatibleWithDrive(chosen->media_type, active_drive)) {
+                    CaddyBindingRecord nb;
+                    if (m_caddy_modal_is_item) {
+                        nb.catalog_item_id = m_caddy_modal_target_id;
+                    } else {
+                        nb.machine_id = m_caddy_modal_target_id;
+                    }
+                    nb.media_id = chosen->id;
+                    nb.target_drive = active_drive;
+                    nb.slot_order = ComputeNextSlotOrder(m_caddy_modal_bindings, active_drive);
+                    if (KioskDatabase::GetInstance().AddCaddyBinding(nb)) {
+                        m_caddy_modal_bindings = m_caddy_modal_is_item
+                                                     ? KioskDatabase::GetInstance().GetCaddyBindingsForItem(m_caddy_modal_target_id)
+                                                     : KioskDatabase::GetInstance().GetCaddyBindingsForMachine(m_caddy_modal_target_id);
+                        KioskUI::GetInstance().ShowToast("Attached disk to Drive " + nb.target_drive + ":");
+                    }
                 }
             }
         }
@@ -1008,13 +1062,17 @@ void ViewCarousel::RenderCaddyManagerModal() {
         ImGui::Spacing();
         if (ImGui::Button("Close", ImVec2(110.0f, 30.0f))) {
             m_show_caddy_modal = false;
+            ImGui::CloseCurrentPopup();
         }
+        ImGui::EndPopup();
     }
-    ImGui::End();
 }
 
 void ViewCarousel::RenderDeleteConfirmModal() {
-    if (!m_show_delete_modal) return;
+    static const char* kDeletePopupId = "Confirm Removal###KioskDeleteModal";
+    if (m_show_delete_modal && !ImGui::IsPopupOpen(kDeletePopupId)) {
+        ImGui::OpenPopup(kDeletePopupId);
+    }
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     if (vp) {
@@ -1025,7 +1083,12 @@ void ViewCarousel::RenderDeleteConfirmModal() {
     }
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
-    if (ImGui::Begin("Confirm Removal###KioskDeleteModal", &m_show_delete_modal, flags)) {
+    if (ImGui::BeginPopupModal(kDeletePopupId, &m_show_delete_modal, flags)) {
+        if (!m_show_delete_modal) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
         ImGui::TextWrapped("Remove '%s' from the Kiosk catalog? Disk image files on host storage will not be deleted.",
                            m_delete_modal_target_name.c_str());
         ImGui::Spacing();
@@ -1041,13 +1104,15 @@ void ViewCarousel::RenderDeleteConfirmModal() {
                 KioskUI::GetInstance().ShowToast("Removed '" + m_delete_modal_target_name + "'");
             }
             m_show_delete_modal = false;
+            ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(100.0f, 32.0f))) {
             m_show_delete_modal = false;
+            ImGui::CloseCurrentPopup();
         }
+        ImGui::EndPopup();
     }
-    ImGui::End();
 }
 
 #endif // defined(C_KIOSK)

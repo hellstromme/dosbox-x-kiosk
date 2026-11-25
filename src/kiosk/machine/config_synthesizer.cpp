@@ -47,7 +47,8 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
     const MachineRecord& machine,
     const CatalogItemRecord* item,
     const std::vector<CaddyBindingRecord>& caddy,
-    const std::string& dispatch_image_path
+    const std::string& dispatch_image_path,
+    bool boot_installer_media
 ) const {
     std::ostringstream ss;
     ss << "[autoexec]\n"
@@ -144,9 +145,22 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
             ss << " -t iso -fs iso -ide 2s\n";
         }
 
-        // 4. Boot from C: MBR
-        ss << "# Boot from primary hard drive\n"
-           << "BOOT -l c\n";
+        // 4. Boot from installer media (pending OS install) or primary C: MBR
+        if (boot_installer_media && item == nullptr) {
+            if (!floppy_a_queue.empty()) {
+                ss << "# Boot OS installer from Floppy Drive A:\n"
+                   << "BOOT -l a\n";
+            } else if (drive_bindings.find("D") != drive_bindings.end() && !drive_bindings["D"].empty()) {
+                ss << "# Boot OS installer from Optical Drive D:\n"
+                   << "BOOT -l d\n";
+            } else {
+                ss << "# Boot from primary hard drive\n"
+                   << "BOOT -l c\n";
+            }
+        } else {
+            ss << "# Boot from primary hard drive\n"
+               << "BOOT -l c\n";
+        }
     } else {
         // INTEGRATED_DOS mode
         // 1. Mount container or default C: drive
@@ -234,7 +248,8 @@ std::string ConfigSynthesizer::SynthesizeConfig(
     const CatalogItemRecord* item,
     const std::vector<CaddyBindingRecord>& caddy,
     const std::string& base_conf_path,
-    const std::string& dispatch_image_path
+    const std::string& dispatch_image_path,
+    bool boot_installer_media
 ) const {
     std::ostringstream ss;
 
@@ -266,7 +281,7 @@ std::string ConfigSynthesizer::SynthesizeConfig(
     }
 
     // 4. Layer 4: Dynamic [autoexec]
-    ss << SynthesizeAutoexec(machine, item, caddy, dispatch_image_path) << "\n";
+    ss << SynthesizeAutoexec(machine, item, caddy, dispatch_image_path, boot_installer_media) << "\n";
 
     return ss.str();
 }

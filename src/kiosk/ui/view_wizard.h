@@ -31,7 +31,8 @@ public:
     bool SelectOSDistribution(const std::string& os_id, std::string& out_error);
     void SetHddSizeMb(int size_mb);
     void SetPrimaryHddPath(const std::string& path);
-    void SetCreateBlankHddOnDisk(bool enable) { m_create_blank_hdd_file = enable; }
+    void SetCreateBlankHddOnDisk(bool enable);
+    bool GetCreateBlankHddOnDisk() const { return m_create_blank_hdd_file; }
     void SetInstallerFloppyMediaId(const std::string& media_id) { m_installer_floppy_media_id = media_id; }
     void SetInstallerCdMediaId(const std::string& media_id) { m_installer_cd_media_id = media_id; }
 
@@ -55,14 +56,14 @@ private:
     void RenderStep3OsStorage();
     void RenderStep4ReviewCreate();
 
-    std::string GenerateDefaultHddPath(const std::string& machine_name) const;
+    std::string GenerateDefaultHddPath(const std::string& machine_name, const std::string& machine_id) const;
     static std::string GenerateMachineUuid(const std::string& seed);
 
     WizardStep m_step = WizardStep::STEP_ARCHETYPE;
     MachineRecord m_draft;
     int m_hdd_size_mb = 250;
     bool m_name_edited_by_user = false;
-    bool m_create_blank_hdd_file = false;
+    bool m_create_blank_hdd_file = true;
     std::string m_installer_floppy_media_id;
     std::string m_installer_cd_media_id;
     std::string m_last_error;

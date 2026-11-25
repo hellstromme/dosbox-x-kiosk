@@ -49,6 +49,8 @@ void KioskInputRouter::ShutdownControllers() {
     m_controllers.clear();
     m_axis_x_dir = 0;
     m_axis_y_dir = 0;
+    m_axis_x_owner = -1;
+    m_axis_y_owner = -1;
     m_last_hat_state = 0;
     m_action_queue.clear();
 }
@@ -73,6 +75,16 @@ void KioskInputRouter::OpenControllerByDeviceIndex(int device_index) {
 }
 
 void KioskInputRouter::CloseControllerByInstanceId(int32_t instance_id) {
+    // Clear any held analog stick direction owned by the disconnecting controller
+    if (m_axis_x_owner == instance_id) {
+        m_axis_x_dir = 0;
+        m_axis_x_owner = -1;
+    }
+    if (m_axis_y_owner == instance_id) {
+        m_axis_y_dir = 0;
+        m_axis_y_owner = -1;
+    }
+
     for (std::vector<SDL_GameController*>::iterator it = m_controllers.begin();
          it != m_controllers.end(); ++it) {
         SDL_Joystick* joy = SDL_GameControllerGetJoystick(*it);
@@ -93,7 +105,13 @@ void KioskInputRouter::PushAction(KioskInputAction action) {
     m_action_queue.push_back(action);
 }
 
-void KioskInputRouter::HandleAnalogAxis(int axis_index, int16_t value, uint32_t now_ms) {
+void KioskInputRouter::HandleAnalogAxis(
+    int32_t instance_id,
+    int axis_index,
+    int16_t value,
+    uint32_t now_ms,
+    bool suppress_actions
+) {
     if (axis_index == SDL_CONTROLLER_AXIS_LEFTX) {
         int new_dir = m_axis_x_dir;
         if (value <= -AXIS_DEADZONE) {
@@ -101,15 +119,18 @@ void KioskInputRouter::HandleAnalogAxis(int axis_index, int16_t value, uint32_t 
         } else if (value >= AXIS_DEADZONE) {
             new_dir = 1;
         } else if (std::abs(static_cast<int>(value)) < AXIS_RELEASE_ZONE) {
-            new_dir = 0;
+            if (m_axis_x_owner == instance_id || m_axis_x_owner == -1) {
+                new_dir = 0;
+            }
         }
 
         if (new_dir != m_axis_x_dir) {
             m_axis_x_dir = new_dir;
-            if (new_dir < 0) {
+            m_axis_x_owner = (new_dir != 0) ? instance_id : -1;
+            if (!suppress_actions && new_dir < 0) {
                 PushAction(KioskInputAction::NAV_LEFT);
                 m_axis_x_next_repeat_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
-            } else if (new_dir > 0) {
+            } else if (!suppress_actions && new_dir > 0) {
                 PushAction(KioskInputAction::NAV_RIGHT);
                 m_axis_x_next_repeat_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
             }
@@ -121,15 +142,18 @@ void KioskInputRouter::HandleAnalogAxis(int axis_index, int16_t value, uint32_t 
         } else if (value >= AXIS_DEADZONE) {
             new_dir = 1;
         } else if (std::abs(static_cast<int>(value)) < AXIS_RELEASE_ZONE) {
-            new_dir = 0;
+            if (m_axis_y_owner == instance_id || m_axis_y_owner == -1) {
+                new_dir = 0;
+            }
         }
 
         if (new_dir != m_axis_y_dir) {
             m_axis_y_dir = new_dir;
-            if (new_dir < 0) {
+            m_axis_y_owner = (new_dir != 0) ? instance_id : -1;
+            if (!suppress_actions && new_dir < 0) {
                 PushAction(KioskInputAction::NAV_UP);
                 m_axis_y_next_repeat_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
-            } else if (new_dir > 0) {
+            } else if (!suppress_actions && new_dir > 0) {
                 PushAction(KioskInputAction::NAV_DOWN);
                 m_axis_y_next_repeat_ms = now_ms + REPEAT_INITIAL_DELAY_MS;
             }
@@ -137,7 +161,10 @@ void KioskInputRouter::HandleAnalogAxis(int axis_index, int16_t value, uint32_t 
     }
 }
 
-void KioskInputRouter::UpdateRepeat(uint32_t now_ms) {
+void KioskInputRouter::UpdateRepeat(uint32_t now_ms, bool suppress_actions) {
+    if (suppress_actions) {
+        return;
+    }
     if (m_axis_x_dir != 0 && SDL_TICKS_PASSED(now_ms, m_axis_x_next_repeat_ms)) {
         PushAction(m_axis_x_dir < 0 ? KioskInputAction::NAV_LEFT : KioskInputAction::NAV_RIGHT);
         m_axis_x_next_repeat_ms = now_ms + REPEAT_INTERVAL_MS;
@@ -148,7 +175,13 @@ void KioskInputRouter::UpdateRepeat(uint32_t now_ms) {
     }
 }
 
-bool KioskInputRouter::ProcessSDLEvent(const SDL_Event& event, bool want_text_input, uint32_t now_ms) {
+bool KioskInputRouter::ProcessSDLEvent(
+    const SDL_Event& event,
+    bool want_text_input,
+    uint32_t now_ms,
+    bool suppress_actions,
+    bool suppress_confirm
+) {
     if (now_ms == 0) {
         now_ms = SDL_GetTicks();
     }
@@ -162,7 +195,33 @@ bool KioskInputRouter::ProcessSDLEvent(const SDL_Event& event, bool want_text_in
             CloseControllerByInstanceId(event.cdevice.which);
             return true;
 
+        case SDL_CONTROLLERAXISMOTION:
+            // Always update physical stick deflection/release state even when actions are suppressed
+            HandleAnalogAxis(event.caxis.which, event.caxis.axis, event.caxis.value, now_ms, suppress_actions);
+            return false;
+
+        case SDL_JOYHATMOTION: {
+            // Skip raw hat events if this instance is already managed by an open SDL_GameController
+            if (SDL_GameControllerFromInstanceID(event.jhat.which) != nullptr) {
+                return false;
+            }
+            const uint8_t val = event.jhat.value;
+            const uint8_t newly_pressed = static_cast<uint8_t>(val & (~m_last_hat_state));
+            m_last_hat_state = val;
+            if (suppress_actions) {
+                return false;
+            }
+            if ((newly_pressed & SDL_HAT_LEFT) != 0) PushAction(KioskInputAction::NAV_LEFT);
+            if ((newly_pressed & SDL_HAT_RIGHT) != 0) PushAction(KioskInputAction::NAV_RIGHT);
+            if ((newly_pressed & SDL_HAT_UP) != 0) PushAction(KioskInputAction::NAV_UP);
+            if ((newly_pressed & SDL_HAT_DOWN) != 0) PushAction(KioskInputAction::NAV_DOWN);
+            return newly_pressed != 0;
+        }
+
         case SDL_KEYDOWN: {
+            if (suppress_actions) {
+                return false;
+            }
             const SDL_Keycode sym = event.key.keysym.sym;
             const uint16_t mod = event.key.keysym.mod;
 
@@ -196,6 +255,9 @@ bool KioskInputRouter::ProcessSDLEvent(const SDL_Event& event, bool want_text_in
                 case SDLK_RETURN:
                 case SDLK_KP_ENTER:
                 case SDLK_SPACE:
+                    if (suppress_confirm) {
+                        return false;
+                    }
                     if (event.key.repeat == 0) {
                         PushAction(KioskInputAction::ACTION_CONFIRM);
                     }
@@ -253,6 +315,9 @@ bool KioskInputRouter::ProcessSDLEvent(const SDL_Event& event, bool want_text_in
         }
 
         case SDL_CONTROLLERBUTTONDOWN: {
+            if (suppress_actions) {
+                return false;
+            }
             switch (event.cbutton.button) {
                 case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
                     PushAction(KioskInputAction::NAV_LEFT);
@@ -267,6 +332,9 @@ bool KioskInputRouter::ProcessSDLEvent(const SDL_Event& event, bool want_text_in
                     PushAction(KioskInputAction::NAV_DOWN);
                     return true;
                 case SDL_CONTROLLER_BUTTON_A:
+                    if (suppress_confirm) {
+                        return false;
+                    }
                     PushAction(KioskInputAction::ACTION_CONFIRM);
                     return true;
                 case SDL_CONTROLLER_BUTTON_B:
@@ -295,32 +363,19 @@ bool KioskInputRouter::ProcessSDLEvent(const SDL_Event& event, bool want_text_in
             }
         }
 
-        case SDL_CONTROLLERAXISMOTION:
-            HandleAnalogAxis(event.caxis.axis, event.caxis.value, now_ms);
-            return false;
-
-        case SDL_JOYHATMOTION: {
-            // Skip raw hat events if this instance is already managed by an open SDL_GameController
-            if (SDL_GameControllerFromInstanceID(event.jhat.which) != nullptr) {
+        case SDL_JOYBUTTONDOWN: {
+            if (suppress_actions) {
                 return false;
             }
-            const uint8_t val = event.jhat.value;
-            const uint8_t newly_pressed = static_cast<uint8_t>(val & (~m_last_hat_state));
-            m_last_hat_state = val;
-            if ((newly_pressed & SDL_HAT_LEFT) != 0) PushAction(KioskInputAction::NAV_LEFT);
-            if ((newly_pressed & SDL_HAT_RIGHT) != 0) PushAction(KioskInputAction::NAV_RIGHT);
-            if ((newly_pressed & SDL_HAT_UP) != 0) PushAction(KioskInputAction::NAV_UP);
-            if ((newly_pressed & SDL_HAT_DOWN) != 0) PushAction(KioskInputAction::NAV_DOWN);
-            return newly_pressed != 0;
-        }
-
-        case SDL_JOYBUTTONDOWN: {
             // Only translate raw joystick buttons when no SDL_GameController is managing this instance
             if (SDL_GameControllerFromInstanceID(event.jbutton.which) != nullptr) {
                 return false;
             }
             switch (event.jbutton.button) {
-                case 0: PushAction(KioskInputAction::ACTION_CONFIRM); return true;
+                case 0:
+                    if (suppress_confirm) return false;
+                    PushAction(KioskInputAction::ACTION_CONFIRM);
+                    return true;
                 case 1: PushAction(KioskInputAction::ACTION_BACK); return true;
                 case 2: PushAction(KioskInputAction::ACTION_CADDY_QUEUE); return true;
                 case 3: PushAction(KioskInputAction::ACTION_VIEW_TOGGLE); return true;

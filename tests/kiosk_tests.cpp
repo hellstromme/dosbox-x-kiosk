@@ -2187,15 +2187,25 @@ TEST(KioskWizardTest, EnforcesArchetypeOsTierCompatibilityAndCreatesMachine) {
     EXPECT_TRUE(wiz.SelectOSDistribution("WIN98_SE", err));
     EXPECT_TRUE(err.empty());
 
-    // 3. Configure identity, REAL_HDD_BOOT, CHS geometry, and installer media
+    // 3. Configure identity, REAL_HDD_BOOT, exclusive blank HDD creation, CHS geometry, and installer media
+    std::string temp_dir = "/tmp/";
+#if defined(_WIN32)
+    if (const char* td = std::getenv("TEMP")) {
+        temp_dir = td;
+        if (!temp_dir.empty() && temp_dir.back() != '\\' && temp_dir.back() != '/') temp_dir += '\\';
+    }
+#endif
+    const std::string temp_hdd = temp_dir + "kiosk_test_wizard_win98.img";
+    std::remove(temp_hdd.c_str());
+
     wiz.SetDisplayName("My Win98 Voodoo Rig");
     wiz.SetBootMode("REAL_HDD_BOOT");
-    wiz.SetHddSizeMb(512);
-    wiz.SetPrimaryHddPath("win98_test_hdd.img");
-    wiz.SetCreateBlankHddOnDisk(false);
+    wiz.SetHddSizeMb(20);
+    wiz.SetPrimaryHddPath(temp_hdd);
+    wiz.SetCreateBlankHddOnDisk(true);
     wiz.SetInstallerFloppyMediaId(floppy.id);
 
-    const std::string chs = ViewWizard::ComputeHddChsGeometry(512);
+    const std::string chs = ViewWizard::ComputeHddChsGeometry(20);
     EXPECT_FALSE(chs.empty());
     EXPECT_NE(chs.find(",16,63"), std::string::npos);
 
@@ -2203,6 +2213,10 @@ TEST(KioskWizardTest, EnforcesArchetypeOsTierCompatibilityAndCreatesMachine) {
     std::string created_id;
     ASSERT_TRUE(wiz.CommitMachine(created_id, err)) << err;
     EXPECT_FALSE(created_id.empty());
+
+    // Attempting to create a blank HDD over an existing file must be refused (no truncation)
+    std::string dup_chs;
+    EXPECT_FALSE(ViewWizard::CreateBlankHddImage(temp_hdd, 20, dup_chs));
 
     // Verify persistence in SQLite
     MachineRecord persisted;
@@ -2212,13 +2226,134 @@ TEST(KioskWizardTest, EnforcesArchetypeOsTierCompatibilityAndCreatesMachine) {
     EXPECT_EQ(persisted.os_id, "WIN98_SE");
     EXPECT_EQ(persisted.boot_mode, "REAL_HDD_BOOT");
     EXPECT_EQ(persisted.primary_hdd_chs, chs);
+    EXPECT_FALSE(persisted.os_installed);
 
     auto bindings = KioskDatabase::GetInstance().GetCaddyBindingsForMachine(created_id);
     ASSERT_EQ(bindings.size(), 1u);
     EXPECT_EQ(bindings[0].media_id, floppy.id);
     EXPECT_EQ(bindings[0].target_drive, "A");
 
+    // Launching this newly created blank REAL_HDD_BOOT machine with bound installer media
+    // must skip EnsureOneTimeAutoexecHook and boot Floppy Drive A: (BOOT -l a)
+    KioskManager::GetInstance().Initialize("", "");
+    ASSERT_TRUE(KioskManager::GetInstance().RequestLaunchMachine(created_id));
+    std::string synth_conf;
+    ASSERT_TRUE(KioskManager::GetInstance().SynthesizeAndPrepareLaunch(synth_conf));
+    EXPECT_NE(std::string::npos, synth_conf.find("BOOT -l a"));
+    EXPECT_EQ(std::string::npos, synth_conf.find("BOOT -l c"));
+
+    KioskManager::GetInstance().Shutdown();
     KioskDatabase::GetInstance().Close();
+    std::remove(temp_hdd.c_str());
+}
+
+TEST(KioskWizardTest, ImportedHddPreservesNativeGeometryAndRejectsInvalidBindings) {
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(":memory:"));
+
+    std::string temp_dir = "/tmp/";
+#if defined(_WIN32)
+    if (const char* td = std::getenv("TEMP")) {
+        temp_dir = td;
+        if (!temp_dir.empty() && temp_dir.back() != '\\' && temp_dir.back() != '/') temp_dir += '\\';
+    }
+#endif
+    const std::string existing_hdd = temp_dir + "kiosk_test_imported_hdd.img";
+    {
+        std::ofstream ofs(existing_hdd.c_str(), std::ios::binary | std::ios::trunc);
+        std::vector<uint8_t> stub(512, 0);
+        stub[510] = 0x55;
+        stub[511] = 0xAA;
+        ofs.write(reinterpret_cast<const char*>(stub.data()), static_cast<std::streamsize>(stub.size()));
+    }
+
+    ViewWizard& wiz = ViewWizard::GetInstance();
+    wiz.Reset();
+    ASSERT_TRUE(wiz.SelectArchetype(KioskArchetypes::DX2_486));
+    wiz.SetDisplayName("Imported 486 Rig");
+    wiz.SetBootMode("REAL_HDD_BOOT");
+    wiz.SetHddSizeMb(250);
+    wiz.SetPrimaryHddPath(existing_hdd);
+    wiz.SetCreateBlankHddOnDisk(false);
+
+    // Nonexistent installer media ID must fail atomically without persisting an orphan machine
+    wiz.SetInstallerFloppyMediaId("nonexistent-media-uuid");
+    std::string id_fail, err;
+    EXPECT_FALSE(wiz.CommitMachine(id_fail, err));
+    EXPECT_TRUE(KioskDatabase::GetInstance().GetAllMachines().empty());
+
+    // Valid import must succeed with empty primary_hdd_chs (preserving native geometry) and os_installed=true
+    wiz.SetInstallerFloppyMediaId("");
+    std::string id_ok;
+    ASSERT_TRUE(wiz.CommitMachine(id_ok, err)) << err;
+    MachineRecord persisted;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMachine(id_ok, persisted));
+    EXPECT_TRUE(persisted.primary_hdd_chs.empty());
+    EXPECT_TRUE(persisted.os_installed);
+
+    KioskDatabase::GetInstance().Close();
+    std::remove(existing_hdd.c_str());
+}
+
+TEST(KioskInputRouterTest, ClearsHeldStickOnDisconnectAndSuppressesConfirmWhenFocused) {
+    KioskInputRouter& router = KioskInputRouter::GetInstance();
+    router.ClearPendingActions();
+
+    // Deflect stick on controller instance 7
+    SDL_Event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.type = SDL_CONTROLLERAXISMOTION;
+    ev.caxis.which = 7;
+    ev.caxis.axis = SDL_CONTROLLER_AXIS_LEFTX;
+    ev.caxis.value = 24000;
+    router.ProcessSDLEvent(ev, false, 1000, false, false);
+    KioskInputAction act = KioskInputAction::NONE;
+    ASSERT_TRUE(router.PollAction(act));
+    EXPECT_EQ(act, KioskInputAction::NAV_RIGHT);
+
+    // Physical release while actions are suppressed must clear held state so UpdateRepeat stops
+    ev.caxis.value = 0;
+    router.ProcessSDLEvent(ev, false, 1100, true /* suppress_actions */, false);
+    router.UpdateRepeat(2000, false);
+    EXPECT_EQ(router.GetPendingActionCount(), 0u);
+
+    // Re-deflect and disconnect controller 7 -> UpdateRepeat must not fire
+    ev.caxis.value = -24000;
+    router.ProcessSDLEvent(ev, false, 2100, false, false);
+    ASSERT_TRUE(router.PollAction(act));
+    EXPECT_EQ(act, KioskInputAction::NAV_LEFT);
+
+    std::memset(&ev, 0, sizeof(ev));
+    ev.type = SDL_CONTROLLERDEVICEREMOVED;
+    ev.cdevice.which = 7;
+    router.ProcessSDLEvent(ev, false, 2200, false, false);
+    router.UpdateRepeat(3000, false);
+    EXPECT_EQ(router.GetPendingActionCount(), 0u);
+
+    // Enter/A with suppress_confirm=true must NOT queue ACTION_CONFIRM
+    std::memset(&ev, 0, sizeof(ev));
+    ev.type = SDL_KEYDOWN;
+    ev.key.keysym.sym = SDLK_RETURN;
+    EXPECT_FALSE(router.ProcessSDLEvent(ev, false, 3100, false, true /* suppress_confirm */));
+    EXPECT_EQ(router.GetPendingActionCount(), 0u);
+}
+
+TEST(KioskCarouselTest, ValidatesDriveMediaCompatibilityAndComputesMaxSlotOrder) {
+    EXPECT_TRUE(ViewCarousel::IsMediaCompatibleWithDrive("FLOPPY_35_1440K", "A"));
+    EXPECT_TRUE(ViewCarousel::IsMediaCompatibleWithDrive("FLOPPY_525_360K", "B"));
+    EXPECT_FALSE(ViewCarousel::IsMediaCompatibleWithDrive("CDROM_ISO", "A"));
+    EXPECT_FALSE(ViewCarousel::IsMediaCompatibleWithDrive("CDROM_CUE", "B"));
+    EXPECT_TRUE(ViewCarousel::IsMediaCompatibleWithDrive("CDROM_ISO", "D"));
+    EXPECT_TRUE(ViewCarousel::IsMediaCompatibleWithDrive("CDROM_CUE", "E"));
+    EXPECT_FALSE(ViewCarousel::IsMediaCompatibleWithDrive("FLOPPY_35_1440K", "D"));
+
+    // Deleting slots 1 & 2 from [1,2,3,4] leaves [3,4] -> next slot for Drive A must be 5, not 3
+    std::vector<CaddyBindingRecord> bindings;
+    CaddyBindingRecord b3; b3.target_drive = "A"; b3.slot_order = 3; bindings.push_back(b3);
+    CaddyBindingRecord b4; b4.target_drive = "A"; b4.slot_order = 4; bindings.push_back(b4);
+    CaddyBindingRecord d1; d1.target_drive = "D"; d1.slot_order = 1; bindings.push_back(d1);
+    EXPECT_EQ(ViewCarousel::ComputeNextSlotOrder(bindings, "A"), 5);
+    EXPECT_EQ(ViewCarousel::ComputeNextSlotOrder(bindings, "D"), 2);
+    EXPECT_EQ(ViewCarousel::ComputeNextSlotOrder(bindings, "B"), 1);
 }
 
 TEST(KioskWatchdogTest, ResolvesPreviewAndRendersAllShellStatesHeadless) {
