@@ -2280,6 +2280,8 @@ bool ArchiveImporter::HarvestMetadata(
     bool found = false;
     std::string best_ico;
     uint64_t best_ico_size = 0;
+    std::string fallback_ico;
+    uint64_t fallback_ico_size = 0;
 
     for (size_t i = 0; i < files.size(); ++i) {
         std::string base = ToLowerAscii(BasenameOf(files[i]));
@@ -2297,6 +2299,12 @@ bool ArchiveImporter::HarvestMetadata(
                 best_ico_size = sz;
                 best_ico = files[i];
             }
+        } else if (EndsWithLower(base, ".ico")) {
+            uint64_t sz = GetFileSizeBytes(files[i]);
+            if (sz > fallback_ico_size) {
+                fallback_ico_size = sz;
+                fallback_ico = files[i];
+            }
         } else if (base == "steam_appid.txt") {
             std::vector<uint8_t> bytes;
             if (ReadFileToBytes(files[i], bytes, 1024)) {
@@ -2312,6 +2320,9 @@ bool ArchiveImporter::HarvestMetadata(
         }
     }
 
+    if (best_ico.empty()) {
+        best_ico = fallback_ico;
+    }
     if (!best_ico.empty()) {
         out_meta.icon_source_path = best_ico;
         if (!icon_cache_dir.empty() && !item_id.empty()) {
@@ -2334,7 +2345,7 @@ int ArchiveImporter::SanitizeWrapperCruft(const std::string& sandbox_dir) {
     static const char* kCruftExactFiles[] = {
         "dosbox.exe", "gogdosconfig.exe", "sdl.dll", "sdl_net.dll",
         "ddraw.dll", "unins000.exe", "unins000.dat", "galaxy.dll",
-        "galaxy64.dll", "webcache.zip", "nglide_config.exe"
+        "galaxy64.dll", "webcache.zip", "nglide_config.exe", "testapp.exe"
     };
     static const char* kCruftPrefixes[] = {
         "libogg", "libvorbis", "nglide", "3dfxspl"
@@ -3026,13 +3037,23 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
         }
     }
 
-    // --- Stage 3: Inspect Payloads for Win9x PE / DOS Extenders & Finalize Archetype ---
-    bool has_win9x_pe = false;
+    // --- Stage 3: Inspect Payloads for Win9x PE / DOS Extenders & Score Primary Executable ---
+    bool saw_win9x_pe = false;
+    bool saw_dos_exec = false;
     bool has_dos_extender = false;
-    std::string fallback_exe;
-    std::string fallback_exe_crc;
+    std::string best_dos_exe;
+    std::string best_dos_work_dir = "C:\\";
+    std::string best_dos_crc;
+    int best_dos_score = -100000;
+
+    std::string best_win_exe;
+    std::string best_win_work_dir = "C:\\";
+    std::string best_win_crc;
+    int best_win_score = -100000;
+
     std::vector<std::string> game_files;
     WalkFilesRecursive(game_root, game_files);
+    const std::string norm_game_root = NormalizeSlashes(game_root);
 
     for (size_t i = 0; i < game_files.size(); ++i) {
         std::string base_upper = ToUpperAscii(BasenameOf(game_files[i]));
@@ -3043,35 +3064,107 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
         }
         if (EndsWithLower(base_upper, ".exe") || EndsWithLower(base_upper, ".com") || EndsWithLower(base_upper, ".bat")) {
             std::vector<uint8_t> head;
+            uint64_t fsz = GetFileSizeBytes(game_files[i]);
             if (ReadFileToBytes(game_files[i], head, 262144U) && !head.empty()) {
                 ExecutableFingerprint fp;
-                if (SignatureMatcher::ComputeExecutableFingerprint(
-                        head.data(), head.size(), base_upper, fp, GetFileSizeBytes(game_files[i]))) {
-                    if (fp.format == KioskExecFormat::WIN32_PE) {
-                        has_win9x_pe = true;
-                    }
+                if (SignatureMatcher::ComputeExecutableFingerprint(head.data(), head.size(), base_upper, fp, fsz)) {
+                    const bool is_win_pe = (fp.format == KioskExecFormat::WIN32_PE);
+                    const bool is_dos_bin = (fp.format == KioskExecFormat::DOS_MZ ||
+                                             fp.format == KioskExecFormat::DOS_LE ||
+                                             fp.format == KioskExecFormat::DOS_LX ||
+                                             fp.format == KioskExecFormat::DOS_BW ||
+                                             fp.format == KioskExecFormat::RAW_COM ||
+                                             fp.format == KioskExecFormat::BATCH_SCRIPT);
+                    if (is_win_pe) saw_win9x_pe = true;
+                    if (is_dos_bin && !ImageCrawler::IsIgnoredUtilityBinary(base_upper)) saw_dos_exec = true;
                     if (fp.has_dos_extender_stub || fp.format == KioskExecFormat::DOS_LE || fp.format == KioskExecFormat::DOS_LX) {
                         has_dos_extender = true;
                     }
-                    if (!ImageCrawler::IsIgnoredUtilityBinary(base_upper) && fallback_exe.empty()) {
-                        fallback_exe = base_upper;
-                        fallback_exe_crc = fp.header_crc32;
+
+                    if (!ImageCrawler::IsIgnoredUtilityBinary(base_upper)) {
+                        // Compute guest working directory relative to game_root (e.g. "C:\ATLANTIS")
+                        std::string norm_f = NormalizeSlashes(game_files[i]);
+                        std::string rel_dir;
+                        if (norm_f.size() > norm_game_root.size() + 1) {
+                            std::string rel = norm_f.substr(norm_game_root.size() + 1);
+                            std::string d = DirnameOf(rel);
+                            if (d != "." && !d.empty()) rel_dir = d;
+                        }
+                        std::string guest_dir = "C:\\";
+                        if (!rel_dir.empty()) {
+                            std::string dos_sub = ToUpperAscii(rel_dir);
+                            for (size_t k = 0; k < dos_sub.size(); ++k) {
+                                if (dos_sub[k] == '/') dos_sub[k] = '\\';
+                            }
+                            guest_dir += dos_sub;
+                        }
+                        std::string parent_name = rel_dir.empty() ? BasenameOf(norm_game_root) : BasenameOf(rel_dir);
+
+                        SoftwareSignatureRecord sig;
+                        bool has_sig = db.IsOpen() && SignatureMatcher::MatchSignature(base_upper, fp, sig);
+                        bool is_ignore_sig = has_sig && (sig.item_type == "IGNORE_SYSTEM");
+                        int score = ImageCrawler::ScoreDosCandidate(
+                            base_upper, parent_name, fp, false, has_sig, is_ignore_sig);
+
+                        // Prefer valid 8.3 DOS filenames over long Windows wrapper names (e.g. "Indiana Jones ... .exe")
+                        if (base_upper.find(' ') != std::string::npos || StemOf(base_upper).size() > 8) {
+                            score -= 80;
+                        }
+                        // Mild preference for larger main game binaries over tiny stubs
+                        if (fsz >= 32768ULL) score += 20;
+
+                        if (is_dos_bin) {
+                            if (score > best_dos_score) {
+                                best_dos_score = score;
+                                best_dos_exe = base_upper;
+                                best_dos_work_dir = guest_dir;
+                                best_dos_crc = fp.header_crc32;
+                            }
+                        } else if (is_win_pe) {
+                            if (score > best_win_score) {
+                                best_win_score = score;
+                                best_win_exe = base_upper;
+                                best_win_work_dir = guest_dir;
+                                best_win_crc = fp.header_crc32;
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
+    // Only classify as Win9x PE if no real DOS game executable was found (ignores Steam Win32 launcher wrappers)
+    const bool has_win9x_pe = saw_win9x_pe && !saw_dos_exec;
+
     std::string override_delta;
-    std::string archetype_id = ConfTranslator::ScoreArchetype(conf_res, has_win9x_pe, has_dos_extender, override_delta);
+    std::string archetype_id;
+    if (!options.archetype_override.empty() &&
+        ArchetypeManager::GetInstance().GetArchetype(options.archetype_override) != nullptr) {
+        archetype_id = options.archetype_override;
+    } else {
+        archetype_id = ConfTranslator::ScoreArchetype(conf_res, has_win9x_pe, has_dos_extender, override_delta);
+    }
     result.archetype_id = archetype_id;
 
     // Resolve primary executable & working dir
     std::string guest_exe = conf_res.guest_executable;
     std::string guest_args = conf_res.guest_arguments;
     std::string guest_work_dir = conf_res.guest_working_dir.empty() ? "C:\\" : conf_res.guest_working_dir;
+    std::string fallback_exe_crc = !best_dos_crc.empty() ? best_dos_crc : best_win_crc;
     if (guest_exe.empty()) {
-        guest_exe = fallback_exe;
+        if (!best_dos_exe.empty()) {
+            guest_exe = best_dos_exe;
+            guest_work_dir = best_dos_work_dir;
+        } else if (!best_win_exe.empty()) {
+            if (options.deploy_mode == IngestDeployMode::APPLIANCE_CONTAINER) {
+                result.error_message = "No DOS executable found (only Windows PE binaries were detected). "
+                                       "Use Mode B with a Windows 9x machine for Windows games.";
+                return result;
+            }
+            guest_exe = best_win_exe;
+            guest_work_dir = best_win_work_dir;
+        }
     }
 
     // Build ordered CaddyBindingRecords from [autoexec] imgmount directives (falling back to all normalized media)
@@ -3141,30 +3234,10 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
         // Find or create an INTEGRATED_DOS machine template for this archetype
         std::string machine_id = options.target_machine_id;
         if (machine_id.empty() && db.IsOpen()) {
-            std::vector<MachineRecord> machines = db.GetAllMachines();
-            for (size_t i = 0; i < machines.size(); ++i) {
-                if (machines[i].boot_mode == "INTEGRATED_DOS" &&
-                    machines[i].archetype_id == archetype_id &&
-                    machines[i].custom_conf_overrides == override_delta) {
-                    machine_id = machines[i].id;
-                    break;
-                }
-            }
+            machine_id = GetOrCreateContainerMachine(archetype_id, override_delta);
             if (machine_id.empty()) {
-                MachineRecord tpl;
-                tpl.id = GenerateUniqueId("mach", archetype_id);
-                const ArchetypeProfile* prof = ArchetypeManager::GetInstance().GetArchetype(archetype_id);
-                tpl.display_name = prof ? (prof->display_name + " (Container)") : (archetype_id + " (Container)");
-                tpl.archetype_id = archetype_id;
-                tpl.archetype_tier = prof ? prof->tier : 3;
-                tpl.boot_mode = "INTEGRATED_DOS";
-                tpl.os_installed = true;
-                tpl.custom_conf_overrides = override_delta;
-                if (!db.InsertMachine(tpl)) {
-                    result.error_message = "Failed to create INTEGRATED_DOS template machine in catalog.db";
-                    return result;
-                }
-                machine_id = tpl.id;
+                result.error_message = "Failed to create INTEGRATED_DOS template machine in catalog.db";
+                return result;
             }
         }
 
@@ -3232,6 +3305,37 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
             result.deployed_path.c_str(),
             result.archetype_id.c_str());
     return result;
+}
+
+std::string ArchiveImporter::GetOrCreateContainerMachine(
+    const std::string& archetype_id,
+    const std::string& custom_conf_overrides
+) {
+    KioskDatabase& db = KioskDatabase::GetInstance();
+    if (!db.IsOpen()) return "";
+
+    std::vector<MachineRecord> machines = db.GetAllMachines();
+    for (size_t i = 0; i < machines.size(); ++i) {
+        if (machines[i].boot_mode == "INTEGRATED_DOS" &&
+            machines[i].archetype_id == archetype_id &&
+            machines[i].custom_conf_overrides == custom_conf_overrides) {
+            return machines[i].id;
+        }
+    }
+
+    MachineRecord tpl;
+    tpl.id = GenerateUniqueId("mach", archetype_id);
+    const ArchetypeProfile* prof = ArchetypeManager::GetInstance().GetArchetype(archetype_id);
+    tpl.display_name = prof ? (prof->display_name + " (Container)") : (archetype_id + " (Container)");
+    tpl.archetype_id = archetype_id;
+    tpl.archetype_tier = prof ? prof->tier : 3;
+    tpl.boot_mode = "INTEGRATED_DOS";
+    tpl.os_installed = true;
+    tpl.custom_conf_overrides = custom_conf_overrides;
+    if (!db.InsertMachine(tpl)) {
+        return "";
+    }
+    return tpl.id;
 }
 
 #endif // defined(C_KIOSK)

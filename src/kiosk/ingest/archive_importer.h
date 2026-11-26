@@ -23,6 +23,7 @@ struct IngestOptions {
     std::string source_path;                                   // Path to setup_*.exe, *.zip, or folder
     IngestDeployMode deploy_mode = IngestDeployMode::APPLIANCE_CONTAINER;
     std::string target_machine_id;                             // Required for HDD_INJECT; optional for Mode A
+    std::string archetype_override;                            // Optional Mode A override (e.g. ARCH_AT_286); empty = Auto-Detect
     std::string kiosk_data_root;                               // Defaults to platform kiosk data dir
     std::string innoextract_binary;                            // Optional override; auto-discovered in PATH
     std::string item_type = "GAME";                            // "GAME" or "APPLICATION"
@@ -133,6 +134,10 @@ public:
     // Utility helpers
     static std::string GetDefaultKioskDataRoot();
     static std::string MakeSlug(const std::string& raw_name, size_t max_len = 8);
+    static std::string GetOrCreateContainerMachine(
+        const std::string& archetype_id,
+        const std::string& custom_conf_overrides = ""
+    );
 };
 
 #endif // DOSBOX_KIOSK_ARCHIVE_IMPORTER_H

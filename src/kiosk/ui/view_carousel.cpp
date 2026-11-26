@@ -1057,8 +1057,8 @@ void ViewCarousel::RenderContextActionsModal() {
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     if (vp) {
-        const float mw = (std::min)(380.0f, (std::max)(260.0f, vp->WorkSize.x - 24.0f));
-        const float mh = (std::min)(295.0f, (std::max)(220.0f, vp->WorkSize.y - 24.0f));
+        const float mw = (std::min)(420.0f, (std::max)(280.0f, vp->WorkSize.x - 24.0f));
+        const float mh = (std::min)(345.0f, (std::max)(240.0f, vp->WorkSize.y - 24.0f));
         ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(mw, mh), ImGuiCond_Always);
     }
@@ -1098,6 +1098,56 @@ void ViewCarousel::RenderContextActionsModal() {
                 }
                 m_show_context_modal = false;
                 ImGui::CloseCurrentPopup();
+            }
+
+            // Allow switching Hardware Archetype for INTEGRATED_AUTOEXEC container items
+            const std::vector<CatalogItemRecord>& cached_items = ui.GetCachedItems();
+            const CatalogItemRecord* cur_item = nullptr;
+            for (size_t i = 0; i < cached_items.size(); ++i) {
+                if (cached_items[i].id == m_context_modal_target_id) {
+                    cur_item = &cached_items[i];
+                    break;
+                }
+            }
+            if (cur_item && cur_item->launch_mechanism == "INTEGRATED_AUTOEXEC") {
+                static const char* kArchLabels[5] = {
+                    "XT 8088 (4.77 MHz, CGA)",
+                    "AT 286 (12 MHz, EGA, AdLib)",
+                    "386DX (33 MHz, SVGA, SB Pro 2)",
+                    "486DX2 (66 MHz, S3, SB16+GUS)",
+                    "Pentium MMX + 3dfx Voodoo"
+                };
+                static const char* kArchIds[5] = {
+                    KioskArchetypes::XT_8088,
+                    KioskArchetypes::AT_286,
+                    KioskArchetypes::DX_386,
+                    KioskArchetypes::DX2_486,
+                    KioskArchetypes::PENTIUM_3DFX
+                };
+                int cur_arch_idx = 2;
+                const std::vector<MachineRecord>& cached_machs = ui.GetCachedMachines();
+                for (size_t m = 0; m < cached_machs.size(); ++m) {
+                    if (cached_machs[m].id == cur_item->machine_id) {
+                        for (int a = 0; a < 5; ++a) {
+                            if (cached_machs[m].archetype_id == kArchIds[a]) cur_arch_idx = a;
+                        }
+                        break;
+                    }
+                }
+                ImGui::Spacing();
+                ImGui::Text("Hardware Configuration:");
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::Combo("##CtxChangeArchetype", &cur_arch_idx, kArchLabels, 5)) {
+                    std::string new_mach_id = ArchiveImporter::GetOrCreateContainerMachine(kArchIds[cur_arch_idx]);
+                    if (!new_mach_id.empty()) {
+                        CatalogItemRecord updated = *cur_item;
+                        updated.machine_id = new_mach_id;
+                        if (KioskDatabase::GetInstance().UpdateCatalogItem(updated)) {
+                            ui.InvalidateCatalogCache();
+                            ui.ShowToast(std::string("Updated hardware to ") + kArchLabels[cur_arch_idx]);
+                        }
+                    }
+                }
             }
         } else {
             if (ImGui::Button("Scan Disk for Software", ImVec2(-1.0f, 32.0f))) {
@@ -1394,6 +1444,29 @@ void ViewCarousel::RenderImportArchiveModal() {
         ImGui::RadioButton("Mode A: Appliance Container (Instant Integrated DOS)", &m_import_deploy_mode, 0);
         ImGui::RadioButton("Mode B: Inject into Machine HDD (REAL_HDD_BOOT)", &m_import_deploy_mode, 1);
 
+        static const char* kImportArchLabels[6] = {
+            "Auto-Detect (from .conf / binaries)",
+            "XT 8088 (4.77 MHz, CGA, 640KB)",
+            "AT 286 (12 MHz, EGA, AdLib, 2MB)",
+            "386DX (33 MHz, SVGA, SB Pro 2, 8MB)",
+            "486DX2 (66 MHz, S3 Trio64, SB16+GUS, 16MB)",
+            "Pentium MMX + 3dfx Voodoo (64MB)"
+        };
+        static const char* kImportArchIds[6] = {
+            "",
+            KioskArchetypes::XT_8088,
+            KioskArchetypes::AT_286,
+            KioskArchetypes::DX_386,
+            KioskArchetypes::DX2_486,
+            KioskArchetypes::PENTIUM_3DFX
+        };
+        if (m_import_deploy_mode == 0) {
+            ImGui::Spacing();
+            ImGui::Text("Hardware Configuration:");
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::Combo("##ImportArchetype", &m_import_archetype_idx, kImportArchLabels, 6);
+        }
+
         std::vector<MachineRecord> hdd_machines;
         const std::vector<MachineRecord>& all_machines = ui.GetCachedMachines();
         for (size_t i = 0; i < all_machines.size(); ++i) {
@@ -1445,6 +1518,9 @@ void ViewCarousel::RenderImportArchiveModal() {
             opts.deploy_mode = (m_import_deploy_mode == 1)
                                    ? IngestDeployMode::HDD_INJECT
                                    : IngestDeployMode::APPLIANCE_CONTAINER;
+            if (m_import_deploy_mode == 0 && m_import_archetype_idx > 0 && m_import_archetype_idx < 6) {
+                opts.archetype_override = kImportArchIds[m_import_archetype_idx];
+            }
             if (m_import_deploy_mode == 1 && !hdd_machines.empty()) {
                 opts.target_machine_id = hdd_machines[static_cast<size_t>(m_import_target_machine_idx)].id;
             }

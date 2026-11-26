@@ -3868,4 +3868,47 @@ TEST_F(KioskDatabaseFixture, Phase7ModeBFat16HddInjectionAndPathPatching) {
     std::remove(zip_path.c_str());
 }
 
+TEST_F(KioskDatabaseFixture, Phase7SteamSubdirDosExecutableSkipsWin32WrapperAndHonorsArchetypeOverride) {
+    const std::string base_tmp = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".p7_indy";
+    const std::string zip_path = base_tmp + ".zip";
+    const std::string data_root = base_tmp + "_root";
+
+    // Build a realistic Win32 PE wrapper (like Steam's root launcher) + real DOS MZ inside ATLANTIS/
+    std::vector<uint8_t> win32_pe(256, 0);
+    win32_pe[0] = 'M'; win32_pe[1] = 'Z';
+    TestWriteLe32(win32_pe.data() + 0x3C, 0x80);
+    win32_pe[0x80] = 'P'; win32_pe[0x81] = 'E'; win32_pe[0x82] = 0; win32_pe[0x83] = 0;
+
+    std::vector<uint8_t> dos_mz(40000, 0x90);
+    dos_mz[0] = 'M'; dos_mz[1] = 'Z';
+
+    std::vector<TestZipFileSpec> specs;
+    specs.push_back({"Indiana Jones and the Fate of Atlantis/Indiana Jones and the Fate of Atlantis.exe", win32_pe, false});
+    specs.push_back({"Indiana Jones and the Fate of Atlantis/testapp.exe", win32_pe, false});
+    specs.push_back({"Indiana Jones and the Fate of Atlantis/ATLANTIS/ATLANTIS.EXE", dos_mz, true});
+    specs.push_back({"Indiana Jones and the Fate of Atlantis/ATLANTIS/HELPME.EXE", std::vector<uint8_t>{'M','Z',0x90,0x90}, false});
+    ASSERT_TRUE(WriteSyntheticZipArchive(zip_path, specs));
+
+    IngestOptions opts;
+    opts.source_path = zip_path;
+    opts.deploy_mode = IngestDeployMode::APPLIANCE_CONTAINER;
+    opts.archetype_override = KioskArchetypes::AT_286;
+    opts.kiosk_data_root = data_root;
+
+    IngestResult res = ArchiveImporter::ImportArchive(opts);
+    ASSERT_TRUE(res.success) << res.error_message;
+    EXPECT_EQ(res.archetype_id, KioskArchetypes::AT_286);
+
+    CatalogItemRecord item;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetItem(res.catalog_item_id, item));
+    EXPECT_EQ(item.guest_working_dir, "C:\\ATLANTIS");
+    EXPECT_EQ(item.guest_executable, "ATLANTIS.EXE");
+
+    // Verify testapp.exe was stripped
+    std::ifstream testapp_check((item.host_container_dir + "/testapp.exe").c_str());
+    EXPECT_FALSE(testapp_check.is_open());
+
+    std::remove(zip_path.c_str());
+}
+
 #endif // defined(C_DEBUG) && defined(C_KIOSK)
