@@ -3406,4 +3406,27 @@ TEST(KioskCrawlerTest, Fat32ActiveFatAndSectorSizeGuard) {
     std::remove(img_path.c_str());
 }
 
+TEST(KioskCrawlerTest, Round2DriveGuardMbrBoundsAndTruncatedLeWindow) {
+    // 1. FindPath must reject non-C: drive letters (e.g. D:\) against mounted C: volume
+    const std::string hdd_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".r2_drive.img";
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd_path));
+    FatReadOnlyVfs vfs;
+    ASSERT_TRUE(vfs.OpenImageFile(hdd_path));
+    FatDirEntry fe;
+    EXPECT_TRUE(vfs.FindPath("C:\\DOOM2\\DOOM2.EXE", fe));
+    EXPECT_FALSE(vfs.FindPath("D:\\DOOM2\\DOOM2.EXE", fe));
+    vfs.Close();
+    std::remove(hdd_path.c_str());
+
+    // 2. Truncated LE payload window (size < true_file_size and < 4096 bytes available after LE) must return false
+    std::vector<uint8_t> trunc_le(4096, 0x90);
+    trunc_le[0] = 'M'; trunc_le[1] = 'Z';
+    TestWriteLe32(trunc_le.data() + 0x3C, 3000);
+    trunc_le[3000] = 'L'; trunc_le[3001] = 'E';
+    ExecutableFingerprint fp;
+    EXPECT_FALSE(SignatureMatcher::ComputeExecutableFingerprint(trunc_le.data(), trunc_le.size(), "BIG.EXE", fp, 10000));
+    // Same buffer when true_file_size == buffer size (genuinely short LE) must succeed
+    EXPECT_TRUE(SignatureMatcher::ComputeExecutableFingerprint(trunc_le.data(), trunc_le.size(), "SMALL.EXE", fp, 4096));
+}
+
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

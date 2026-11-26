@@ -11,7 +11,12 @@
 #include <cstring>
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <direct.h>
+#include <cwchar>
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -20,6 +25,30 @@
 
 namespace {
 
+#if defined(_WIN32)
+void EnsureDirectoryRecursiveWide(const std::wstring& dir_path) {
+    if (dir_path.empty()) return;
+    std::wstring cur;
+    for (size_t i = 0; i < dir_path.size(); ++i) {
+        wchar_t c = dir_path[i];
+        cur.push_back(c);
+        if ((c == L'\\' || c == L'/') && cur.size() > 1) {
+            if (cur.size() == 3 && cur[1] == L':') continue;
+            _wmkdir(cur.c_str());
+        }
+    }
+    _wmkdir(dir_path.c_str());
+}
+
+std::string WideToUtf8(const std::wstring& ws) {
+    if (ws.empty()) return "";
+    int needed = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return "";
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), &out[0], needed, nullptr, nullptr);
+    return out;
+}
+#else
 void EnsureDirectoryRecursive(const std::string& dir_path) {
     if (dir_path.empty()) return;
     std::string cur;
@@ -27,20 +56,12 @@ void EnsureDirectoryRecursive(const std::string& dir_path) {
         char c = dir_path[i];
         cur.push_back(c);
         if ((c == '\\' || c == '/') && cur.size() > 1) {
-            if (cur.size() == 3 && cur[1] == ':') continue;
-#if defined(_WIN32)
-            _mkdir(cur.c_str());
-#else
             mkdir(cur.c_str(), 0755);
-#endif
         }
     }
-#if defined(_WIN32)
-    _mkdir(dir_path.c_str());
-#else
     mkdir(dir_path.c_str(), 0755);
-#endif
 }
+#endif
 
 // Helper to bind nullable std::string
 void BindTextOrNull(sqlite3_stmt* stmt, int index, const std::string& val) {
@@ -92,17 +113,19 @@ std::string KioskDatabase::GetActiveDatabasePath() const {
 
 std::string KioskDatabase::GetDefaultDatabasePath() {
 #if defined(_WIN32)
-    const char* local_app = std::getenv("LOCALAPPDATA");
-    if (local_app && local_app[0] != '\0') {
-        std::string dir = std::string(local_app) + "\\DOSBox-Kiosk";
-        EnsureDirectoryRecursive(dir);
-        return dir + "\\catalog.db";
+    const wchar_t* local_app = _wgetenv(L"LOCALAPPDATA");
+    if (local_app && local_app[0] != L'\0') {
+        std::wstring dir = std::wstring(local_app) + L"\\DOSBox-Kiosk";
+        EnsureDirectoryRecursiveWide(dir);
+        std::string utf8 = WideToUtf8(dir + L"\\catalog.db");
+        if (!utf8.empty()) return utf8;
     }
-    const char* app_data = std::getenv("APPDATA");
-    if (app_data && app_data[0] != '\0') {
-        std::string dir = std::string(app_data) + "\\DOSBox-Kiosk";
-        EnsureDirectoryRecursive(dir);
-        return dir + "\\catalog.db";
+    const wchar_t* app_data = _wgetenv(L"APPDATA");
+    if (app_data && app_data[0] != L'\0') {
+        std::wstring dir = std::wstring(app_data) + L"\\DOSBox-Kiosk";
+        EnsureDirectoryRecursiveWide(dir);
+        std::string utf8 = WideToUtf8(dir + L"\\catalog.db");
+        if (!utf8.empty()) return utf8;
     }
     return ".\\dosbox-kiosk-catalog.db";
 #else

@@ -957,6 +957,7 @@ bool FatReadOnlyVfs::MountPartition() {
     // 1. Check MBR partition table at 0x1BE if boot signature 0x55AA is present
     if (sec0[510] == 0x55 && sec0[511] == 0xAA) {
         uint32_t best_lba = 0;
+        uint32_t best_lba_count = 0;
         bool best_active = false;
         for (int i = 0; i < 4; ++i) {
             const uint8_t* p = sec0 + 0x1BE + (i * 16);
@@ -972,17 +973,21 @@ bool FatReadOnlyVfs::MountPartition() {
 
             if (best_lba == 0 || (boot_flag == 0x80 && !best_active)) {
                 best_lba = lba_start;
+                best_lba_count = lba_count;
                 best_active = (boot_flag == 0x80);
             }
         }
-        if (best_lba > 0 && ParseBpb(best_lba)) {
-            m_mounted = true;
-            return true;
+        if (best_lba > 0) {
+            if (ParseBpb(best_lba, best_lba_count)) {
+                m_mounted = true;
+                return true;
+            }
+            return false;
         }
     }
 
     // 2. Fallback: superfloppy / unpartitioned FAT volume starting at LBA 0
-    if (ParseBpb(0)) {
+    if (ParseBpb(0, 0)) {
         m_mounted = true;
         return true;
     }
@@ -990,7 +995,7 @@ bool FatReadOnlyVfs::MountPartition() {
     return false;
 }
 
-bool FatReadOnlyVfs::ParseBpb(uint32_t part_lba) {
+bool FatReadOnlyVfs::ParseBpb(uint32_t part_lba, uint32_t max_part_sectors) {
     uint8_t vbr[512];
     if (!ReadSector(part_lba, vbr)) return false;
     if (vbr[510] != 0x55 || vbr[511] != 0xAA) return false;
@@ -1010,6 +1015,7 @@ bool FatReadOnlyVfs::ParseBpb(uint32_t part_lba) {
     if (sec_per_clus == 0 || (sec_per_clus & (sec_per_clus - 1)) != 0) return false;
     if (rsvd_sec == 0 || num_fats == 0 || num_fats > 4) return false;
     if (tot_sec == 0 || fat_sz == 0) return false;
+    if (max_part_sectors > 0 && tot_sec > max_part_sectors) return false;
     if (static_cast<uint64_t>(part_lba) + static_cast<uint64_t>(tot_sec) > 0xFFFFFFFFULL) return false;
 
     uint32_t root_dir_secs = ((static_cast<uint32_t>(root_ent_cnt) * 32u) + (byts_per_sec - 1u)) / byts_per_sec;
@@ -1068,9 +1074,9 @@ bool FatReadOnlyVfs::IsEndOfChain(uint32_t cluster) const {
     return (cluster & 0x0FFFFFFFu) >= 0x0FFFFFF8u;
 }
 
-uint32_t FatReadOnlyVfs::GetNextCluster(uint32_t cluster) const {
+bool FatReadOnlyVfs::GetNextCluster(uint32_t cluster, uint32_t& out_next) const {
     if (!m_mounted || cluster < 2 || (cluster - 2u) >= m_cluster_count) {
-        return 0x0FFFFFFFu;
+        return false;
     }
 
     const uint32_t fat_lba = m_part_lba + m_reserved_sectors + (m_active_fat_index * m_fat_size_sectors);
@@ -1081,19 +1087,20 @@ uint32_t FatReadOnlyVfs::GetNextCluster(uint32_t cluster) const {
         uint64_t sec_idx = byte_off / 512ULL;
         uint32_t in_sec = static_cast<uint32_t>(byte_off % 512ULL);
         if (sec_idx >= m_fat_size_sectors || !ReadSector(fat_lba + static_cast<uint32_t>(sec_idx), sec)) {
-            return 0xFFFu;
+            return false;
         }
         uint16_t raw = 0;
         if (in_sec == 511u) {
             uint8_t sec2[512];
             if (sec_idx + 1ULL >= m_fat_size_sectors || !ReadSector(fat_lba + static_cast<uint32_t>(sec_idx + 1ULL), sec2)) {
-                return 0xFFFu;
+                return false;
             }
             raw = static_cast<uint16_t>(sec[511]) | (static_cast<uint16_t>(sec2[0]) << 8);
         } else {
             raw = ReadLe16(sec + in_sec);
         }
-        return (cluster & 1u) ? ((raw >> 4) & 0x0FFFu) : (raw & 0x0FFFu);
+        out_next = (cluster & 1u) ? ((raw >> 4) & 0x0FFFu) : (raw & 0x0FFFu);
+        return true;
     }
 
     if (m_fs_type == FilesystemType::FAT16) {
@@ -1101,9 +1108,10 @@ uint32_t FatReadOnlyVfs::GetNextCluster(uint32_t cluster) const {
         uint64_t sec_idx = byte_off / 512ULL;
         uint32_t in_sec = static_cast<uint32_t>(byte_off % 512ULL);
         if (sec_idx >= m_fat_size_sectors || !ReadSector(fat_lba + static_cast<uint32_t>(sec_idx), sec)) {
-            return 0xFFFFu;
+            return false;
         }
-        return ReadLe16(sec + in_sec);
+        out_next = ReadLe16(sec + in_sec);
+        return true;
     }
 
     // FAT32
@@ -1111,9 +1119,10 @@ uint32_t FatReadOnlyVfs::GetNextCluster(uint32_t cluster) const {
     uint64_t sec_idx = byte_off / 512ULL;
     uint32_t in_sec = static_cast<uint32_t>(byte_off % 512ULL);
     if (sec_idx >= m_fat_size_sectors || !ReadSector(fat_lba + static_cast<uint32_t>(sec_idx), sec)) {
-        return 0x0FFFFFFFu;
+        return false;
     }
-    return ReadLe32(sec + in_sec) & 0x0FFFFFFFu;
+    out_next = ReadLe32(sec + in_sec) & 0x0FFFFFFFu;
+    return true;
 }
 
 void FatReadOnlyVfs::ParseDirectoryBuffer(
@@ -1238,16 +1247,20 @@ bool FatReadOnlyVfs::ListDirectory(const FatDirEntry* dir, std::vector<FatDirEnt
     std::unordered_set<uint32_t> visited;
     const size_t kMaxDirClusters = 2048;
     while (!IsEndOfChain(cur_cluster) && visited.size() < kMaxDirClusters) {
-        if ((cur_cluster - 2u) >= m_cluster_count) break;
+        if ((cur_cluster - 2u) >= m_cluster_count) return false;
         if (!visited.insert(cur_cluster).second) {
-            break; // Cycle protection
+            return false; // Cycle protection
         }
         uint32_t lba = ClusterToLba(cur_cluster);
         for (uint32_t s = 0; s < m_sectors_per_cluster; ++s) {
             if (!ReadSector(lba + s, sec)) return false;
             raw_dir.insert(raw_dir.end(), sec, sec + 512);
         }
-        cur_cluster = GetNextCluster(cur_cluster);
+        uint32_t next_cluster = 0;
+        if (!GetNextCluster(cur_cluster, next_cluster)) {
+            return false; // FAT read error
+        }
+        cur_cluster = next_cluster;
     }
 
     ParseDirectoryBuffer(raw_dir, out_entries);
@@ -1262,6 +1275,10 @@ bool FatReadOnlyVfs::FindPath(const std::string& guest_path, FatDirEntry& out_en
         if (p[i] == '/') p[i] = '\\';
     }
     if (p.size() >= 2 && p[1] == ':') {
+        const char drv = static_cast<char>(std::toupper(static_cast<unsigned char>(p[0])));
+        if (drv != 'C') {
+            return false; // Only drive-less or C: paths belong to the mounted primary HDD
+        }
         p = p.substr(2);
     }
 
@@ -1338,7 +1355,14 @@ bool FatReadOnlyVfs::ReadFile(
             size_t take = (std::min)(static_cast<size_t>(512), need);
             out_data.insert(out_data.end(), sec, sec + take);
         }
-        cur_cluster = GetNextCluster(cur_cluster);
+        if (out_data.size() >= target_bytes) {
+            break; // Satisfied capped or full read without needing next FAT lookup
+        }
+        uint32_t next_cluster = 0;
+        if (!GetNextCluster(cur_cluster, next_cluster)) {
+            return false;
+        }
+        cur_cluster = next_cluster;
     }
 
     return out_data.size() == target_bytes;
@@ -1478,6 +1502,13 @@ int ImageCrawler::ScoreDosCandidate(
     return score;
 }
 
+static void StbAppendPngToVector(void* context, void* data, int size) {
+    if (!context || !data || size <= 0) return;
+    std::vector<uint8_t>* buf = static_cast<std::vector<uint8_t>*>(context);
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    buf->insert(buf->end(), bytes, bytes + size);
+}
+
 bool ImageCrawler::WriteRgbaPng(
     const std::string& out_png_path,
     int width,
@@ -1488,8 +1519,12 @@ bool ImageCrawler::WriteRgbaPng(
     if (rgba_pixels.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 4U) {
         return false;
     }
-    EnsureParentDirsExist(out_png_path);
-    return stbi_write_png(out_png_path.c_str(), width, height, 4, rgba_pixels.data(), width * 4) != 0;
+    std::vector<uint8_t> encoded;
+    if (stbi_write_png_to_func(StbAppendPngToVector, &encoded, width, height, 4, rgba_pixels.data(), width * 4) == 0 ||
+        encoded.empty()) {
+        return false;
+    }
+    return WriteRawBytesToFile(out_png_path, encoded.data(), encoded.size());
 }
 
 bool ImageCrawler::ExtractPeNeIcon(
@@ -1702,11 +1737,21 @@ bool ImageCrawler::ParseWin9xLnkBuffer(
                     }
                     base_path = Utf16LeToUtf8(u16);
                 }
+                uint32_t common_suffix_uni_off = ReadLe32(data + pos + 32);
+                if (common_suffix_uni_off > 0 && common_suffix_uni_off < li_size) {
+                    std::vector<uint16_t> u16;
+                    for (size_t u = pos + common_suffix_uni_off; (li_end - u) >= 2; u += 2) {
+                        uint16_t ch = ReadLe16(data + u);
+                        if (ch == 0) break;
+                        u16.push_back(ch);
+                    }
+                    suffix = Utf16LeToUtf8(u16);
+                }
             }
             if (base_path.empty() && local_base_off > 0 && local_base_off < li_size) {
                 base_path = ReadNullTermAscii(data, li_end, pos + local_base_off);
             }
-            if (common_suffix_off > 0 && common_suffix_off < li_size) {
+            if (suffix.empty() && common_suffix_off > 0 && common_suffix_off < li_size) {
                 suffix = ReadNullTermAscii(data, li_end, pos + common_suffix_off);
             }
             if (!base_path.empty()) {
@@ -1876,6 +1921,20 @@ std::vector<ImageCrawler::CrawlResult> ImageCrawler::ScanMountedVfs(
     }
 
     std::set<std::string> seen_targets; // key: UPPER(full_target_path)
+    std::set<uint32_t> seen_clusters;   // deduplicates 8.3 vs LFN aliases to the same FAT file
+
+    auto reserve_fat_target = [&](const std::string& target_key, const FatDirEntry& fe) -> bool {
+        if (fe.first_cluster >= 2 && seen_clusters.find(fe.first_cluster) != seen_clusters.end()) {
+            return false;
+        }
+        if (!seen_targets.insert(target_key).second) {
+            return false;
+        }
+        if (fe.first_cluster >= 2) {
+            seen_clusters.insert(fe.first_cluster);
+        }
+        return true;
+    };
 
     auto make_icon_path = [&](const std::string& seed_key) -> std::string {
         if (icon_cache_dir.empty()) return "";
@@ -1948,7 +2007,7 @@ std::vector<ImageCrawler::CrawlResult> ImageCrawler::ScanMountedVfs(
                 std::string work_dir = lnk.working_dir.empty() ? dir_part : NormalizeGuestDir(lnk.working_dir);
                 std::string canonical_target = (dir_part.back() == '\\') ? (dir_part + file_part) : (dir_part + "\\" + file_part);
                 std::string target_key = ToUpperAscii(canonical_target);
-                if (!seen_targets.insert(target_key).second) continue;
+                if (!reserve_fat_target(target_key, target_fe)) continue;
 
                 CrawlResult cr;
                 cr.title = !lnk.description.empty() ? lnk.description : SignatureMatcher::PrettifyTitle(e.name);
@@ -2035,8 +2094,13 @@ std::vector<ImageCrawler::CrawlResult> ImageCrawler::ScanMountedVfs(
                     SplitGuestPath(it.executable, dir_part, file_part);
                     if (file_part.empty() || IsIgnoredUtilityBinary(file_part)) continue;
 
+                    FatDirEntry target_fe;
+                    if (!vfs.FindPath(it.executable, target_fe) || target_fe.is_directory) {
+                        continue; // Skip uninstalled / missing Program Manager targets
+                    }
+
                     std::string target_key = ToUpperAscii(dir_part + "\\" + file_part);
-                    if (!seen_targets.insert(target_key).second) continue;
+                    if (!reserve_fat_target(target_key, target_fe)) continue;
 
                     CrawlResult cr;
                     cr.title = it.title;
@@ -2047,20 +2111,24 @@ std::vector<ImageCrawler::CrawlResult> ImageCrawler::ScanMountedVfs(
                     cr.item_type = (ToUpperAscii(it.group_title).find("GAME") != std::string::npos) ? "GAME" : "APPLICATION";
 
                     // Check fingerprint & IGNORE_SYSTEM signature before extracting icon PNG
-                    FatDirEntry target_fe;
-                    if (vfs.FindPath(it.executable, target_fe) && !target_fe.is_directory) {
-                        std::vector<uint8_t> bin;
-                        if (vfs.ReadFile(target_fe, bin, 262144)) {
-                            ExecutableFingerprint fp;
-                            if (SignatureMatcher::ComputeExecutableFingerprint(bin.data(), bin.size(), file_part, fp, target_fe.file_size)) {
-                                cr.executable_crc32 = fp.header_crc32;
-                                SoftwareSignatureRecord sig;
-                                if (SignatureMatcher::MatchSignature(file_part, fp, sig)) {
-                                    if (sig.item_type == "IGNORE_SYSTEM") continue;
-                                    cr.title = sig.detected_title;
-                                    cr.item_type = sig.item_type;
-                                    cr.matched_signature = true;
-                                }
+                    std::vector<uint8_t> bin;
+                    if (vfs.ReadFile(target_fe, bin, 262144)) {
+                        ExecutableFingerprint fp;
+                        bool fp_ok = SignatureMatcher::ComputeExecutableFingerprint(bin.data(), bin.size(), file_part, fp, target_fe.file_size);
+                        if (!fp_ok && target_fe.file_size > bin.size()) {
+                            std::vector<uint8_t> full_bin;
+                            if (vfs.ReadFile(target_fe, full_bin, 8U * 1024U * 1024U)) {
+                                fp_ok = SignatureMatcher::ComputeExecutableFingerprint(full_bin.data(), full_bin.size(), file_part, fp, target_fe.file_size);
+                            }
+                        }
+                        if (fp_ok) {
+                            cr.executable_crc32 = fp.header_crc32;
+                            SoftwareSignatureRecord sig;
+                            if (SignatureMatcher::MatchSignature(file_part, fp, sig)) {
+                                if (sig.item_type == "IGNORE_SYSTEM") continue;
+                                cr.title = sig.detected_title;
+                                cr.item_type = sig.item_type;
+                                cr.matched_signature = true;
                             }
                         }
                     }
@@ -2179,7 +2247,17 @@ std::vector<ImageCrawler::CrawlResult> ImageCrawler::ScanMountedVfs(
 
             ExecutableFingerprint fp;
             if (!SignatureMatcher::ComputeExecutableFingerprint(bytes.data(), bytes.size(), fe.name, fp, fe.file_size)) {
-                continue;
+                if (fe.file_size > bytes.size()) {
+                    std::vector<uint8_t> full_bytes;
+                    if (vfs.ReadFile(fe, full_bytes, 8U * 1024U * 1024U) &&
+                        SignatureMatcher::ComputeExecutableFingerprint(full_bytes.data(), full_bytes.size(), fe.name, fp, fe.file_size)) {
+                        bytes.swap(full_bytes);
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
             }
 
             SoftwareSignatureRecord sig;
@@ -2224,7 +2302,7 @@ std::vector<ImageCrawler::CrawlResult> ImageCrawler::ScanMountedVfs(
             }
             const ScoredCandidate& c = scored[i];
             std::string target_key = ToUpperAscii(node.guest_path + "\\" + c.entry.name);
-            if (!seen_targets.insert(target_key).second) continue;
+            if (!reserve_fat_target(target_key, c.entry)) continue;
 
             CrawlResult cr;
             cr.working_dir = node.guest_path;
@@ -2321,19 +2399,38 @@ bool ImageCrawler::ScanAndCatalogMachine(
     }
     out_summary.total_discovered = static_cast<int>(discovered.size());
 
-    // Build existing-items lookup set for deduplication
+    // Build existing-items lookup map for deduplication & icon backfill
     std::vector<CatalogItemRecord> existing = db.GetItemsForMachine(machine_id);
-    std::set<std::string> existing_keys;
+    std::vector<std::pair<std::string, size_t>> existing_index;
+    existing_index.reserve(existing.size());
     for (size_t i = 0; i < existing.size(); ++i) {
         std::string key = ToUpperAscii(NormalizeGuestDir(existing[i].guest_working_dir) + "\\" + existing[i].guest_executable);
-        existing_keys.insert(key);
+        existing_index.push_back(std::make_pair(key, i));
     }
+
+    auto find_existing_idx = [&](const std::string& key) -> int {
+        for (size_t j = 0; j < existing_index.size(); ++j) {
+            if (existing_index[j].first == key) {
+                return static_cast<int>(existing_index[j].second);
+            }
+        }
+        return -1;
+    };
 
     for (size_t i = 0; i < discovered.size(); ++i) {
         const CrawlResult& cr = discovered[i];
         std::string key = ToUpperAscii(NormalizeGuestDir(cr.working_dir) + "\\" + cr.executable);
-        if (existing_keys.find(key) != existing_keys.end()) {
+        int exist_idx = find_existing_idx(key);
+        if (exist_idx >= 0) {
             out_summary.skipped_duplicates++;
+            // Backfill icon_cache_path if this SCANNED item previously lacked an icon
+            CatalogItemRecord& ex = existing[static_cast<size_t>(exist_idx)];
+            if (ex.source_origin == "SCANNED" && ex.icon_cache_path.empty() && !cr.icon_output_path.empty()) {
+                ex.icon_cache_path = cr.icon_output_path;
+                if (db.UpdateCatalogItem(ex)) {
+                    out_summary.icons_extracted++;
+                }
+            }
             continue;
         }
 
@@ -2358,7 +2455,8 @@ bool ImageCrawler::ScanAndCatalogMachine(
             if (!rec.icon_cache_path.empty()) {
                 out_summary.icons_extracted++;
             }
-            existing_keys.insert(key);
+            existing.push_back(rec);
+            existing_index.push_back(std::make_pair(key, existing.size() - 1));
         } else {
             out_summary.failed_inserts++;
         }

@@ -58,9 +58,9 @@ public:
 
 private:
     bool MountPartition();
-    bool ParseBpb(uint32_t part_lba);
+    bool ParseBpb(uint32_t part_lba, uint32_t max_part_sectors = 0);
     bool ReadSector(uint32_t abs_lba, uint8_t out_sector[512]) const;
-    uint32_t GetNextCluster(uint32_t cluster) const;
+    bool GetNextCluster(uint32_t cluster, uint32_t& out_next) const;
     bool IsEndOfChain(uint32_t cluster) const;
     uint32_t ClusterToLba(uint32_t cluster) const;
     void ParseDirectoryBuffer(const std::vector<uint8_t>& buf, std::vector<FatDirEntry>& out_entries) const;

@@ -317,8 +317,15 @@ bool SignatureMatcher::ComputeExecutableFingerprint(
          out_fp.format == KioskExecFormat::DOS_LX ||
          out_fp.format == KioskExecFormat::DOS_BW) &&
         out_fp.payload_offset > 0 && out_fp.payload_offset < size) {
-        const size_t avail = (std::min)(kHashWindow, size - out_fp.payload_offset);
-        out_fp.crc32_value = ComputeCrc32(data + out_fp.payload_offset, avail);
+        const size_t avail = size - out_fp.payload_offset;
+        const uint64_t expected_avail = (effective_size > out_fp.payload_offset)
+                                            ? (effective_size - out_fp.payload_offset)
+                                            : static_cast<uint64_t>(avail);
+        const uint64_t needed = (std::min)(static_cast<uint64_t>(kHashWindow), expected_avail);
+        if (static_cast<uint64_t>(avail) < needed) {
+            return false; // Incomplete LE/LX/BW payload window due to truncated prefix read
+        }
+        out_fp.crc32_value = ComputeCrc32(data + out_fp.payload_offset, static_cast<size_t>(needed));
     } else {
         uint8_t size_le[8];
         uint64_t sz = effective_size;
