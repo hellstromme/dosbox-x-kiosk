@@ -1306,6 +1306,7 @@ bool FatReadOnlyVfs::ListDirectory(const FatDirEntry* dir, std::vector<FatDirEnt
 
     std::unordered_set<uint32_t> visited;
     const size_t kMaxDirClusters = 2048;
+    bool saw_eod = false;
     while (!IsEndOfChain(cur_cluster) && visited.size() < kMaxDirClusters) {
         if (cur_cluster < 2 || (cur_cluster - 2u) >= m_cluster_count) return false;
         if (!visited.insert(cur_cluster).second) {
@@ -1315,7 +1316,15 @@ bool FatReadOnlyVfs::ListDirectory(const FatDirEntry* dir, std::vector<FatDirEnt
         for (uint32_t s = 0; s < m_sectors_per_cluster; ++s) {
             if (!ReadSector(lba + s, sec)) return false;
             raw_dir.insert(raw_dir.end(), sec, sec + 512);
+            for (size_t e = 0; e < 512; e += 32) {
+                if (sec[e] == 0x00) {
+                    saw_eod = true;
+                    break;
+                }
+            }
+            if (saw_eod) break;
         }
+        if (saw_eod) break;
         uint32_t next_cluster = 0;
         if (!GetNextCluster(cur_cluster, next_cluster)) {
             return false; // FAT read error
@@ -1326,8 +1335,8 @@ bool FatReadOnlyVfs::ListDirectory(const FatDirEntry* dir, std::vector<FatDirEnt
         cur_cluster = next_cluster;
     }
 
-    if (!IsEndOfChain(cur_cluster)) {
-        return false; // Exceeded directory cluster cap before reaching end-of-chain
+    if (!saw_eod && !IsEndOfChain(cur_cluster)) {
+        return false; // Exceeded directory cluster cap before reaching end-of-directory or end-of-chain
     }
 
     ParseDirectoryBuffer(raw_dir, out_entries);
