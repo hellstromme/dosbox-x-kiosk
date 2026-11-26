@@ -71,6 +71,9 @@ private:
     void RenderCaddyManagerModal();
     void RenderDeleteConfirmModal();
     void RenderImportArchiveModal();
+    void RenderFilePickerModal();
+    void OpenFilePicker(const std::string& initial_dir = "");
+    void RefreshFilePickerEntries();
 
     int m_selected_game_idx = 0;
     int m_selected_app_idx = 0;
@@ -113,6 +116,19 @@ private:
     int m_import_deploy_mode = 0; // 0 = Mode A (Appliance Container), 1 = Mode B (HDD Inject)
     int m_import_target_machine_idx = 0;
     std::string m_import_status_msg;
+
+    // In-Kiosk Dear ImGui file/folder picker state (no OS dialogs, stays fullscreen)
+    struct FilePickerEntry {
+        std::string name;
+        std::string full_path;
+        bool is_dir = false;
+        uint64_t size_bytes = 0;
+    };
+    bool m_show_file_picker = false;
+    bool m_picker_filter_archives = true;
+    std::string m_picker_current_dir;
+    int m_picker_selected_idx = -1;
+    std::vector<FilePickerEntry> m_picker_entries;
 };
 
 #endif // DOSBOX_KIOSK_VIEW_CAROUSEL_H

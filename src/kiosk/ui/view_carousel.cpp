@@ -10,7 +10,6 @@
 #include "../machine/archetypes.h"
 #include "../ingest/image_crawler.h"
 #include "../ingest/archive_importer.h"
-#include "../../libs/tinyfiledialogs/tinyfiledialogs.h"
 #include "logging.h"
 #include "imgui.h"
 
@@ -18,8 +17,21 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <direct.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -93,6 +105,7 @@ void ViewCarousel::ResetTransientModals() {
     m_show_caddy_modal = false;
     m_show_delete_modal = false;
     m_show_import_modal = false;
+    m_show_file_picker = false;
 }
 
 std::vector<CatalogItemRecord> ViewCarousel::FilterAndSortCatalogItems(
@@ -152,6 +165,13 @@ int ViewCarousel::ComputeNextSlotOrder(const std::vector<CaddyBindingRecord>& bi
 }
 
 bool ViewCarousel::HandleAction(KioskHubTab active_tab, KioskInputAction action) {
+    if (m_show_file_picker) {
+        if (action == KioskInputAction::ACTION_BACK) {
+            m_show_file_picker = false;
+            return true;
+        }
+        return false;
+    }
     if (m_show_context_modal || m_show_caddy_modal || m_show_delete_modal || m_show_import_modal) {
         if (action == KioskInputAction::ACTION_BACK) {
             m_show_context_modal = false;
@@ -1361,33 +1381,12 @@ void ViewCarousel::RenderImportArchiveModal() {
         ImGui::Spacing();
 
         ImGui::Text("Archive / Folder Path:");
-        ImGui::SetNextItemWidth(-1.0f);
+        const float browse_w = 115.0f;
+        ImGui::SetNextItemWidth((std::max)(140.0f, ImGui::GetContentRegionAvail().x - browse_w - 8.0f));
         ImGui::InputTextWithHint("##ImportSourcePath", "e.g. setup_game.exe or steam_game.zip", m_import_path_buf, sizeof(m_import_path_buf));
-        if (ImGui::Button("Browse File...##ImportBrowseFile", ImVec2(130.0f, 26.0f))) {
-            static const char* kImportFilters[2] = { "*.exe", "*.zip" };
-            const char* picked = tinyfd_openFileDialog(
-                "Select GOG Installer or Steam Archive",
-                "",
-                2,
-                kImportFilters,
-                "GOG Installers & Steam Archives (*.exe, *.zip)",
-                0
-            );
-            if (picked && picked[0] != '\0') {
-                std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", picked);
-                m_import_status_msg.clear();
-            }
-        }
         ImGui::SameLine();
-        if (ImGui::Button("Browse Folder...##ImportBrowseFolder", ImVec2(140.0f, 26.0f))) {
-            const char* picked_dir = tinyfd_selectFolderDialog(
-                "Select Unpacked Game Folder",
-                ""
-            );
-            if (picked_dir && picked_dir[0] != '\0') {
-                std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", picked_dir);
-                m_import_status_msg.clear();
-            }
+        if (ImGui::Button("Browse...##ImportBrowse", ImVec2(browse_w, 0.0f))) {
+            OpenFilePicker(m_import_path_buf);
         }
         ImGui::Spacing();
 
@@ -1466,8 +1465,414 @@ void ViewCarousel::RenderImportArchiveModal() {
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(100.0f, 32.0f))) {
             m_show_import_modal = false;
+            m_show_file_picker = false;
             ImGui::CloseCurrentPopup();
         }
+
+        RenderFilePickerModal();
+        ImGui::EndPopup();
+    }
+}
+
+namespace {
+
+#if defined(_WIN32)
+std::wstring PickerUtf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &w[0], n);
+    return w;
+}
+
+std::string PickerWideToUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string s(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr);
+    return s;
+}
+#endif
+
+bool PickerIsDirectory(const std::string& path) {
+    if (path.empty()) return false;
+#if defined(_WIN32)
+    DWORD attr = GetFileAttributesW(PickerUtf8ToWide(path).c_str());
+    return (attr != INVALID_FILE_ATTRIBUTES) && ((attr & FILE_ATTRIBUTE_DIRECTORY) != 0);
+#else
+    struct stat st;
+    return (stat(path.c_str(), &st) == 0) && S_ISDIR(st.st_mode);
+#endif
+}
+
+std::string PickerGetCwd() {
+#if defined(_WIN32)
+    wchar_t buf[1024];
+    DWORD n = GetCurrentDirectoryW(1024, buf);
+    if (n > 0 && n < 1024) return PickerWideToUtf8(std::wstring(buf, n));
+    return "C:\\";
+#else
+    char buf[1024];
+    if (getcwd(buf, sizeof(buf)) != nullptr) return std::string(buf);
+    return "/";
+#endif
+}
+
+std::string PickerGetHomeDir() {
+#if defined(_WIN32)
+    const char* up = std::getenv("USERPROFILE");
+    if (up && *up) return std::string(up);
+    return PickerGetCwd();
+#else
+    const char* home = std::getenv("HOME");
+    if (home && *home) return std::string(home);
+    return "/";
+#endif
+}
+
+std::string PickerNormalizeDir(const std::string& p) {
+    if (p.empty()) return "";
+    std::string out = p;
+#if defined(_WIN32)
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (out[i] == '/') out[i] = '\\';
+    }
+    while (out.size() > 3 && out.back() == '\\') out.pop_back();
+    if (out.size() == 2 && out[1] == ':') out.push_back('\\');
+#else
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (out[i] == '\\') out[i] = '/';
+    }
+    while (out.size() > 1 && out.back() == '/') out.pop_back();
+#endif
+    return out;
+}
+
+std::string PickerParentDir(const std::string& p) {
+    std::string np = PickerNormalizeDir(p);
+    if (np.empty()) return "";
+#if defined(_WIN32)
+    // At drive root like "C:\", go up to Drive List ("")
+    if (np.size() <= 3 && np.size() >= 2 && np[1] == ':') return "";
+    size_t pos = np.find_last_of('\\');
+    if (pos == std::string::npos) return "";
+    if (pos == 2 && np[1] == ':') return np.substr(0, 3);
+    return np.substr(0, pos);
+#else
+    if (np == "/") return "/";
+    size_t pos = np.find_last_of('/');
+    if (pos == std::string::npos || pos == 0) return "/";
+    return np.substr(0, pos);
+#endif
+}
+
+std::string PickerJoin(const std::string& dir, const std::string& name) {
+    if (dir.empty()) return name;
+#if defined(_WIN32)
+    if (dir.back() == '\\' || dir.back() == '/') return dir + name;
+    return dir + "\\" + name;
+#else
+    if (dir.back() == '/') return dir + name;
+    return dir + "/" + name;
+#endif
+}
+
+bool PickerMatchesImportExt(const std::string& filename) {
+    std::string low = ToLowerCopy(filename);
+    if (low.size() >= 4) {
+        std::string ext = low.substr(low.size() - 4);
+        if (ext == ".exe" || ext == ".zip") return true;
+    }
+    return false;
+}
+
+std::string PickerFormatSize(uint64_t bytes) {
+    char buf[32];
+    if (bytes >= 1024ULL * 1024ULL) {
+        std::snprintf(buf, sizeof(buf), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+    } else if (bytes >= 1024ULL) {
+        std::snprintf(buf, sizeof(buf), "%.1f KB", static_cast<double>(bytes) / 1024.0);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%u B", static_cast<unsigned int>(bytes));
+    }
+    return std::string(buf);
+}
+
+} // anonymous namespace
+
+void ViewCarousel::OpenFilePicker(const std::string& initial_dir) {
+    std::string start_dir;
+    if (!initial_dir.empty()) {
+        std::string norm = PickerNormalizeDir(initial_dir);
+        if (PickerIsDirectory(norm)) {
+            start_dir = norm;
+        } else {
+            std::string parent = PickerParentDir(norm);
+            if (!parent.empty() && PickerIsDirectory(parent)) {
+                start_dir = parent;
+            }
+        }
+    }
+    if (start_dir.empty()) {
+        start_dir = PickerGetCwd();
+    }
+    m_picker_current_dir = start_dir;
+    m_picker_selected_idx = -1;
+    RefreshFilePickerEntries();
+    m_show_file_picker = true;
+}
+
+void ViewCarousel::RefreshFilePickerEntries() {
+    m_picker_entries.clear();
+    m_picker_selected_idx = -1;
+
+#if defined(_WIN32)
+    if (m_picker_current_dir.empty()) {
+        // Drive root listing (C:\, D:\, ...)
+        DWORD mask = GetLogicalDrives();
+        for (int i = 0; i < 26; ++i) {
+            if (mask & (1U << i)) {
+                std::string drv;
+                drv.push_back(static_cast<char>('A' + i));
+                drv += ":\\";
+                FilePickerEntry e;
+                e.name = drv;
+                e.full_path = drv;
+                e.is_dir = true;
+                m_picker_entries.push_back(e);
+            }
+        }
+        return;
+    }
+
+    std::wstring pattern = PickerUtf8ToWide(PickerJoin(m_picker_current_dir, "*"));
+    WIN32_FIND_DATAW ffd;
+    HANDLE h = FindFirstFileW(pattern.c_str(), &ffd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            std::string name = PickerWideToUtf8(ffd.cFileName);
+            if (name == "." || name == "..") continue;
+            bool is_dir = ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+            if (!is_dir && m_picker_filter_archives && !PickerMatchesImportExt(name)) {
+                continue;
+            }
+            FilePickerEntry e;
+            e.name = name;
+            e.full_path = PickerJoin(m_picker_current_dir, name);
+            e.is_dir = is_dir;
+            ULARGE_INTEGER sz;
+            sz.LowPart = ffd.nFileSizeLow;
+            sz.HighPart = ffd.nFileSizeHigh;
+            e.size_bytes = is_dir ? 0ULL : sz.QuadPart;
+            m_picker_entries.push_back(e);
+        } while (FindNextFileW(h, &ffd));
+        FindClose(h);
+    }
+#else
+    if (m_picker_current_dir.empty()) {
+        m_picker_current_dir = "/";
+    }
+    DIR* d = opendir(m_picker_current_dir.c_str());
+    if (d) {
+        struct dirent* ent = nullptr;
+        while ((ent = readdir(d)) != nullptr) {
+            std::string name(ent->d_name);
+            if (name == "." || name == "..") continue;
+            std::string full = PickerJoin(m_picker_current_dir, name);
+            struct stat st;
+            bool is_dir = false;
+            uint64_t sz = 0;
+            if (stat(full.c_str(), &st) == 0) {
+                is_dir = S_ISDIR(st.st_mode);
+                sz = is_dir ? 0ULL : static_cast<uint64_t>(st.st_size);
+            }
+            if (!is_dir && m_picker_filter_archives && !PickerMatchesImportExt(name)) {
+                continue;
+            }
+            FilePickerEntry e;
+            e.name = name;
+            e.full_path = full;
+            e.is_dir = is_dir;
+            e.size_bytes = sz;
+            m_picker_entries.push_back(e);
+        }
+        closedir(d);
+    }
+#endif
+
+    std::sort(m_picker_entries.begin(), m_picker_entries.end(),
+              [](const FilePickerEntry& a, const FilePickerEntry& b) {
+                  if (a.is_dir != b.is_dir) return a.is_dir;
+                  return ToLowerCopy(a.name) < ToLowerCopy(b.name);
+              });
+}
+
+void ViewCarousel::RenderFilePickerModal() {
+    static const char* kPickerPopupId = "Select Archive or Folder###KioskFilePickerModal";
+    if (m_show_file_picker && !ImGui::IsPopupOpen(kPickerPopupId)) {
+        ImGui::OpenPopup(kPickerPopupId);
+    }
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    if (vp) {
+        const float mw = (std::min)(620.0f, (std::max)(360.0f, vp->WorkSize.x - 24.0f));
+        const float mh = (std::min)(440.0f, (std::max)(300.0f, vp->WorkSize.y - 24.0f));
+        ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(mw, mh), ImGuiCond_Always);
+    }
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
+    if (ImGui::BeginPopupModal(kPickerPopupId, &m_show_file_picker, flags)) {
+        if (!m_show_file_picker) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+
+        const KioskThemePalette& pal = KioskUI::GetInstance().GetThemePalette();
+
+        // Top navigation bar
+        if (ImGui::Button("Up (..)")) {
+            m_picker_current_dir = PickerParentDir(m_picker_current_dir);
+            RefreshFilePickerEntries();
+        }
+        ImGui::SameLine();
+#if defined(_WIN32)
+        if (ImGui::Button("Drives")) {
+            m_picker_current_dir.clear();
+            RefreshFilePickerEntries();
+        }
+#else
+        if (ImGui::Button("/")) {
+            m_picker_current_dir = "/";
+            RefreshFilePickerEntries();
+        }
+#endif
+        ImGui::SameLine();
+        if (ImGui::Button("Home")) {
+            m_picker_current_dir = PickerGetHomeDir();
+            RefreshFilePickerEntries();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("App Dir")) {
+            m_picker_current_dir = PickerGetCwd();
+            RefreshFilePickerEntries();
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox(".exe / .zip only", &m_picker_filter_archives)) {
+            RefreshFilePickerEntries();
+        }
+
+        ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
+        ImGui::TextWrapped("Location: %s", m_picker_current_dir.empty() ? "(Drives)" : m_picker_current_dir.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+
+        // Scrollable directory / file listing
+        const float list_h = (std::max)(120.0f, ImGui::GetContentRegionAvail().y - 46.0f);
+        if (ImGui::BeginTable("##KioskFilePickerTable", 3,
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH,
+                              ImVec2(-1.0f, list_h))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 84.0f);
+            ImGui::TableHeadersRow();
+
+            int navigate_idx = -1;
+            int pick_file_idx = -1;
+
+            for (size_t i = 0; i < m_picker_entries.size(); ++i) {
+                const FilePickerEntry& entry = m_picker_entries[i];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+
+                const char* badge = "[FILE]";
+                if (entry.is_dir) {
+                    badge = "[DIR]";
+                } else {
+                    std::string low = ToLowerCopy(entry.name);
+                    if (low.size() >= 4 && low.substr(low.size() - 4) == ".zip") badge = "[ZIP]";
+                    else if (low.size() >= 4 && low.substr(low.size() - 4) == ".exe") badge = "[EXE]";
+                }
+
+                const bool is_sel = (static_cast<int>(i) == m_picker_selected_idx);
+                ImGui::PushID(static_cast<int>(i));
+                if (ImGui::Selectable(badge, is_sel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                    m_picker_selected_idx = static_cast<int>(i);
+                    if (ImGui::IsMouseDoubleClicked(0)) {
+                        if (entry.is_dir) navigate_idx = static_cast<int>(i);
+                        else pick_file_idx = static_cast<int>(i);
+                    }
+                }
+                ImGui::PopID();
+
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(entry.name.c_str());
+
+                ImGui::TableSetColumnIndex(2);
+                if (!entry.is_dir) {
+                    std::string sz_str = PickerFormatSize(entry.size_bytes);
+                    ImGui::TextUnformatted(sz_str.c_str());
+                } else {
+                    ImGui::TextUnformatted("--");
+                }
+            }
+            ImGui::EndTable();
+
+            if (navigate_idx >= 0) {
+                m_picker_current_dir = m_picker_entries[static_cast<size_t>(navigate_idx)].full_path;
+                RefreshFilePickerEntries();
+            } else if (pick_file_idx >= 0) {
+                std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s",
+                              m_picker_entries[static_cast<size_t>(pick_file_idx)].full_path.c_str());
+                m_import_status_msg.clear();
+                m_show_file_picker = false;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        const bool has_sel = (m_picker_selected_idx >= 0 &&
+                              m_picker_selected_idx < static_cast<int>(m_picker_entries.size()));
+        const bool sel_is_dir = has_sel && m_picker_entries[static_cast<size_t>(m_picker_selected_idx)].is_dir;
+
+        if (!has_sel) ImGui::BeginDisabled();
+        if (ImGui::Button(sel_is_dir ? "Open Folder" : "Select File", ImVec2(120.0f, 30.0f))) {
+            const FilePickerEntry& chosen = m_picker_entries[static_cast<size_t>(m_picker_selected_idx)];
+            if (chosen.is_dir) {
+                m_picker_current_dir = chosen.full_path;
+                RefreshFilePickerEntries();
+            } else {
+                std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", chosen.full_path.c_str());
+                m_import_status_msg.clear();
+                m_show_file_picker = false;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        if (!has_sel) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        const bool can_use_folder = !m_picker_current_dir.empty();
+        if (!can_use_folder) ImGui::BeginDisabled();
+        if (ImGui::Button("Use This Folder", ImVec2(135.0f, 30.0f))) {
+            std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", m_picker_current_dir.c_str());
+            m_import_status_msg.clear();
+            m_show_file_picker = false;
+            ImGui::CloseCurrentPopup();
+        }
+        if (!can_use_folder) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(95.0f, 30.0f))) {
+            m_show_file_picker = false;
+            ImGui::CloseCurrentPopup();
+        }
+
         ImGui::EndPopup();
     }
 }
