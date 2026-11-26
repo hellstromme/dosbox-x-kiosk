@@ -7,9 +7,61 @@
 #include "sqlite3.h"
 #include "logging.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <direct.h>
+#include <cwchar>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
 namespace {
+
+#if defined(_WIN32)
+void EnsureDirectoryRecursiveWide(const std::wstring& dir_path) {
+    if (dir_path.empty()) return;
+    std::wstring cur;
+    for (size_t i = 0; i < dir_path.size(); ++i) {
+        wchar_t c = dir_path[i];
+        cur.push_back(c);
+        if ((c == L'\\' || c == L'/') && cur.size() > 1) {
+            if (cur.size() == 3 && cur[1] == L':') continue;
+            _wmkdir(cur.c_str());
+        }
+    }
+    _wmkdir(dir_path.c_str());
+}
+
+std::string WideToUtf8(const std::wstring& ws) {
+    if (ws.empty()) return "";
+    int needed = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return "";
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), &out[0], needed, nullptr, nullptr);
+    return out;
+}
+#else
+void EnsureDirectoryRecursive(const std::string& dir_path) {
+    if (dir_path.empty()) return;
+    std::string cur;
+    for (size_t i = 0; i < dir_path.size(); ++i) {
+        char c = dir_path[i];
+        cur.push_back(c);
+        if ((c == '\\' || c == '/') && cur.size() > 1) {
+            mkdir(cur.c_str(), 0755);
+        }
+    }
+    mkdir(dir_path.c_str(), 0755);
+}
+#endif
 
 // Helper to bind nullable std::string
 void BindTextOrNull(sqlite3_stmt* stmt, int index, const std::string& val) {
@@ -54,6 +106,48 @@ bool KioskDatabase::IsOpen() const {
     return m_db != nullptr;
 }
 
+std::string KioskDatabase::GetActiveDatabasePath() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_active_path;
+}
+
+std::string KioskDatabase::GetDefaultDatabasePath() {
+#if defined(_WIN32)
+    const wchar_t* local_app = _wgetenv(L"LOCALAPPDATA");
+    if (local_app && local_app[0] != L'\0') {
+        std::wstring dir = std::wstring(local_app) + L"\\DOSBox-Kiosk";
+        EnsureDirectoryRecursiveWide(dir);
+        std::string utf8 = WideToUtf8(dir + L"\\catalog.db");
+        if (!utf8.empty()) return utf8;
+    }
+    const wchar_t* app_data = _wgetenv(L"APPDATA");
+    if (app_data && app_data[0] != L'\0') {
+        std::wstring dir = std::wstring(app_data) + L"\\DOSBox-Kiosk";
+        EnsureDirectoryRecursiveWide(dir);
+        std::string utf8 = WideToUtf8(dir + L"\\catalog.db");
+        if (!utf8.empty()) return utf8;
+    }
+    return ".\\dosbox-kiosk-catalog.db";
+#else
+    if (access("/var/lib/dosbox-kiosk", W_OK) == 0) {
+        return "/var/lib/dosbox-kiosk/catalog.db";
+    }
+    const char* xdg_data = std::getenv("XDG_DATA_HOME");
+    if (xdg_data && xdg_data[0] != '\0') {
+        std::string dir = std::string(xdg_data) + "/dosbox-kiosk";
+        EnsureDirectoryRecursive(dir);
+        return dir + "/catalog.db";
+    }
+    const char* home = std::getenv("HOME");
+    if (home && home[0] != '\0') {
+        std::string dir = std::string(home) + "/.local/share/dosbox-kiosk";
+        EnsureDirectoryRecursive(dir);
+        return dir + "/catalog.db";
+    }
+    return "./dosbox-kiosk-catalog.db";
+#endif
+}
+
 bool KioskDatabase::Open(const std::string& db_path) {
     std::lock_guard<std::mutex> lock(m_mutex);
     return OpenInternal(db_path);
@@ -85,6 +179,7 @@ bool KioskDatabase::OpenInternal(const std::string& db_path) {
     }
 
     LOG_MSG("KIOSK: Opened SQLite database '%s' (SQLite v%s)", path.c_str(), sqlite3_libversion());
+    m_active_path = path;
 
     if (!InitializeSchema()) {
         LOG_MSG("KIOSK: Failed to initialize schema in '%s'", path.c_str());
@@ -110,6 +205,7 @@ void KioskDatabase::CloseInternal() {
         sqlite3_close_v2(m_db);
         m_db = nullptr;
     }
+    m_active_path.clear();
 }
 
 std::string KioskDatabase::GetSQLiteVersion() const {
@@ -275,6 +371,22 @@ bool KioskDatabase::SeedDefaultData() {
         sqlite3_finalize(check_stmt);
     }
 
+    // 3. Seed starter software_signatures for known DOS utilities / extenders (idempotent)
+    check_stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "SELECT COUNT(*) FROM software_signatures;", -1, &check_stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(check_stmt) == SQLITE_ROW && sqlite3_column_int(check_stmt, 0) == 0) {
+            const char* seed_sig_sql =
+                "INSERT OR IGNORE INTO software_signatures (exec_filename, file_size_bytes, header_crc32, detected_title, item_type, recommended_archetype) VALUES\n"
+                "('DOS4GW.EXE',   0, '00000000', 'DOS/4GW Protected Mode Extender', 'IGNORE_SYSTEM', NULL),\n"
+                "('DOS32A.EXE',   0, '00000000', 'DOS/32A Protected Mode Extender', 'IGNORE_SYSTEM', NULL),\n"
+                "('CWSDPMI.EXE',  0, '00000000', 'CWSDPMI DPMI Server',             'IGNORE_SYSTEM', NULL),\n"
+                "('UNIVBE.EXE',   0, '00000000', 'SciTech UniVBE Display Driver',   'IGNORE_SYSTEM', NULL),\n"
+                "('SETSOUND.EXE', 0, '00000000', 'Miles Sound System Config',       'IGNORE_SYSTEM', NULL);\n";
+            ExecuteSqlInternal(seed_sig_sql);
+        }
+        sqlite3_finalize(check_stmt);
+    }
+
     return true;
 }
 
@@ -328,7 +440,11 @@ bool KioskDatabase::UpdateConfig(const KioskConfigRecord& config) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) {
+        KioskUI::GetInstance().InvalidateCatalogCache();
+        KioskUI::GetInstance().InvalidateSettingsDraft();
+        return true;
+    }
     return false;
 }
 
@@ -665,10 +781,10 @@ bool KioskDatabase::GetItem(const std::string& id, CatalogItemRecord& out_item) 
     return found;
 }
 
-std::vector<CatalogItemRecord> KioskDatabase::GetItemsForMachine(const std::string& machine_id) {
+bool KioskDatabase::GetItemsForMachine(const std::string& machine_id, std::vector<CatalogItemRecord>& out_items) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    std::vector<CatalogItemRecord> list;
-    if (!m_db || machine_id.empty()) return list;
+    out_items.clear();
+    if (!m_db || machine_id.empty()) return false;
 
     const char* sql = "SELECT id, machine_id, item_type, title, developer, release_year, "
                       "source_origin, launch_mechanism, host_container_dir, guest_working_dir, "
@@ -676,10 +792,11 @@ std::vector<CatalogItemRecord> KioskDatabase::GetItemsForMachine(const std::stri
                       "screenshot_cache_path, executable_crc32, play_count, last_launched_at, "
                       "is_favorite FROM catalog_items WHERE machine_id = ? ORDER BY title ASC;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return list;
+    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
 
     sqlite3_bind_text(stmt, 1, machine_id.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         CatalogItemRecord it;
         it.id = ColumnTextSafe(stmt, 0);
         it.machine_id = ColumnTextSafe(stmt, 1);
@@ -700,9 +817,19 @@ std::vector<CatalogItemRecord> KioskDatabase::GetItemsForMachine(const std::stri
         it.play_count = sqlite3_column_int(stmt, 16);
         it.last_launched_at = ColumnTextSafe(stmt, 17);
         it.is_favorite = sqlite3_column_int(stmt, 18) != 0;
-        list.push_back(it);
+        out_items.push_back(it);
     }
     sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        out_items.clear();
+        return false;
+    }
+    return true;
+}
+
+std::vector<CatalogItemRecord> KioskDatabase::GetItemsForMachine(const std::string& machine_id) {
+    std::vector<CatalogItemRecord> list;
+    GetItemsForMachine(machine_id, list);
     return list;
 }
 

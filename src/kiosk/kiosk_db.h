@@ -15,6 +15,8 @@ public:
     bool Open(const std::string& db_path);
     void Close();
     bool IsOpen() const;
+    std::string GetActiveDatabasePath() const;
+    static std::string GetDefaultDatabasePath();
 
     std::string GetSQLiteVersion() const;
     bool InitializeSchema();
@@ -37,6 +39,7 @@ public:
     std::vector<CatalogItemRecord> GetItemsByType(const std::string& item_type);
     bool GetItem(const std::string& id, CatalogItemRecord& out_item);
     std::vector<CatalogItemRecord> GetItemsForMachine(const std::string& machine_id);
+    bool GetItemsForMachine(const std::string& machine_id, std::vector<CatalogItemRecord>& out_items);
     bool InsertCatalogItem(const CatalogItemRecord& item);
     bool UpdateCatalogItem(const CatalogItemRecord& item);
     bool DeleteCatalogItem(const std::string& id);
@@ -80,6 +83,7 @@ private:
 
     mutable std::mutex m_mutex;
     sqlite3* m_db = nullptr;
+    std::string m_active_path;
 };
 
 #endif // DOSBOX_KIOSK_DB_H

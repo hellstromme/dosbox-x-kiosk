@@ -6090,6 +6090,22 @@ void GFX_Events() {
                     continue;
                 }
             }
+            if (kstate == KioskState::STATE_COUNTDOWN_IDLE || kstate == KioskState::STATE_SHELL_INTERACTIVE) {
+                if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
+                    const SDL_Keycode sym = event.key.keysym.sym;
+                    const Uint16 mod = event.key.keysym.mod;
+                    const bool is_alt_enter =
+                        ((sym == SDLK_RETURN || sym == SDLK_KP_ENTER) && (mod & KMOD_ALT) != 0);
+                    const bool is_f11_alone =
+                        (sym == SDLK_F11 && (mod & (KMOD_CTRL | KMOD_ALT | KMOD_SHIFT)) == 0 &&
+                         (kb_state == nullptr || kb_state[SDL_SCANCODE_O] == 0));
+                    if (is_alt_enter || is_f11_alone) {
+                        extern void Kiosk_TogglePreBootFullscreen(void);
+                        Kiosk_TogglePreBootFullscreen();
+                        continue;
+                    }
+                }
+            }
             if (kstate == KioskState::STATE_COUNTDOWN_IDLE) {
                 KioskManager::GetInstance().HandlePreBootInputEvent(event);
             } else if (kstate == KioskState::STATE_SHELL_INTERACTIVE || kstate == KioskState::STATE_RUNTIME_OVERLAY) {
@@ -8682,11 +8698,14 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
     if (control->opt_kiosk_mode) {
         fprintf(stderr, "KIOSK: DOSBox-X Kiosk Edition flag detected.\n");
         LOG_MSG("KIOSK: DOSBox-X Kiosk Edition flag detected.");
-        saved_kiosk_db = control->opt_kiosk_db;
+        const std::string effective_kiosk_db = control->opt_kiosk_db.empty()
+            ? KioskDatabase::GetDefaultDatabasePath()
+            : control->opt_kiosk_db;
+        saved_kiosk_db = effective_kiosk_db;
         saved_kiosk_conf = control->opt_kiosk_conf;
         KioskManager::GetInstance().SetKioskModeActive(true);
         KioskManager::GetInstance().SetSkipCountdown(control->opt_kiosk_skip_countdown);
-        if (KioskManager::GetInstance().Initialize(control->opt_kiosk_db, control->opt_kiosk_conf)) {
+        if (KioskManager::GetInstance().Initialize(effective_kiosk_db, control->opt_kiosk_conf)) {
             fprintf(stderr, "KIOSK: Subsystems initialized successfully (SQLite %s, ImGui %s).\n",
                     KioskDatabase::GetInstance().GetSQLiteVersion().c_str(),
                     KioskUI::GetInstance().GetImGuiVersion().c_str());
@@ -9958,6 +9977,10 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
             menu.hidecycles = (control->opt_showcycles||sdl_sec->Get_bool("showdetails") ? false : true);
 #if defined(C_KIOSK)
             if (KioskManager::GetInstance().IsKioskModeActive()) {
+                if (sdl.desktop.fullscreen) {
+                    extern void Kiosk_ApplyPreBootFullscreen(bool enable);
+                    Kiosk_ApplyPreBootFullscreen(true);
+                }
                 KioskManager::GetInstance().RunMainLoop();
                 if (KioskManager::GetInstance().IsExitRequested()) {
                     GFX_ShutDown();
@@ -11117,10 +11140,59 @@ void SDL_GL_SwapBuffers(void) {
 #endif
 
 #if defined(C_KIOSK)
+bool Kiosk_IsPreBootFullscreen(void) {
+#if defined(C_SDL2)
+    if (sdl.window != NULL) {
+        const Uint32 wf = SDL_GetWindowFlags(sdl.window);
+        if (wf & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) {
+            return true;
+        }
+    }
+#endif
+    return sdl.desktop.fullscreen;
+}
+
+void Kiosk_ApplyPreBootFullscreen(bool enable) {
+#if defined(C_SDL2)
+    if (sdl.desktop.prevent_fullscreen || sdl.window == NULL) {
+        return;
+    }
+    if (SDL_SetWindowFullscreen(sdl.window, enable ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) != 0) {
+        LOG_MSG("KIOSK: SDL_SetWindowFullscreen(%d) failed: %s", enable ? 1 : 0, SDL_GetError());
+        return;
+    }
+    sdl.desktop.fullscreen = enable;
+    if (sdl.mouse.locked) {
+        GFX_CaptureMouse();
+    }
+    SDL_SetRelativeMouseMode(SDL_FALSE);
+    SDL_ShowCursor(SDL_ENABLE);
+
+    int win_w = 0, win_h = 0;
+    SDL_GetWindowSize(sdl.window, &win_w, &win_h);
+    if (win_w > 0 && win_h > 0) {
+        currentWindowWidth = win_w;
+        currentWindowHeight = win_h;
+    }
+    SetVal("sdl", "fullscreen", enable ? "true" : "false");
+#else
+    (void)enable;
+#endif
+}
+
+void Kiosk_TogglePreBootFullscreen(void) {
+    Kiosk_ApplyPreBootFullscreen(!Kiosk_IsPreBootFullscreen());
+}
+
 void Kiosk_PumpPreBootFrame(void) {
     GFX_Events();
 #if defined(C_SDL2) && defined(C_OPENGL)
     if (OpenGL_using() && sdl.window != NULL) {
+        int dw = 0, dh = 0;
+        SDL_GL_GetDrawableSize(sdl.window, &dw, &dh);
+        if (dw > 0 && dh > 0) {
+            glViewport(0, 0, dw, dh);
+        }
         glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         SDL_GL_SwapBuffers();

@@ -21,6 +21,9 @@
 #include <cstdio>
 #include <vector>
 
+extern bool Kiosk_IsPreBootFullscreen(void);
+extern void Kiosk_TogglePreBootFullscreen(void);
+
 KioskUI& KioskUI::GetInstance() {
     static KioskUI instance;
     return instance;
@@ -232,8 +235,11 @@ void KioskUI::RenderFrame() {
 
 void KioskUI::InvalidateCatalogCache() {
     m_cache_loaded = false;
-    m_settings_draft_loaded = false;
     ViewWatchdog::GetInstance().InvalidatePreview();
+}
+
+void KioskUI::InvalidateSettingsDraft() {
+    m_settings_draft_loaded = false;
 }
 
 void KioskUI::EnsureCatalogCacheLoaded() {
@@ -631,6 +637,16 @@ void KioskUI::RenderInteractiveShell() {
         }
         if (ImGui::Button("Quick DOS", ImVec2(95.0f, 30.0f))) {
             KioskManager::GetInstance().RequestDefaultDosboxLaunch();
+        }
+
+        const bool is_fs = Kiosk_IsPreBootFullscreen();
+        const char* fs_label = is_fs ? "Windowed" : "Fullscreen";
+        const float fs_btn_w = ImGui::CalcTextSize(fs_label).x + pad_x + 8.0f;
+        if (ImGui::GetItemRectMax().x + 8.0f + fs_btn_w <= win_right) {
+            ImGui::SameLine(0.0f, 8.0f);
+        }
+        if (ImGui::Button(fs_label, ImVec2(fs_btn_w, 30.0f))) {
+            Kiosk_TogglePreBootFullscreen();
         }
 
         ImGui::Spacing();
