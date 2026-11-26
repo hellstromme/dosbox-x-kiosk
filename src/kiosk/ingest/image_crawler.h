@@ -131,6 +131,7 @@ public:
         int skipped_duplicates = 0;
         int failed_inserts = 0;
         int icons_extracted = 0;
+        int failed_icon_updates = 0;
         std::string error_message;
     };
 

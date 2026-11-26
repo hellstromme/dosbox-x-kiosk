@@ -823,11 +823,20 @@ void ViewCarousel::RenderMachinesTab() {
                                           summary.icons_extracted,
                                           summary.icons_extracted == 1 ? "" : "s");
                         } else if (summary.skipped_duplicates > 0) {
-                            std::snprintf(toast_buf, sizeof(toast_buf),
-                                          "Scanned '%s': all %d title%s already cataloged",
-                                          mach.display_name.c_str(),
-                                          summary.skipped_duplicates,
-                                          summary.skipped_duplicates == 1 ? "" : "s");
+                            if (summary.failed_icon_updates > 0) {
+                                std::snprintf(toast_buf, sizeof(toast_buf),
+                                              "Scanned '%s': %d already cataloged (%d icon update%s failed)",
+                                              mach.display_name.c_str(),
+                                              summary.skipped_duplicates,
+                                              summary.failed_icon_updates,
+                                              summary.failed_icon_updates == 1 ? "" : "s");
+                            } else {
+                                std::snprintf(toast_buf, sizeof(toast_buf),
+                                              "Scanned '%s': all %d title%s already cataloged",
+                                              mach.display_name.c_str(),
+                                              summary.skipped_duplicates,
+                                              summary.skipped_duplicates == 1 ? "" : "s");
+                            }
                         } else {
                             std::snprintf(toast_buf, sizeof(toast_buf),
                                           "Scanned '%s': no new software found",

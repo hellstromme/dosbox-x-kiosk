@@ -22,6 +22,10 @@
 #include <utility>
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <direct.h>
 #include <sys/stat.h>
 #else
@@ -418,14 +422,26 @@ bool DecodeIconPayloadToRgba(
 bool WriteRawBytesToFile(const std::string& path, const uint8_t* data, size_t size) {
     if (path.empty() || !data || size == 0) return false;
     EnsureParentDirsExist(path);
-    std::FILE* f = std::fopen(path.c_str(), "wb");
+    const std::string tmp_path = path + ".tmp";
+    std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
     if (!f) return false;
     const size_t written = std::fwrite(data, 1, size, f);
     const bool closed_ok = (std::fclose(f) == 0);
     if (written != size || !closed_ok) {
-        std::remove(path.c_str());
+        std::remove(tmp_path.c_str());
         return false;
     }
+#if defined(_WIN32)
+    if (!MoveFileExA(tmp_path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+#else
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+#endif
     return true;
 }
 
@@ -982,7 +998,16 @@ bool FatReadOnlyVfs::MountPartition() {
                 m_mounted = true;
                 return true;
             }
-            return false;
+            // If best_lba contains a real VBR (0x55AA + FAT jump) that failed validation
+            // (e.g. BPB tot_sec > partition lba_count), treat the MBR partition as rejected
+            // rather than falling back to LBA 0. Otherwise allow superfloppy fallback if LBA 0
+            // itself is an unpartitioned FAT boot sector.
+            uint8_t probe_vbr[512];
+            if (ReadSector(best_lba, probe_vbr) &&
+                probe_vbr[510] == 0x55 && probe_vbr[511] == 0xAA &&
+                ((probe_vbr[0] == 0xEB && probe_vbr[2] == 0x90) || probe_vbr[0] == 0xE9)) {
+                return false;
+            }
         }
     }
 
@@ -1068,7 +1093,6 @@ uint32_t FatReadOnlyVfs::ClusterToLba(uint32_t cluster) const {
 }
 
 bool FatReadOnlyVfs::IsEndOfChain(uint32_t cluster) const {
-    if (cluster < 2) return true;
     if (m_fs_type == FilesystemType::FAT12) return cluster >= 0xFF8u;
     if (m_fs_type == FilesystemType::FAT16) return cluster >= 0xFFF8u;
     return (cluster & 0x0FFFFFFFu) >= 0x0FFFFFF8u;
@@ -1247,7 +1271,7 @@ bool FatReadOnlyVfs::ListDirectory(const FatDirEntry* dir, std::vector<FatDirEnt
     std::unordered_set<uint32_t> visited;
     const size_t kMaxDirClusters = 2048;
     while (!IsEndOfChain(cur_cluster) && visited.size() < kMaxDirClusters) {
-        if ((cur_cluster - 2u) >= m_cluster_count) return false;
+        if (cur_cluster < 2 || (cur_cluster - 2u) >= m_cluster_count) return false;
         if (!visited.insert(cur_cluster).second) {
             return false; // Cycle protection
         }
@@ -1260,7 +1284,14 @@ bool FatReadOnlyVfs::ListDirectory(const FatDirEntry* dir, std::vector<FatDirEnt
         if (!GetNextCluster(cur_cluster, next_cluster)) {
             return false; // FAT read error
         }
+        if (!IsEndOfChain(next_cluster) && (next_cluster < 2 || (next_cluster - 2u) >= m_cluster_count)) {
+            return false; // Free or out-of-range cluster in directory chain
+        }
         cur_cluster = next_cluster;
+    }
+
+    if (!IsEndOfChain(cur_cluster)) {
+        return false; // Exceeded directory cluster cap before reaching end-of-chain
     }
 
     ParseDirectoryBuffer(raw_dir, out_entries);
@@ -1344,7 +1375,7 @@ bool FatReadOnlyVfs::ReadFile(
     uint8_t sec[512];
 
     while (!IsEndOfChain(cur_cluster) && out_data.size() < target_bytes) {
-        if ((cur_cluster - 2u) >= m_cluster_count) break;
+        if (cur_cluster < 2 || (cur_cluster - 2u) >= m_cluster_count) return false;
         if (!visited.insert(cur_cluster).second) {
             break; // Cycle protection
         }
@@ -1361,6 +1392,9 @@ bool FatReadOnlyVfs::ReadFile(
         uint32_t next_cluster = 0;
         if (!GetNextCluster(cur_cluster, next_cluster)) {
             return false;
+        }
+        if (!IsEndOfChain(next_cluster) && (next_cluster < 2 || (next_cluster - 2u) >= m_cluster_count)) {
+            return false; // Free or out-of-range cluster in file chain
         }
         cur_cluster = next_cluster;
     }
@@ -2399,16 +2433,38 @@ bool ImageCrawler::ScanAndCatalogMachine(
     }
     out_summary.total_discovered = static_cast<int>(discovered.size());
 
-    // Build existing-items lookup map for deduplication & icon backfill
+    // Build existing-items lookup maps (by normalized path AND resolved FAT cluster)
+    // so manual 8.3 entries deduplicate cleanly against LFN discoveries.
+    auto resolve_item_target_path = [](const std::string& work_dir, const std::string& exec) -> std::string {
+        if ((exec.size() >= 2 && exec[1] == ':') || (!exec.empty() && (exec[0] == '\\' || exec[0] == '/'))) {
+            return exec;
+        }
+        std::string norm_dir = NormalizeGuestDir(work_dir);
+        return (norm_dir.back() == '\\') ? (norm_dir + exec) : (norm_dir + "\\" + exec);
+    };
+
     std::vector<CatalogItemRecord> existing = db.GetItemsForMachine(machine_id);
     std::vector<std::pair<std::string, size_t>> existing_index;
+    std::vector<std::pair<uint32_t, size_t>> existing_clusters;
     existing_index.reserve(existing.size());
     for (size_t i = 0; i < existing.size(); ++i) {
         std::string key = ToUpperAscii(NormalizeGuestDir(existing[i].guest_working_dir) + "\\" + existing[i].guest_executable);
         existing_index.push_back(std::make_pair(key, i));
+        FatDirEntry ex_fe;
+        std::string target_p = resolve_item_target_path(existing[i].guest_working_dir, existing[i].guest_executable);
+        if (vfs.FindPath(target_p, ex_fe) && !ex_fe.is_directory && ex_fe.first_cluster >= 2) {
+            existing_clusters.push_back(std::make_pair(ex_fe.first_cluster, i));
+        }
     }
 
-    auto find_existing_idx = [&](const std::string& key) -> int {
+    auto find_existing_idx = [&](const std::string& key, uint32_t target_cluster) -> int {
+        if (target_cluster >= 2) {
+            for (size_t j = 0; j < existing_clusters.size(); ++j) {
+                if (existing_clusters[j].first == target_cluster) {
+                    return static_cast<int>(existing_clusters[j].second);
+                }
+            }
+        }
         for (size_t j = 0; j < existing_index.size(); ++j) {
             if (existing_index[j].first == key) {
                 return static_cast<int>(existing_index[j].second);
@@ -2420,7 +2476,14 @@ bool ImageCrawler::ScanAndCatalogMachine(
     for (size_t i = 0; i < discovered.size(); ++i) {
         const CrawlResult& cr = discovered[i];
         std::string key = ToUpperAscii(NormalizeGuestDir(cr.working_dir) + "\\" + cr.executable);
-        int exist_idx = find_existing_idx(key);
+        uint32_t cr_cluster = 0;
+        FatDirEntry cr_fe;
+        if (vfs.FindPath(resolve_item_target_path(cr.working_dir, cr.executable), cr_fe) &&
+            !cr_fe.is_directory && cr_fe.first_cluster >= 2) {
+            cr_cluster = cr_fe.first_cluster;
+        }
+
+        int exist_idx = find_existing_idx(key, cr_cluster);
         if (exist_idx >= 0) {
             out_summary.skipped_duplicates++;
             // Backfill icon_cache_path if this SCANNED item previously lacked an icon
@@ -2429,6 +2492,8 @@ bool ImageCrawler::ScanAndCatalogMachine(
                 ex.icon_cache_path = cr.icon_output_path;
                 if (db.UpdateCatalogItem(ex)) {
                     out_summary.icons_extracted++;
+                } else {
+                    out_summary.failed_icon_updates++;
                 }
             }
             continue;
@@ -2457,6 +2522,9 @@ bool ImageCrawler::ScanAndCatalogMachine(
             }
             existing.push_back(rec);
             existing_index.push_back(std::make_pair(key, existing.size() - 1));
+            if (cr_cluster >= 2) {
+                existing_clusters.push_back(std::make_pair(cr_cluster, existing.size() - 1));
+            }
         } else {
             out_summary.failed_inserts++;
         }
