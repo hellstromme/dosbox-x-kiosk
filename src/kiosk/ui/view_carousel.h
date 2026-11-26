@@ -52,6 +52,8 @@ public:
     static int ComputeNextSlotOrder(const std::vector<CaddyBindingRecord>& bindings, const std::string& target_drive);
 
     void ResetTransientModals();
+    void WaitForPendingImport();
+    void PollImportCompletion();
     bool IsContextModalOpen() const { return m_show_context_modal; }
 
 private:

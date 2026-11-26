@@ -461,16 +461,31 @@ bool ConfTranslator::ParseConfString(
                 continue;
             }
 
-            // Handle cd / chdir (including "cd.." and "cd\foo")
+            // Handle cd / chdir (including "cd..", "cd\foo", and drive-qualified "cd C:SUB" / "cd /d C:SUB")
             if (cmd_lower == "cd" || cmd_lower == "chdir") {
                 if (tokens.size() >= 2) {
                     size_t arg_idx = 1;
+                    bool switch_drive = false;
                     if (ToLowerAscii(tokens[arg_idx]) == "/d" && tokens.size() >= 3) {
+                        switch_drive = true;
                         ++arg_idx;
                     }
-                    current_guest_dir = UpdateGuestWorkingDir(current_guest_dir, tokens[arg_idx]);
-                    if (current_guest_dir.size() >= 2 && current_guest_dir[1] == ':') {
-                        drive_cwds[static_cast<char>(std::toupper(static_cast<unsigned char>(current_guest_dir[0])))] = current_guest_dir;
+                    std::string cd_arg = StripSurroundingQuotes(tokens[arg_idx]);
+                    char active_drv = (current_guest_dir.size() >= 2 && current_guest_dir[1] == ':')
+                                          ? static_cast<char>(std::toupper(static_cast<unsigned char>(current_guest_dir[0])))
+                                          : 'C';
+                    char target_drv = active_drv;
+                    if (cd_arg.size() >= 2 && std::isalpha(static_cast<unsigned char>(cd_arg[0])) && cd_arg[1] == ':') {
+                        target_drv = static_cast<char>(std::toupper(static_cast<unsigned char>(cd_arg[0])));
+                    }
+                    auto it = drive_cwds.find(target_drv);
+                    std::string base_for_target = (it != drive_cwds.end())
+                                                      ? it->second
+                                                      : (std::string(1, target_drv) + ":\\");
+                    std::string updated = UpdateGuestWorkingDir(base_for_target, cd_arg);
+                    drive_cwds[target_drv] = updated;
+                    if (switch_drive || target_drv == active_drv) {
+                        current_guest_dir = updated;
                     }
                 }
                 continue;

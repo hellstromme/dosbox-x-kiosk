@@ -111,7 +111,8 @@ public:
         std::string& out_error,
         const std::string& sandbox_root = "",
         const std::string& dest_bin_dir = "",
-        std::vector<std::string>* out_copied_source_bins = nullptr
+        std::vector<std::string>* out_copied_source_bins = nullptr,
+        const std::string& fallback_primary_bin = ""
     );
     static bool NormalizeMediaInSandbox(
         const std::string& sandbox_dir,

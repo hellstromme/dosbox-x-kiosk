@@ -100,6 +100,17 @@ std::string JoinPath(const std::string& a, const std::string& b) {
     return na + "/" + nb;
 }
 
+// Preserves native POSIX entry names (including literal backslashes) during filesystem traversal
+std::string JoinNativePath(const std::string& dir, const std::string& entry_name) {
+#if defined(_WIN32)
+    return JoinPath(dir, entry_name);
+#else
+    if (dir.empty()) return entry_name;
+    if (dir.back() == '/') return dir + entry_name;
+    return dir + "/" + entry_name;
+#endif
+}
+
 std::string BasenameOf(const std::string& p) {
     std::string np = NormalizeSlashes(p);
     size_t pos = np.find_last_of('/');
@@ -292,7 +303,7 @@ bool ListDirEntries(const std::string& dir, std::vector<FsDirEntry>& out_entries
     while ((ent = readdir(d)) != nullptr) {
         std::string name(ent->d_name);
         if (name == "." || name == "..") continue;
-        std::string full = JoinPath(dir, name);
+        std::string full = JoinNativePath(dir, name);
         struct stat lst;
         if (lstat(full.c_str(), &lst) != 0) continue;
         if (S_ISLNK(lst.st_mode)) continue; // Skip symlinks
@@ -312,7 +323,7 @@ void WalkFilesRecursive(const std::string& root, std::vector<std::string>& out_f
     std::vector<FsDirEntry> entries;
     if (!ListDirEntries(root, entries)) return;
     for (size_t i = 0; i < entries.size(); ++i) {
-        std::string full = JoinPath(root, entries[i].name);
+        std::string full = JoinNativePath(root, entries[i].name);
         if (entries[i].is_dir) {
             WalkFilesRecursive(full, out_files, depth + 1);
         } else {
@@ -339,7 +350,7 @@ bool RemoveTreeRecursive(const std::string& path, int depth = 0) {
     std::vector<FsDirEntry> entries;
     ListDirEntries(path, entries);
     for (size_t i = 0; i < entries.size(); ++i) {
-        RemoveTreeRecursive(JoinPath(path, entries[i].name), depth + 1);
+        RemoveTreeRecursive(JoinNativePath(path, entries[i].name), depth + 1);
     }
 #if defined(_WIN32)
     return RemoveDirectoryW(Utf8ToWide(path).c_str()) != 0;
@@ -453,8 +464,8 @@ bool CopyDirRecursive(const std::string& src_dir, const std::string& dst_dir, bo
     std::vector<FsDirEntry> entries;
     if (!ListDirEntries(src_dir, entries)) return false;
     for (size_t i = 0; i < entries.size(); ++i) {
-        std::string s = JoinPath(src_dir, entries[i].name);
-        std::string d = JoinPath(dst_dir, entries[i].name);
+        std::string s = JoinNativePath(src_dir, entries[i].name);
+        std::string d = JoinNativePath(dst_dir, entries[i].name);
         if (entries[i].is_dir) {
             if (!CopyDirRecursive(s, d, overwrite, depth + 1)) return false;
         } else {
@@ -745,6 +756,42 @@ public:
             if (val == 0) ++free_clusters;
         }
         return static_cast<uint64_t>(free_clusters) * m_sectors_per_cluster * m_bytes_per_sector;
+    }
+
+    bool PathExistsInFat(const std::string& guest_path) {
+        if (!m_open) return false;
+        std::vector<std::string> segs = SplitGuestPath(guest_path);
+        uint32_t cur_cluster = (m_fs_type == FilesystemType::FAT32) ? m_root_cluster : 0;
+        for (size_t i = 0; i < segs.size(); ++i) {
+            uint32_t next_cl = 0;
+            bool is_dir = false;
+            if (!FindEntryInDir(cur_cluster, segs[i], next_cl, is_dir)) {
+                return false;
+            }
+            if (i + 1 < segs.size() && !is_dir) return false;
+            cur_cluster = next_cl;
+        }
+        return true;
+    }
+
+    bool EnsureChildDirectory(
+        uint32_t parent_cluster,
+        const std::string& child_name,
+        bool allow_lfn,
+        uint32_t& out_child_cluster,
+        std::string& out_error
+    ) {
+        uint32_t found_cluster = 0;
+        bool is_dir = false;
+        if (FindEntryInDir(parent_cluster, child_name, found_cluster, is_dir)) {
+            if (!is_dir) {
+                out_error = "Path component is a file, not a directory: " + child_name;
+                return false;
+            }
+            out_child_cluster = found_cluster;
+            return true;
+        }
+        return CreateSubdirectory(parent_cluster, child_name, allow_lfn, out_child_cluster, out_error);
     }
 
     bool EnsureDirectoryPath(const std::string& guest_path, bool allow_lfn, uint32_t& out_dir_cluster, std::string& out_error) {
@@ -2027,68 +2074,119 @@ bool ArchiveImporter::ExtractZipArchive(
         fseeko(f, static_cast<off_t>(data_offset), SEEK_SET);
 #endif
 
-        const uint64_t kMaxSingleEntryBytes = 512ULL * 1024ULL * 1024ULL;
-        if (em.comp_size > kMaxSingleEntryBytes || em.uncomp_size > kMaxSingleEntryBytes) {
+        // Stream entry directly to disk in 64KB chunks (supports 600+ MiB CD images without large RAM allocations)
+        if (em.method == 0 && em.comp_size != em.uncomp_size) {
             std::fclose(f);
-            out_error = "ZIP entry exceeds 512 MiB per-file safety limit: " + rel;
+            out_error = "Invalid Stored ZIP entry size mismatch for: " + rel;
             return false;
         }
-
-        std::vector<uint8_t> comp_buf(em.comp_size);
-        if (em.comp_size > 0 && std::fread(comp_buf.data(), 1, em.comp_size, f) != em.comp_size) {
-            std::fclose(f);
-            out_error = "Failed reading compressed bytes for: " + rel;
-            return false;
-        }
-
-        std::vector<uint8_t> uncomp_buf;
-        if (em.method == 0) {
-            // Stored: compressed and uncompressed sizes must match
-            if (em.comp_size != em.uncomp_size) {
-                std::fclose(f);
-                out_error = "Invalid Stored ZIP entry size mismatch for: " + rel;
-                return false;
-            }
-            uncomp_buf.swap(comp_buf);
-        } else if (em.method == 8) {
-            // Deflate via zlib raw inflate (-MAX_WBITS)
-            uncomp_buf.resize(em.uncomp_size);
-            uint8_t dummy_out = 0;
-            z_stream zs;
-            std::memset(&zs, 0, sizeof(zs));
-            zs.next_in = comp_buf.empty() ? nullptr : comp_buf.data();
-            zs.avail_in = static_cast<uInt>(comp_buf.size());
-            zs.next_out = uncomp_buf.empty() ? &dummy_out : uncomp_buf.data();
-            zs.avail_out = uncomp_buf.empty() ? 1U : static_cast<uInt>(uncomp_buf.size());
-
-            if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) {
-                std::fclose(f);
-                out_error = "zlib inflateInit2 failed for: " + rel;
-                return false;
-            }
-            int zrc = inflate(&zs, Z_FINISH);
-            inflateEnd(&zs);
-            if (zrc != Z_STREAM_END || zs.total_out != em.uncomp_size) {
-                std::fclose(f);
-                out_error = "zlib inflate failed for: " + rel;
-                return false;
-            }
-        } else {
+        if (em.method != 0 && em.method != 8) {
             std::fclose(f);
             out_error = "Unsupported ZIP compression method (" + std::to_string(em.method) + ") for: " + rel;
             return false;
         }
 
-        uint32_t actual_crc = SignatureMatcher::ComputeCrc32(uncomp_buf.data(), uncomp_buf.size());
-        if (actual_crc != em.crc32) {
+        MakeDirRecursive(DirnameOf(out_path));
+#if defined(_WIN32)
+        FILE* out_f = _wfopen(Utf8ToWide(out_path).c_str(), L"wb");
+#else
+        FILE* out_f = std::fopen(out_path.c_str(), "wb");
+#endif
+        if (!out_f) {
             std::fclose(f);
-            out_error = "CRC32 mismatch in ZIP entry: " + rel;
+            out_error = "Failed to open extracted file for writing: " + out_path;
             return false;
         }
 
-        if (!WriteBytesToFile(out_path, uncomp_buf.data(), uncomp_buf.size())) {
+        uint8_t in_chunk[65536];
+        uint8_t out_chunk[65536];
+        uLong crc_state = ::crc32(0L, Z_NULL, 0);
+        uint64_t remaining_in = em.comp_size;
+        uint64_t written_total = 0;
+        bool stream_ok = true;
+
+        if (em.method == 0) {
+            while (remaining_in > 0) {
+                size_t to_read = static_cast<size_t>((std::min)(remaining_in, static_cast<uint64_t>(sizeof(in_chunk))));
+                if (std::fread(in_chunk, 1, to_read, f) != to_read) {
+                    out_error = "Failed reading stored ZIP bytes for: " + rel;
+                    stream_ok = false;
+                    break;
+                }
+                if (std::fwrite(in_chunk, 1, to_read, out_f) != to_read) {
+                    out_error = "Failed writing extracted file: " + out_path;
+                    stream_ok = false;
+                    break;
+                }
+                crc_state = ::crc32(crc_state, in_chunk, static_cast<uInt>(to_read));
+                remaining_in -= to_read;
+                written_total += to_read;
+            }
+        } else {
+            z_stream zs;
+            std::memset(&zs, 0, sizeof(zs));
+            if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) {
+                out_error = "zlib inflateInit2 failed for: " + rel;
+                stream_ok = false;
+            } else {
+                int zrc = Z_OK;
+                while (zrc != Z_STREAM_END) {
+                    if (zs.avail_in == 0 && remaining_in > 0) {
+                        size_t to_read = static_cast<size_t>((std::min)(remaining_in, static_cast<uint64_t>(sizeof(in_chunk))));
+                        if (std::fread(in_chunk, 1, to_read, f) != to_read) {
+                            out_error = "Failed reading deflated ZIP bytes for: " + rel;
+                            stream_ok = false;
+                            break;
+                        }
+                        zs.next_in = in_chunk;
+                        zs.avail_in = static_cast<uInt>(to_read);
+                        remaining_in -= to_read;
+                    }
+                    zs.next_out = out_chunk;
+                    zs.avail_out = static_cast<uInt>(sizeof(out_chunk));
+                    zrc = inflate(&zs, (remaining_in == 0) ? Z_FINISH : Z_NO_FLUSH);
+                    size_t produced = sizeof(out_chunk) - zs.avail_out;
+                    if (produced > 0) {
+                        if (written_total + produced > em.uncomp_size) {
+                            out_error = "Deflated ZIP entry exceeded declared uncompressed size: " + rel;
+                            stream_ok = false;
+                            break;
+                        }
+                        if (std::fwrite(out_chunk, 1, produced, out_f) != produced) {
+                            out_error = "Failed writing extracted file: " + out_path;
+                            stream_ok = false;
+                            break;
+                        }
+                        crc_state = ::crc32(crc_state, out_chunk, static_cast<uInt>(produced));
+                        written_total += produced;
+                    }
+                    if (zrc != Z_OK && zrc != Z_STREAM_END && zrc != Z_BUF_ERROR) {
+                        out_error = "zlib inflate failed for: " + rel;
+                        stream_ok = false;
+                        break;
+                    }
+                    if (zrc == Z_BUF_ERROR && remaining_in == 0 && produced == 0) {
+                        out_error = "Truncated deflate stream in ZIP entry: " + rel;
+                        stream_ok = false;
+                        break;
+                    }
+                }
+                inflateEnd(&zs);
+            }
+        }
+
+        if (std::fclose(out_f) != 0) {
+            if (stream_ok) out_error = "Failed to flush extracted file: " + out_path;
+            stream_ok = false;
+        }
+        if (!stream_ok || written_total != em.uncomp_size || static_cast<uint32_t>(crc_state) != em.crc32) {
+            RemoveFileQuiet(out_path);
             std::fclose(f);
-            out_error = "Failed to write extracted file: " + out_path;
+            if (out_error.empty()) {
+                out_error = (written_total != em.uncomp_size)
+                                ? ("Uncompressed size mismatch in ZIP entry: " + rel)
+                                : ("CRC32 mismatch in ZIP entry: " + rel);
+            }
             return false;
         }
     }
@@ -2509,7 +2607,8 @@ bool ArchiveImporter::SanitizeCueSheet(
     std::string& out_error,
     const std::string& sandbox_root,
     const std::string& dest_bin_dir,
-    std::vector<std::string>* out_copied_source_bins
+    std::vector<std::string>* out_copied_source_bins,
+    const std::string& fallback_primary_bin
 ) {
     out_rewritten_cue.clear();
     out_has_redbook_audio = false;
@@ -2518,6 +2617,8 @@ bool ArchiveImporter::SanitizeCueSheet(
 
     const std::string contain_root = sandbox_root.empty() ? source_cue_dir : sandbox_root;
     std::map<std::string, std::string> bin_src_to_dest_base;
+    std::map<std::string, std::string> audio_src_to_dest_name;
+    std::set<std::string> used_audio_names;
     int bin_track_idx = 0;
 
     std::istringstream iss(cue_content);
@@ -2577,12 +2678,34 @@ bool ArchiveImporter::SanitizeCueSheet(
                     out_error = "CUE references missing audio track: " + ref_path;
                     return false;
                 }
-                std::string lower_audio = ToLowerAscii(BasenameOf(resolved));
-                if (!dest_audio_dir.empty()) {
-                    MakeDirRecursive(dest_audio_dir);
-                    if (!CopyFileStream(resolved, JoinPath(dest_audio_dir, lower_audio))) {
-                        out_error = "Failed to copy audio track to media pool: " + resolved;
-                        return false;
+                std::string audio_key = ToLowerAscii(NormalizeSlashes(resolved));
+                std::string lower_audio;
+                auto ait = audio_src_to_dest_name.find(audio_key);
+                if (ait != audio_src_to_dest_name.end()) {
+                    lower_audio = ait->second;
+                } else {
+                    std::string base_lower = ToLowerAscii(BasenameOf(resolved));
+                    lower_audio = base_lower;
+                    if (used_audio_names.count(lower_audio) > 0) {
+                        std::string stem = StemOf(base_lower);
+                        size_t dot = base_lower.find_last_of('.');
+                        std::string ext = (dot == std::string::npos) ? "" : base_lower.substr(dot);
+                        for (int dup = 2; dup <= 999; ++dup) {
+                            std::string cand = stem + "_" + std::to_string(dup) + ext;
+                            if (used_audio_names.count(cand) == 0) {
+                                lower_audio = cand;
+                                break;
+                            }
+                        }
+                    }
+                    used_audio_names.insert(lower_audio);
+                    audio_src_to_dest_name[audio_key] = lower_audio;
+                    if (!dest_audio_dir.empty()) {
+                        MakeDirRecursive(dest_audio_dir);
+                        if (!CopyFileStream(resolved, JoinPath(dest_audio_dir, lower_audio))) {
+                            out_error = "Failed to copy audio track to media pool: " + resolved;
+                            return false;
+                        }
                     }
                 }
                 std::string cue_rel = audio_subdir_name.empty()
@@ -2594,6 +2717,9 @@ bool ArchiveImporter::SanitizeCueSheet(
                 std::string resolved_bin = FindFileCaseInsensitive(source_cue_dir, ref_path, contain_root);
                 if (resolved_bin.empty()) {
                     resolved_bin = FindFileCaseInsensitive(contain_root, BasenameOf(ref_path), contain_root);
+                }
+                if (resolved_bin.empty() && bin_track_idx == 0 && !fallback_primary_bin.empty()) {
+                    resolved_bin = fallback_primary_bin;
                 }
                 std::string key = resolved_bin.empty() ? ToLowerAscii(ref_path) : ToLowerAscii(NormalizeSlashes(resolved_bin));
                 std::string out_bin_name;
@@ -2656,6 +2782,7 @@ bool ArchiveImporter::NormalizeMediaInSandbox(
     std::sort(all_files.begin(), all_files.end());
 
     std::set<std::string> consumed_files;
+    std::vector<std::string> deferred_delete_files;
     int cd_index = 0;
     int floppy_index = 0;
 
@@ -2725,7 +2852,7 @@ bool ArchiveImporter::NormalizeMediaInSandbox(
         std::vector<std::string> copied_bins;
         if (!SanitizeCueSheet(cue_text, src_cue_dir, bin_base, audio_subdir, dest_audio,
                               rewritten_cue, has_redbook, cue_err,
-                              sandbox_dir, media_pool_dir, &copied_bins)) {
+                              sandbox_dir, media_pool_dir, &copied_bins, bin_src_path)) {
             out_error = cue_err;
             return false;
         }
@@ -2743,10 +2870,10 @@ bool ArchiveImporter::NormalizeMediaInSandbox(
         }
 
         consumed_files.insert(ToLowerAscii(NormalizeSlashes(cue_path)));
-        RemoveFileQuiet(cue_path);
+        deferred_delete_files.push_back(cue_path);
         for (size_t cb = 0; cb < copied_bins.size(); ++cb) {
             consumed_files.insert(ToLowerAscii(NormalizeSlashes(copied_bins[cb])));
-            RemoveFileQuiet(copied_bins[cb]);
+            deferred_delete_files.push_back(copied_bins[cb]);
         }
 
         NormalizedMediaEntry entry;
@@ -2757,6 +2884,11 @@ bool ArchiveImporter::NormalizeMediaInSandbox(
         entry.has_redbook_audio = has_redbook;
         entry.media_pool_id = GenerateUniqueId("media", dest_cue);
         out_entries.push_back(entry);
+    }
+
+    // Delete consumed CUE/BIN files only after all CUE sheets are rewritten (handles shared BIN tracks)
+    for (size_t d = 0; d < deferred_delete_files.size(); ++d) {
+        RemoveFileQuiet(deferred_delete_files[d]);
     }
 
     // Pass 2: Standalone .gog / .iso images and floppy .img / .ima / .vfd images
@@ -2979,34 +3111,17 @@ bool ArchiveImporter::InjectDirectoryIntoFatImage(
 
     // Honor allow_vfat_lfn on both FAT16 (Win95) and FAT32 (Win95 OSR2 / Win98)
     const bool use_lfn = allow_vfat_lfn;
-
-    // Make retries safe: if guest_dest_dir already exists on the HDD, pick a fresh sibling slug
-    std::string effective_dest_dir = guest_dest_dir;
-    {
-        uint32_t probe_cl = 0;
-        std::string parent_part = "C:\\GAMES";
-        std::string leaf_part = BasenameOf(NormalizeSlashes(guest_dest_dir));
-        size_t sep = guest_dest_dir.find_last_of("\\/");
-        if (sep != std::string::npos) {
-            parent_part = guest_dest_dir.substr(0, sep);
-            leaf_part = guest_dest_dir.substr(sep + 1);
-        }
-        if (writer.EnsureDirectoryPath(parent_part, use_lfn, probe_cl, out_error)) {
-            uint32_t dummy_cl = 0;
-            bool dummy_dir = false;
-            // Check if leaf already exists by testing via EnsureDirectoryPath?
-            // Use a lightweight existence check on parent_part via FindEntryInDir isn't public;
-            // Instead, probe up to 99 suffixed names only if WriteFileToDir would collide on retry.
-            (void)dummy_cl;
-            (void)dummy_dir;
-        }
-    }
-    if (out_actual_guest_dir) *out_actual_guest_dir = effective_dest_dir;
+    if (out_actual_guest_dir) *out_actual_guest_dir = guest_dest_dir;
 
     uint32_t root_dest_cluster = 0;
-    if (!writer.EnsureDirectoryPath(effective_dest_dir, use_lfn, root_dest_cluster, out_error)) {
+    if (!writer.EnsureDirectoryPath(guest_dest_dir, use_lfn, root_dest_cluster, out_error)) {
         return false;
     }
+
+    // Cache source relative directory -> FAT cluster so every file from one long-named directory
+    // lands in the same FAT subdirectory even when LFN is disabled.
+    std::map<std::string, uint32_t> dir_cluster_cache;
+    dir_cluster_cache[""] = root_dest_cluster;
 
     std::string norm_src = NormalizeSlashes(host_source_dir);
     for (size_t i = 0; i < all_files.size(); ++i) {
@@ -3015,12 +3130,35 @@ bool ArchiveImporter::InjectDirectoryIntoFatImage(
         std::string rel = norm_f.substr(norm_src.size() + 1);
 
         std::string rel_dir = DirnameOf(rel);
+        if (rel_dir == ".") rel_dir.clear();
         std::string fname = BasenameOf(rel);
         uint32_t target_cl = root_dest_cluster;
-        if (rel_dir != "." && !rel_dir.empty()) {
-            std::string full_guest_dir = guest_dest_dir + "\\" + rel_dir;
-            if (!writer.EnsureDirectoryPath(full_guest_dir, use_lfn, target_cl, out_error)) {
-                return false;
+        if (!rel_dir.empty()) {
+            auto cit = dir_cluster_cache.find(rel_dir);
+            if (cit != dir_cluster_cache.end()) {
+                target_cl = cit->second;
+            } else {
+                std::stringstream ss(rel_dir);
+                std::string seg;
+                std::string acc_rel;
+                uint32_t cur_cl = root_dest_cluster;
+                while (std::getline(ss, seg, '/')) {
+                    if (seg.empty() || seg == ".") continue;
+                    std::string next_rel = acc_rel.empty() ? seg : (acc_rel + "/" + seg);
+                    auto nit = dir_cluster_cache.find(next_rel);
+                    if (nit != dir_cluster_cache.end()) {
+                        cur_cl = nit->second;
+                    } else {
+                        uint32_t child_cl = 0;
+                        if (!writer.EnsureChildDirectory(cur_cl, seg, use_lfn, child_cl, out_error)) {
+                            return false;
+                        }
+                        cur_cl = child_cl;
+                        dir_cluster_cache[next_rel] = cur_cl;
+                    }
+                    acc_rel = next_rel;
+                }
+                target_cl = cur_cl;
             }
         }
 
@@ -3057,6 +3195,7 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
                                     : NormalizeSlashes(options.kiosk_data_root);
     const std::string job_uuid = GenerateUniqueId("job", options.source_path);
     const std::string sandbox_dir = JoinPath(JoinPath(data_root, "ingest_staging"), job_uuid);
+    const std::string preserved_save_dir = sandbox_dir + "_save";
     const std::string preserved_overlay_dir = sandbox_dir + "_ovl";
     const std::string media_pool_dir = JoinPath(data_root, "media_pool");
     const std::string icon_cache_dir = JoinPath(JoinPath(data_root, "cache"), "icons");
@@ -3065,12 +3204,14 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
     // Ensure sandbox & temporary overlay cleanup on every exit path
     struct SandboxGuard {
         std::string dir;
+        std::string save_dir;
         std::string ovl_dir;
         ~SandboxGuard() {
             if (!ovl_dir.empty()) RemoveTreeRecursive(ovl_dir);
+            if (!save_dir.empty()) RemoveTreeRecursive(save_dir);
             if (!dir.empty()) RemoveTreeRecursive(dir);
         }
-    } sandbox_guard{sandbox_dir, preserved_overlay_dir};
+    } sandbox_guard{sandbox_dir, preserved_save_dir, preserved_overlay_dir};
 
     // --- Stage 1A: Detect & Unpack ---
     IngestSourceFormat fmt = DetectSourceFormat(options.source_path, options.innoextract_binary);
@@ -3121,17 +3262,17 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
     ConfTranslationResult conf_res;
     bool has_conf = ConfTranslator::ParseAndMergeConfFiles(conf_files, conf_res);
 
-    // Preserve __support/save/ and any sandbox-contained -t overlay directories in separate staging before sanitizer deletes __support/
+    // Preserve __support/save/ (non-overwriting) and explicit -t overlay dirs (overlay precedence) before sanitizer deletes __support/
     std::string support_save_dir = JoinPath(JoinPath(sandbox_dir, "__support"), "save");
     if (IsDirectory(support_save_dir)) {
-        if (!CopyDirRecursive(support_save_dir, preserved_overlay_dir)) {
+        if (!CopyDirRecursive(support_save_dir, preserved_save_dir)) {
             result.error_message = "Failed to preserve __support/save data before sanitization";
             return result;
         }
     }
     for (size_t i = 0; i < conf_res.overlay_dirs.size(); ++i) {
         if (IsPathInsideDir(conf_res.overlay_dirs[i], sandbox_dir) && IsDirectory(conf_res.overlay_dirs[i])) {
-            if (!CopyDirRecursive(conf_res.overlay_dirs[i], preserved_overlay_dir)) {
+            if (!CopyDirRecursive(conf_res.overlay_dirs[i], preserved_overlay_dir, true)) {
                 result.error_message = "Failed to preserve overlay directory: " + conf_res.overlay_dirs[i];
                 return result;
             }
@@ -3164,10 +3305,17 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
         }
     }
 
-    // Merge preserved overlay / __support/save files into game_root, then remove temp dir
+    // Merge __support/save (without overwriting base files) and explicit -t overlays (with overlay precedence)
+    if (IsDirectory(preserved_save_dir)) {
+        if (!CopyDirRecursive(preserved_save_dir, game_root, false)) {
+            result.error_message = "Failed to merge preserved save files into game root";
+            return result;
+        }
+        RemoveTreeRecursive(preserved_save_dir);
+    }
     if (IsDirectory(preserved_overlay_dir)) {
-        if (!CopyDirRecursive(preserved_overlay_dir, game_root, false)) {
-            result.error_message = "Failed to merge preserved save/overlay files into game root";
+        if (!CopyDirRecursive(preserved_overlay_dir, game_root, true)) {
+            result.error_message = "Failed to apply overlay files into game root";
             return result;
         }
         RemoveTreeRecursive(preserved_overlay_dir);
@@ -3366,16 +3514,31 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
         const ParsedMountDirective& md = conf_res.media_mounts[m];
         std::string raw_drv(1, md.drive_letter);
         for (size_t p = 0; p < md.raw_paths.size(); ++p) {
-            std::string ref_resolved = (p < md.resolved_paths.size()) ? ToLowerAscii(NormalizeSlashes(md.resolved_paths[p])) : "";
+            std::string ref_exact = (p < md.resolved_paths.size()) ? NormalizeSlashes(md.resolved_paths[p]) : "";
+            std::string ref_resolved = ToLowerAscii(ref_exact);
             std::string ref_base = ToLowerAscii(BasenameOf(md.raw_paths[p]));
             int matched_idx = -1;
-            for (size_t nm = 0; nm < norm_media.size(); ++nm) {
-                if (bound_media_ids.count(norm_media[nm].media_pool_id) > 0) continue;
-                if (!ref_resolved.empty() && ToLowerAscii(norm_media[nm].original_rel_path) == ref_resolved) {
-                    matched_idx = static_cast<int>(nm);
-                    break;
+            // 1. Exact resolved path match (for case-sensitive POSIX hosts)
+            if (!ref_exact.empty()) {
+                for (size_t nm = 0; nm < norm_media.size(); ++nm) {
+                    if (bound_media_ids.count(norm_media[nm].media_pool_id) > 0) continue;
+                    if (norm_media[nm].original_rel_path == ref_exact) {
+                        matched_idx = static_cast<int>(nm);
+                        break;
+                    }
                 }
             }
+            // 2. Case-folded resolved path match
+            if (matched_idx < 0 && !ref_resolved.empty()) {
+                for (size_t nm = 0; nm < norm_media.size(); ++nm) {
+                    if (bound_media_ids.count(norm_media[nm].media_pool_id) > 0) continue;
+                    if (ToLowerAscii(norm_media[nm].original_rel_path) == ref_resolved) {
+                        matched_idx = static_cast<int>(nm);
+                        break;
+                    }
+                }
+            }
+            // 3. Basename fallback
             if (matched_idx < 0) {
                 for (size_t nm = 0; nm < norm_media.size(); ++nm) {
                     if (bound_media_ids.count(norm_media[nm].media_pool_id) > 0) continue;
@@ -3468,7 +3631,31 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
             return result;
         }
 
-        std::string guest_install_dir = "C:\\GAMES\\" + ToUpperAscii(item_slug);
+        // Select an unused sibling directory under C:\GAMES BEFORE patching configs or writing files
+        std::string base_slug = ToUpperAscii(item_slug);
+        std::string guest_install_dir = "C:\\GAMES\\" + base_slug;
+        {
+            FatImageWriter probe;
+            std::string probe_err;
+            if (probe.Open(target_mach.primary_hdd_path, probe_err) && probe.PathExistsInFat(guest_install_dir)) {
+                bool found_free = false;
+                for (int dup = 2; dup <= 99; ++dup) {
+                    std::string suffix = std::to_string(dup);
+                    std::string prefix = base_slug.substr(0, (std::min)(base_slug.size(), static_cast<size_t>(8) - suffix.size()));
+                    std::string cand = "C:\\GAMES\\" + prefix + suffix;
+                    if (!probe.PathExistsInFat(cand)) {
+                        guest_install_dir = cand;
+                        found_free = true;
+                        break;
+                    }
+                }
+                if (!found_free) {
+                    result.error_message = "Could not find an unused C:\\GAMES\\<SLUG> folder on HDD image";
+                    return result;
+                }
+            }
+        }
+
         std::string patch_err;
         result.config_files_patched = PatchGameConfigPaths(game_root, guest_install_dir, &patch_err);
         if (result.config_files_patched < 0) {
@@ -3493,14 +3680,29 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
         result.deployed_path = actual_guest_dir;
     }
 
+    // Helper to roll back deployed Mode A container & DB rows if final publication fails
+    auto rollback_publication = [&](bool delete_item_row) {
+        if (delete_item_row) {
+            db.DeleteCatalogItem(item.id);
+        }
+        for (size_t i = 0; i < norm_media.size(); ++i) {
+            db.DeleteMedia(norm_media[i].media_pool_id);
+        }
+        if (options.deploy_mode == IngestDeployMode::APPLIANCE_CONTAINER && !item.host_container_dir.empty()) {
+            RemoveTreeRecursive(item.host_container_dir);
+        }
+    };
+
     // Persist CatalogItemRecord and CaddyBindingRecords
     if (!db.InsertCatalogItem(item)) {
+        rollback_publication(false);
         result.error_message = "Failed to insert imported CatalogItemRecord into catalog.db";
         return result;
     }
     for (size_t i = 0; i < caddy_bindings.size(); ++i) {
         caddy_bindings[i].machine_id.clear();
         if (!db.AddCaddyBinding(caddy_bindings[i])) {
+            rollback_publication(true);
             result.error_message = "Failed to persist caddy binding for imported item";
             return result;
         }

@@ -94,8 +94,43 @@ ViewCarousel& ViewCarousel::GetInstance() {
 }
 
 ViewCarousel::~ViewCarousel() {
+    WaitForPendingImport();
+}
+
+void ViewCarousel::WaitForPendingImport() {
     if (m_import_worker.joinable()) {
         m_import_worker.join();
+    }
+}
+
+void ViewCarousel::PollImportCompletion() {
+    if (m_import_in_progress.load()) return;
+
+    bool finished = false;
+    IngestResult done_res;
+    {
+        std::lock_guard<std::mutex> lock(m_import_mutex);
+        if (m_import_result_ready) {
+            finished = true;
+            done_res = m_import_result;
+            m_import_result_ready = false;
+        }
+    }
+    if (!finished) return;
+
+    if (m_import_worker.joinable()) {
+        m_import_worker.join();
+    }
+    KioskUI& ui = KioskUI::GetInstance();
+    if (done_res.success) {
+        ui.InvalidateCatalogCache();
+        ui.ShowToast("Imported '" + done_res.title + "' (" + done_res.archetype_id + ")");
+        m_import_path_buf[0] = '\0';
+        m_import_status_msg.clear();
+        m_show_import_modal = false;
+    } else {
+        m_import_status_msg = "Import failed: " + done_res.error_message;
+        ui.ShowToast("Import failed: " + done_res.error_message, 4.0f);
     }
 }
 
@@ -701,16 +736,19 @@ void ViewCarousel::RenderCatalogCarousel(const std::string& item_type, int& sele
 }
 
 void ViewCarousel::RenderGamesTab() {
+    PollImportCompletion();
     RenderCatalogCarousel("GAME", m_selected_game_idx, m_game_scroll_offset);
     RenderImportArchiveModal();
 }
 
 void ViewCarousel::RenderApplicationsTab() {
+    PollImportCompletion();
     RenderCatalogCarousel("APPLICATION", m_selected_app_idx, m_app_scroll_offset);
     RenderImportArchiveModal();
 }
 
 void ViewCarousel::RenderMachinesTab() {
+    PollImportCompletion();
     KioskUI& ui = KioskUI::GetInstance();
     const KioskThemePalette& pal = ui.GetThemePalette();
     const std::vector<MachineRecord>& machines = ui.GetCachedMachines();
@@ -932,6 +970,7 @@ void ViewCarousel::RenderMachinesTab() {
 }
 
 void ViewCarousel::RenderMediaPoolTab() {
+    PollImportCompletion();
     KioskUI& ui = KioskUI::GetInstance();
     const KioskThemePalette& pal = ui.GetThemePalette();
     const std::vector<MediaPoolRecord>& media = ui.GetCachedMedia();
@@ -1506,37 +1545,22 @@ void ViewCarousel::RenderImportArchiveModal() {
             }
         }
 
-        // Poll background import worker completion without blocking the UI loop
-        if (!m_import_in_progress.load()) {
-            bool finished = false;
-            IngestResult done_res;
-            {
-                std::lock_guard<std::mutex> lock(m_import_mutex);
-                if (m_import_result_ready) {
-                    finished = true;
-                    done_res = m_import_result;
-                    m_import_result_ready = false;
-                }
-            }
-            if (finished) {
-                if (m_import_worker.joinable()) m_import_worker.join();
-                if (done_res.success) {
-                    ui.InvalidateCatalogCache();
-                    ui.ShowToast("Imported '" + done_res.title + "' (" + done_res.archetype_id + ")");
-                    m_import_path_buf[0] = '\0';
-                    m_import_status_msg.clear();
-                    m_show_import_modal = false;
-                    ImGui::CloseCurrentPopup();
-                    ImGui::EndPopup();
-                    return;
-                } else {
-                    m_import_status_msg = "Import failed: " + done_res.error_message;
-                }
-            }
+        // Poll completion inside modal as well so modal closes cleanly on finish
+        PollImportCompletion();
+        if (!m_show_import_modal) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
         }
 
         const bool importing_now = m_import_in_progress.load();
-        if (importing_now) {
+        bool result_pending = false;
+        {
+            std::lock_guard<std::mutex> lock(m_import_mutex);
+            result_pending = m_import_result_ready;
+        }
+
+        if (importing_now || result_pending) {
             ImGui::Spacing();
             ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
             ImGui::TextUnformatted("Importing archive in background... please wait.");
@@ -1552,7 +1576,7 @@ void ViewCarousel::RenderImportArchiveModal() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        const bool can_import = !importing_now &&
+        const bool can_import = !importing_now && !result_pending &&
                                 (m_import_path_buf[0] != '\0') &&
                                 (m_import_deploy_mode == 0 || !hdd_machines.empty());
         if (!can_import) ImGui::BeginDisabled();
@@ -1572,26 +1596,43 @@ void ViewCarousel::RenderImportArchiveModal() {
             }
             m_import_status_msg.clear();
             m_import_in_progress.store(true);
-            m_import_worker = std::thread([this, opts]() {
-                IngestResult res = ArchiveImporter::ImportArchive(opts);
-                {
-                    std::lock_guard<std::mutex> lock(m_import_mutex);
-                    m_import_result = res;
-                    m_import_result_ready = true;
-                }
+            try {
+                m_import_worker = std::thread([this, opts]() {
+                    IngestResult res;
+                    try {
+                        res = ArchiveImporter::ImportArchive(opts);
+                    } catch (const std::exception& e) {
+                        res.success = false;
+                        res.error_message = std::string("Unexpected error during import: ") + e.what();
+                    } catch (...) {
+                        res.success = false;
+                        res.error_message = "Unknown exception during archive import";
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(m_import_mutex);
+                        m_import_result = res;
+                        m_import_result_ready = true;
+                    }
+                    m_import_in_progress.store(false);
+                });
+            } catch (const std::exception& e) {
                 m_import_in_progress.store(false);
-            });
+                m_import_status_msg = std::string("Failed to start import thread: ") + e.what();
+            } catch (...) {
+                m_import_in_progress.store(false);
+                m_import_status_msg = "Failed to start import thread";
+            }
         }
         if (!can_import) ImGui::EndDisabled();
 
         ImGui::SameLine();
-        if (importing_now) ImGui::BeginDisabled();
+        if (importing_now || result_pending) ImGui::BeginDisabled();
         if (ImGui::Button("Cancel", ImVec2(100.0f, 32.0f))) {
             m_show_import_modal = false;
             m_show_file_picker = false;
             ImGui::CloseCurrentPopup();
         }
-        if (importing_now) ImGui::EndDisabled();
+        if (importing_now || result_pending) ImGui::EndDisabled();
 
         RenderFilePickerModal();
         ImGui::EndPopup();
