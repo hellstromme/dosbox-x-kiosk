@@ -9,6 +9,7 @@
 #include "../kiosk_db.h"
 #include "../machine/archetypes.h"
 #include "../ingest/image_crawler.h"
+#include "../ingest/archive_importer.h"
 #include "logging.h"
 #include "imgui.h"
 
@@ -90,6 +91,7 @@ void ViewCarousel::ResetTransientModals() {
     m_show_context_modal = false;
     m_show_caddy_modal = false;
     m_show_delete_modal = false;
+    m_show_import_modal = false;
 }
 
 std::vector<CatalogItemRecord> ViewCarousel::FilterAndSortCatalogItems(
@@ -149,11 +151,12 @@ int ViewCarousel::ComputeNextSlotOrder(const std::vector<CaddyBindingRecord>& bi
 }
 
 bool ViewCarousel::HandleAction(KioskHubTab active_tab, KioskInputAction action) {
-    if (m_show_context_modal || m_show_caddy_modal || m_show_delete_modal) {
+    if (m_show_context_modal || m_show_caddy_modal || m_show_delete_modal || m_show_import_modal) {
         if (action == KioskInputAction::ACTION_BACK) {
             m_show_context_modal = false;
             m_show_caddy_modal = false;
             m_show_delete_modal = false;
+            m_show_import_modal = false;
             return true;
         }
         return false;
@@ -486,6 +489,11 @@ void ViewCarousel::RenderCatalogCarousel(const std::string& item_type, int& sele
                 static_cast<unsigned int>(items.size()),
                 (item_type == "GAME") ? "games" : "applications");
     ImGui::PopStyleColor();
+    ImGui::SameLine();
+    if (ImGui::Button("Import GOG / Steam")) {
+        m_show_import_modal = true;
+        m_import_status_msg.clear();
+    }
 
     ImGui::Spacing();
 
@@ -666,10 +674,12 @@ void ViewCarousel::RenderCatalogCarousel(const std::string& item_type, int& sele
 
 void ViewCarousel::RenderGamesTab() {
     RenderCatalogCarousel("GAME", m_selected_game_idx, m_game_scroll_offset);
+    RenderImportArchiveModal();
 }
 
 void ViewCarousel::RenderApplicationsTab() {
     RenderCatalogCarousel("APPLICATION", m_selected_app_idx, m_app_scroll_offset);
+    RenderImportArchiveModal();
 }
 
 void ViewCarousel::RenderMachinesTab() {
@@ -941,6 +951,11 @@ void ViewCarousel::RenderMediaPoolTab() {
                                 ? CaddyViewMode::LIST
                                 : CaddyViewMode::SKEUOMORPHIC;
     }
+    ImGui::SameLine(0.0f, 8.0f);
+    if (ImGui::Button("Import GOG / Steam##MediaPool")) {
+        m_show_import_modal = true;
+        m_import_status_msg.clear();
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -950,6 +965,7 @@ void ViewCarousel::RenderMediaPoolTab() {
         ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
         ImGui::TextWrapped("Global Media Pool is empty. Add floppy (.img/.ima) or CD-ROM (.iso/.cue) images above to bind them to machines or swap them live with F12+D.");
         ImGui::PopStyleColor();
+        RenderImportArchiveModal();
         return;
     }
 
@@ -1009,6 +1025,7 @@ void ViewCarousel::RenderMediaPoolTab() {
         }
     }
     ImGui::EndChild();
+    RenderImportArchiveModal();
 }
 
 void ViewCarousel::RenderContextActionsModal() {
@@ -1308,6 +1325,120 @@ void ViewCarousel::RenderDeleteConfirmModal() {
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(100.0f, 32.0f))) {
             m_show_delete_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void ViewCarousel::RenderImportArchiveModal() {
+    static const char* kImportPopupId = "Import GOG / Steam Archive###KioskImportModal";
+    if (m_show_import_modal && !ImGui::IsPopupOpen(kImportPopupId)) {
+        ImGui::OpenPopup(kImportPopupId);
+    }
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    if (vp) {
+        const float mw = (std::min)(540.0f, (std::max)(340.0f, vp->WorkSize.x - 24.0f));
+        const float mh = (std::min)(330.0f, (std::max)(260.0f, vp->WorkSize.y - 24.0f));
+        ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(mw, mh), ImGuiCond_Always);
+    }
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
+    if (ImGui::BeginPopupModal(kImportPopupId, &m_show_import_modal, flags)) {
+        if (!m_show_import_modal) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+
+        KioskUI& ui = KioskUI::GetInstance();
+        const KioskThemePalette& pal = ui.GetThemePalette();
+
+        ImGui::TextWrapped("Import a GOG offline installer (setup_*.exe), a Steam DOS/Win9x .zip archive, or an unpacked game folder.");
+        ImGui::Spacing();
+
+        ImGui::Text("Archive / Folder Path:");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##ImportSourcePath", "e.g. setup_game.exe or steam_game.zip", m_import_path_buf, sizeof(m_import_path_buf));
+        ImGui::Spacing();
+
+        ImGui::Text("Deployment Mode:");
+        ImGui::RadioButton("Mode A: Appliance Container (Instant Integrated DOS)", &m_import_deploy_mode, 0);
+        ImGui::RadioButton("Mode B: Inject into Machine HDD (REAL_HDD_BOOT)", &m_import_deploy_mode, 1);
+
+        std::vector<MachineRecord> hdd_machines;
+        const std::vector<MachineRecord>& all_machines = ui.GetCachedMachines();
+        for (size_t i = 0; i < all_machines.size(); ++i) {
+            if (all_machines[i].boot_mode == "REAL_HDD_BOOT" && !all_machines[i].primary_hdd_path.empty()) {
+                hdd_machines.push_back(all_machines[i]);
+            }
+        }
+
+        if (m_import_deploy_mode == 1) {
+            if (hdd_machines.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.35f, 1.0f));
+                ImGui::TextWrapped("No REAL_HDD_BOOT machines available. Create one in + New Machine first.");
+                ImGui::PopStyleColor();
+            } else {
+                if (m_import_target_machine_idx < 0 || m_import_target_machine_idx >= static_cast<int>(hdd_machines.size())) {
+                    m_import_target_machine_idx = 0;
+                }
+                ImGui::SetNextItemWidth(300.0f);
+                if (ImGui::BeginCombo("Target Machine", hdd_machines[static_cast<size_t>(m_import_target_machine_idx)].display_name.c_str())) {
+                    for (size_t i = 0; i < hdd_machines.size(); ++i) {
+                        ImGui::PushID(static_cast<int>(i));
+                        if (ImGui::Selectable(hdd_machines[i].display_name.c_str(), static_cast<int>(i) == m_import_target_machine_idx)) {
+                            m_import_target_machine_idx = static_cast<int>(i);
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+        }
+
+        if (!m_import_status_msg.empty()) {
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
+            ImGui::TextWrapped("%s", m_import_status_msg.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        const bool can_import = (m_import_path_buf[0] != '\0') &&
+                                (m_import_deploy_mode == 0 || !hdd_machines.empty());
+        if (!can_import) ImGui::BeginDisabled();
+        if (ImGui::Button("Start Import", ImVec2(140.0f, 32.0f))) {
+            IngestOptions opts;
+            opts.source_path = m_import_path_buf;
+            opts.deploy_mode = (m_import_deploy_mode == 1)
+                                   ? IngestDeployMode::HDD_INJECT
+                                   : IngestDeployMode::APPLIANCE_CONTAINER;
+            if (m_import_deploy_mode == 1 && !hdd_machines.empty()) {
+                opts.target_machine_id = hdd_machines[static_cast<size_t>(m_import_target_machine_idx)].id;
+            }
+            IngestResult res = ArchiveImporter::ImportArchive(opts);
+            if (res.success) {
+                ui.InvalidateCatalogCache();
+                ui.ShowToast("Imported '" + res.title + "' (" + res.archetype_id + ")");
+                m_import_path_buf[0] = '\0';
+                m_import_status_msg.clear();
+                m_show_import_modal = false;
+                ImGui::CloseCurrentPopup();
+            } else {
+                m_import_status_msg = "Import failed: " + res.error_message;
+            }
+        }
+        if (!can_import) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(100.0f, 32.0f))) {
+            m_show_import_modal = false;
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();

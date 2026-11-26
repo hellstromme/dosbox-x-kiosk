@@ -1228,7 +1228,9 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\cpu\mmx.cpp" />
     <ClCompile Include="..\src\cpu\modrm.cpp" />
     <ClCompile Include="..\src\cpu\paging.cpp" />
-    <ClCompile Include="..\src\debug\debug.cpp" />
+    <ClCompile Include="..\src\debug\debug.cpp">
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="..\src\agent\bridge\agent_bridge.cpp" />
     <ClCompile Include="..\src\agent\debugger\debugger_adapter.cpp" />
 	<ClCompile Include="..\src\agent\parser\debugger_output_parser.cpp" />
@@ -1776,6 +1778,12 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\kiosk\ingest\image_crawler.cpp">
       <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="..\src\kiosk\ingest\conf_translator.cpp">
+      <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="..\src\kiosk\ingest\archive_importer.cpp">
+      <ExcludedFromBuild Condition="!$(Configuration.Contains('SDL2'))">true</ExcludedFromBuild>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\src\winres.rc" />
@@ -1804,6 +1812,8 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\src\kiosk\machine\kioskext_bin.h" />
     <ClInclude Include="..\src\kiosk\ingest\signature_matcher.h" />
     <ClInclude Include="..\src\kiosk\ingest\image_crawler.h" />
+    <ClInclude Include="..\src\kiosk\ingest\conf_translator.h" />
+    <ClInclude Include="..\src\kiosk\ingest\archive_importer.h" />
     <ClInclude Include="..\include\8255.h" />
     <ClInclude Include="..\include\bios.h" />
     <ClInclude Include="..\include\bios_disk.h" />

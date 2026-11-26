@@ -70,6 +70,7 @@ private:
     void RenderContextActionsModal();
     void RenderCaddyManagerModal();
     void RenderDeleteConfirmModal();
+    void RenderImportArchiveModal();
 
     int m_selected_game_idx = 0;
     int m_selected_app_idx = 0;
@@ -105,6 +106,13 @@ private:
     bool m_delete_modal_is_item = false;
     std::string m_delete_modal_target_id;
     std::string m_delete_modal_target_name;
+
+    // GOG / Steam archive import modal state
+    bool m_show_import_modal = false;
+    char m_import_path_buf[512] = {0};
+    int m_import_deploy_mode = 0; // 0 = Mode A (Appliance Container), 1 = Mode B (HDD Inject)
+    int m_import_target_machine_idx = 0;
+    std::string m_import_status_msg;
 };
 
 #endif // DOSBOX_KIOSK_VIEW_CAROUSEL_H
