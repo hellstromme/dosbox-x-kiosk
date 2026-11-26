@@ -8,6 +8,7 @@
 #include "machine/config_synthesizer.h"
 #include "machine/boot_injector.h"
 #include "ui/kiosk_ui.h"
+#include "ui/view_carousel.h"
 #include "ui/input_router.h"
 #include "ui/runtime_overlay.h"
 #include "ui/view_disk_caddy.h"
@@ -199,6 +200,7 @@ void KioskManager::Shutdown() {
 
     if (was_init) {
         LOG_MSG("KIOSK: Shutting down Kiosk Subsystems...");
+        ViewCarousel::GetInstance().WaitForPendingImport();
         KioskUI::GetInstance().Shutdown();
         KioskDatabase::GetInstance().Close();
         m_state.store(KioskState::DISABLED);

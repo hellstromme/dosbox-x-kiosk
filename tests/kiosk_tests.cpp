@@ -10,6 +10,9 @@
 #include "machine/boot_injector.h"
 #include "ingest/signature_matcher.h"
 #include "ingest/image_crawler.h"
+#include "ingest/conf_translator.h"
+#include "ingest/archive_importer.h"
+#include <zlib.h>
 #include "ui/kiosk_ui.h"
 #include "ui/input_router.h"
 #include "ui/view_watchdog.h"
@@ -3427,6 +3430,507 @@ TEST(KioskCrawlerTest, Round2DriveGuardMbrBoundsAndTruncatedLeWindow) {
     EXPECT_FALSE(SignatureMatcher::ComputeExecutableFingerprint(trunc_le.data(), trunc_le.size(), "BIG.EXE", fp, 10000));
     // Same buffer when true_file_size == buffer size (genuinely short LE) must succeed
     EXPECT_TRUE(SignatureMatcher::ComputeExecutableFingerprint(trunc_le.data(), trunc_le.size(), "SMALL.EXE", fp, 4096));
+}
+
+// ----------------------------------------------------------------------------
+// Phase 7: GOG & Steam Ingestion Engine Tests
+// ----------------------------------------------------------------------------
+
+namespace {
+
+struct TestZipFileSpec {
+    std::string path;
+    std::vector<uint8_t> data;
+    bool deflate = false;
+};
+
+// Minimal in-memory PKZIP builder (Stored + Deflate via zlib) for Phase 7 tests
+bool WriteSyntheticZipArchive(const std::string& zip_path, const std::vector<TestZipFileSpec>& files) {
+    std::vector<uint8_t> out;
+    struct CdRec {
+        std::string path;
+        uint16_t method;
+        uint32_t crc;
+        uint32_t csz;
+        uint32_t usz;
+        uint32_t lhoff;
+    };
+    std::vector<CdRec> cds;
+
+    auto push16 = [&](uint16_t v) {
+        out.push_back(static_cast<uint8_t>(v & 0xFF));
+        out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    };
+    auto push32 = [&](uint32_t v) {
+        out.push_back(static_cast<uint8_t>(v & 0xFF));
+        out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+        out.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+        out.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+    };
+
+    for (size_t i = 0; i < files.size(); ++i) {
+        const TestZipFileSpec& f = files[i];
+        uint32_t crc = SignatureMatcher::ComputeCrc32(f.data.data(), f.data.size());
+        std::vector<uint8_t> payload = f.data;
+        uint16_t method = 0;
+
+        if (f.deflate && !f.data.empty()) {
+            z_stream zs;
+            std::memset(&zs, 0, sizeof(zs));
+            if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+                return false;
+            }
+            payload.resize(deflateBound(&zs, static_cast<uLong>(f.data.size())));
+            zs.next_in = const_cast<Bytef*>(f.data.data());
+            zs.avail_in = static_cast<uInt>(f.data.size());
+            zs.next_out = payload.data();
+            zs.avail_out = static_cast<uInt>(payload.size());
+            int zrc = deflate(&zs, Z_FINISH);
+            deflateEnd(&zs);
+            if (zrc != Z_STREAM_END) return false;
+            payload.resize(zs.total_out);
+            method = 8;
+        }
+
+        uint32_t lhoff = static_cast<uint32_t>(out.size());
+        push32(0x04034b50U);
+        push16(20);
+        push16(0);
+        push16(method);
+        push16(0);
+        push16(0);
+        push32(crc);
+        push32(static_cast<uint32_t>(payload.size()));
+        push32(static_cast<uint32_t>(f.data.size()));
+        push16(static_cast<uint16_t>(f.path.size()));
+        push16(0);
+        out.insert(out.end(), f.path.begin(), f.path.end());
+        out.insert(out.end(), payload.begin(), payload.end());
+
+        CdRec cd;
+        cd.path = f.path;
+        cd.method = method;
+        cd.crc = crc;
+        cd.csz = static_cast<uint32_t>(payload.size());
+        cd.usz = static_cast<uint32_t>(f.data.size());
+        cd.lhoff = lhoff;
+        cds.push_back(cd);
+    }
+
+    uint32_t cd_off = static_cast<uint32_t>(out.size());
+    for (size_t i = 0; i < cds.size(); ++i) {
+        const CdRec& cd = cds[i];
+        push32(0x02014b50U);
+        push16(20);
+        push16(20);
+        push16(0);
+        push16(cd.method);
+        push16(0);
+        push16(0);
+        push32(cd.crc);
+        push32(cd.csz);
+        push32(cd.usz);
+        push16(static_cast<uint16_t>(cd.path.size()));
+        push16(0);
+        push16(0);
+        push16(0);
+        push16(0);
+        push32(0);
+        push32(cd.lhoff);
+        out.insert(out.end(), cd.path.begin(), cd.path.end());
+    }
+    uint32_t cd_size = static_cast<uint32_t>(out.size()) - cd_off;
+
+    push32(0x06054b50U);
+    push16(0);
+    push16(0);
+    push16(static_cast<uint16_t>(cds.size()));
+    push16(static_cast<uint16_t>(cds.size()));
+    push32(cd_size);
+    push32(cd_off);
+    push16(0);
+
+    std::ofstream ofs(zip_path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!ofs.is_open()) return false;
+    ofs.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+    return ofs.good();
+}
+
+std::vector<uint8_t> StrToBytes(const std::string& s) {
+    return std::vector<uint8_t>(s.begin(), s.end());
+}
+
+std::vector<uint8_t> BuildSyntheticIso9660Bytes(const std::string& volume_label) {
+    std::vector<uint8_t> iso(0x8800, 0);
+    iso[0x8000] = 0x01;
+    std::memcpy(iso.data() + 0x8001, "CD001", 5);
+    std::memset(iso.data() + 0x8028, ' ', 32);
+    size_t n = (std::min)(volume_label.size(), static_cast<size_t>(32));
+    std::memcpy(iso.data() + 0x8028, volume_label.data(), n);
+    return iso;
+}
+
+} // anonymous namespace
+
+TEST(KioskPhase7Test, ConfTranslatorArchetypeScoringAndSecondaryFilter) {
+    EXPECT_TRUE(ConfTranslator::IsSecondaryProfileConf("dosbox_doom_settings.conf"));
+    EXPECT_TRUE(ConfTranslator::IsSecondaryProfileConf("dosbox_doom_server.conf"));
+    EXPECT_FALSE(ConfTranslator::IsSecondaryProfileConf("dosbox_doom.conf"));
+    EXPECT_FALSE(ConfTranslator::IsSecondaryProfileConf("dosbox_doom_single.conf"));
+
+    std::string delta;
+
+    // 1. XT 8088 (CGA / cycles < 600)
+    ConfTranslationResult r_xt;
+    ConfTranslator::ParseConfString("[dosbox]\nmachine=cga\n[cpu]\ncycles=fixed 300\n", ".", r_xt);
+    EXPECT_EQ(ConfTranslator::ScoreArchetype(r_xt, false, false, delta), KioskArchetypes::XT_8088);
+
+    // 2. AT 286 (EGA / cycles 1500)
+    ConfTranslationResult r_286;
+    ConfTranslator::ParseConfString("[dosbox]\nmachine=ega\n[cpu]\ncycles=fixed 1500\n", ".", r_286);
+    EXPECT_EQ(ConfTranslator::ScoreArchetype(r_286, false, false, delta), KioskArchetypes::AT_286);
+
+    // 3. 386DX (SVGA / cycles 8000)
+    ConfTranslationResult r_386;
+    ConfTranslator::ParseConfString("[dosbox]\nmachine=svga_s3\n[cpu]\ncycles=fixed 8000\n[sblaster]\nsbtype=sbpro2\n", ".", r_386);
+    EXPECT_EQ(ConfTranslator::ScoreArchetype(r_386, false, false, delta), KioskArchetypes::DX_386);
+
+    // 4. 486DX2 (cycles > 40000 -> emits cycles=max override)
+    ConfTranslationResult r_486;
+    ConfTranslator::ParseConfString("[cpu]\ncycles=fixed 50000\n", ".", r_486);
+    EXPECT_EQ(ConfTranslator::ScoreArchetype(r_486, false, false, delta), KioskArchetypes::DX2_486);
+    EXPECT_NE(delta.find("cycles = max"), std::string::npos);
+
+    // 5. Pentium 3dfx (glide=true or Win9x PE)
+    ConfTranslationResult r_p5;
+    ConfTranslator::ParseConfString("[glide]\nglide=true\n", ".", r_p5);
+    EXPECT_EQ(ConfTranslator::ScoreArchetype(r_p5, false, false, delta), KioskArchetypes::PENTIUM_3DFX);
+    EXPECT_EQ(ConfTranslator::ScoreArchetype(r_386, true, false, delta), KioskArchetypes::PENTIUM_3DFX);
+}
+
+TEST(KioskPhase7Test, ConfTranslatorAutoexecAst) {
+    const std::string base_conf =
+        "[dosbox]\nmemsize=16\n"
+        "[cpu]\ncycles=max\n";
+    const std::string single_conf =
+        "[autoexec]\n"
+        "# GOG launch script\n"
+        "@echo off\n"
+        "mount C \"..\"\n"
+        "mount C \"..\\cloud_saves\" -t overlay\n"
+        "imgmount d \"..\\cd1.inst\" \"..\\cd2.inst\" -t iso -fs iso\n"
+        "c:\n"
+        "cd tomb\n"
+        "dos4gw.exe tomb.exe -nojoy\n"
+        "exit\n";
+
+    ConfTranslationResult res;
+    ASSERT_TRUE(ConfTranslator::ParseConfString(base_conf, "/sandbox/__support/app", res));
+    ASSERT_TRUE(ConfTranslator::ParseConfString(single_conf, "/sandbox/__support/app", res));
+
+    EXPECT_EQ(res.resolved_game_root, "/sandbox/__support");
+    ASSERT_EQ(res.overlay_dirs.size(), 1U);
+    EXPECT_EQ(res.overlay_dirs[0], "/sandbox/__support/cloud_saves");
+    ASSERT_EQ(res.media_mounts.size(), 1U);
+    EXPECT_EQ(res.media_mounts[0].drive_letter, 'D');
+    EXPECT_TRUE(res.media_mounts[0].is_imgmount);
+    ASSERT_EQ(res.media_mounts[0].raw_paths.size(), 2U);
+    EXPECT_EQ(res.media_mounts[0].raw_paths[0], "..\\cd1.inst");
+    EXPECT_EQ(res.media_mounts[0].raw_paths[1], "..\\cd2.inst");
+
+    EXPECT_EQ(res.guest_working_dir, "C:\\TOMB");
+    EXPECT_EQ(res.guest_executable, "DOS4GW.EXE");
+    EXPECT_EQ(res.guest_arguments, "tomb.exe -nojoy");
+}
+
+TEST(KioskPhase7Test, CueSanitizerAndIsoNormalizer) {
+    const std::string base_tmp = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".p7_cue";
+    const std::string src_dir = base_tmp + "_src";
+    const std::string pool_dir = base_tmp + "_pool";
+    std::remove((pool_dir + "/homm2_cd1.cue").c_str());
+    std::remove((pool_dir + "/homm2_cd1.bin").c_str());
+    std::remove((pool_dir + "/homm2_cd2.iso").c_str());
+
+    // Create mock .inst + .gog + audio track
+    std::vector<TestZipFileSpec> specs;
+    specs.push_back({"GAME.GOG", BuildSyntheticIso9660Bytes("HOMM2_CD1"), false});
+    specs.push_back({"GAME.INST", StrToBytes(
+        "FILE \"GAME.GOG\" BINARY\n"
+        "  TRACK 01 MODE1/2048\n"
+        "    INDEX 01 00:00:00\n"
+        "FILE \"MUSIC\\TRACK02.OGG\" MP3\n"
+        "  TRACK 02 AUDIO\n"
+        "    INDEX 01 00:00:00\n"), false});
+    specs.push_back({"MUSIC/TRACK02.OGG", StrToBytes("OggS_mock_audio_data"), false});
+    specs.push_back({"STANDALONE.GOG", BuildSyntheticIso9660Bytes("STANDALONE_DISC"), false});
+
+    const std::string zip_path = base_tmp + ".zip";
+    ASSERT_TRUE(WriteSyntheticZipArchive(zip_path, specs));
+    std::string err;
+    ASSERT_TRUE(ArchiveImporter::ExtractZipArchive(zip_path, src_dir, err)) << err;
+
+    std::vector<NormalizedMediaEntry> entries;
+    ASSERT_TRUE(ArchiveImporter::NormalizeMediaInSandbox(src_dir, "homm2", pool_dir, entries, err)) << err;
+    ASSERT_EQ(entries.size(), 2U);
+
+    // Entry 0: CUE+BIN with Redbook audio
+    EXPECT_EQ(entries[0].media_type, "CDROM_CUE");
+    EXPECT_TRUE(entries[0].has_redbook_audio);
+    EXPECT_EQ(entries[0].volume_label, "HOMM2_CD1");
+
+    // Verify rewritten CUE sheet uses lowercase relative POSIX paths
+    std::ifstream cf(entries[0].normalized_pool_path.c_str());
+    ASSERT_TRUE(cf.is_open());
+    std::stringstream cbuf;
+    cbuf << cf.rdbuf();
+    std::string cue_out = cbuf.str();
+    EXPECT_NE(cue_out.find("FILE \"homm2_cd1.bin\" BINARY"), std::string::npos);
+    EXPECT_NE(cue_out.find("FILE \"homm2_cd1_audio/track02.ogg\" MP3"), std::string::npos);
+
+    // Entry 1: Standalone .gog -> .iso
+    EXPECT_EQ(entries[1].media_type, "CDROM_ISO");
+    EXPECT_FALSE(entries[1].has_redbook_audio);
+    EXPECT_EQ(entries[1].volume_label, "STANDALONE_DISC");
+
+    std::remove(zip_path.c_str());
+}
+
+TEST(KioskPhase7Test, ZipExtractorDeflateZipSlipAndSteamBackupGuard) {
+    const std::string base_tmp = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".p7_zip";
+
+    // 1. Valid Deflate + Stored Steam zip with redundant SteamApps/common/MyGame/ wrapper
+    const std::string good_zip = base_tmp + "_good.zip";
+    const std::string expected_exe = "MZ_FAKE_DOS_BINARY_PAYLOAD_1234567890";
+    const std::string expected_appid = "2310\n";
+    std::vector<TestZipFileSpec> good_specs;
+    good_specs.push_back({"SteamApps\\common\\MyGame\\GAME.EXE", StrToBytes(expected_exe), true});
+    good_specs.push_back({"SteamApps\\common\\MyGame\\steam_appid.txt", StrToBytes(expected_appid), false});
+    ASSERT_TRUE(WriteSyntheticZipArchive(good_zip, good_specs));
+
+    std::string err;
+    const std::string out_dir = base_tmp + "_out_v2";
+    std::remove((out_dir + "/GAME.EXE").c_str());
+    std::remove((out_dir + "/steam_appid.txt").c_str());
+    ASSERT_TRUE(ArchiveImporter::ExtractZipArchive(good_zip, out_dir, err)) << err;
+    {
+        std::ifstream f((out_dir + "/GAME.EXE").c_str(), std::ios::binary);
+        ASSERT_TRUE(f.is_open());
+        std::string actual((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        EXPECT_EQ(actual, expected_exe);
+    }
+    {
+        std::ifstream f((out_dir + "/steam_appid.txt").c_str(), std::ios::binary);
+        ASSERT_TRUE(f.is_open());
+        std::string actual((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        EXPECT_EQ(actual, expected_appid);
+    }
+    std::remove((out_dir + "/GAME.EXE").c_str());
+    std::remove((out_dir + "/steam_appid.txt").c_str());
+
+    // 2. Zip-Slip rejection (both standard ".." and Win32-normalized ".. " trailing space)
+    const std::string slip_zip = base_tmp + "_slip.zip";
+    std::vector<TestZipFileSpec> slip_specs;
+    slip_specs.push_back({"../../evil.txt", StrToBytes("pwned"), false});
+    ASSERT_TRUE(WriteSyntheticZipArchive(slip_zip, slip_specs));
+    EXPECT_FALSE(ArchiveImporter::ExtractZipArchive(slip_zip, out_dir + "_slip", err));
+    EXPECT_NE(err.find("Zip-Slip"), std::string::npos);
+
+    const std::string win_slip_zip = base_tmp + "_winslip.zip";
+    std::vector<TestZipFileSpec> win_slip_specs;
+    win_slip_specs.push_back({".. /evil.txt", StrToBytes("pwned"), false});
+    ASSERT_TRUE(WriteSyntheticZipArchive(win_slip_zip, win_slip_specs));
+    EXPECT_FALSE(ArchiveImporter::ExtractZipArchive(win_slip_zip, out_dir + "_winslip", err));
+    EXPECT_NE(err.find("Zip-Slip"), std::string::npos);
+    std::remove(win_slip_zip.c_str());
+
+    // 3. Steam encrypted backup (.csd + sku.sis) detection
+    const std::string csd_zip = base_tmp + "_csd.zip";
+    std::vector<TestZipFileSpec> csd_specs;
+    csd_specs.push_back({"Indy/sku.sis", StrToBytes("\"sku\" {}"), false});
+    csd_specs.push_back({"Indy/6011_depotcache_1.csd", StrToBytes("encrypted"), false});
+    ASSERT_TRUE(WriteSyntheticZipArchive(csd_zip, csd_specs));
+    EXPECT_FALSE(ArchiveImporter::ExtractZipArchive(csd_zip, out_dir + "_csd", err));
+    EXPECT_NE(err.find("encrypted backup"), std::string::npos);
+
+    std::remove(good_zip.c_str());
+    std::remove(slip_zip.c_str());
+    std::remove(csd_zip.c_str());
+}
+
+TEST(KioskPhase7Test, GogMetadataJsonIcoAndCruftSanitizer) {
+    const std::string gog_json =
+        "{\n"
+        "  \"gameId\": \"1432575012\",\n"
+        "  \"name\": \"Eye of the Beholder\",\n"
+        "  \"developer\": \"Westwood Associates\",\n"
+        "  \"releaseDate\": \"1991-01-01\",\n"
+        "  \"playTasks\": [\n"
+        "    { \"category\": \"tool\", \"path\": \"DOSBOX\\\\GOGDOSConfig.exe\" },\n"
+        "    { \"category\": \"game\", \"isPrimary\": true, \"path\": \"DOSBOX\\\\DOSBox.exe\", \"arguments\": \"-conf dosbox_eob1.conf\" }\n"
+        "  ]\n"
+        "}";
+    IngestMetadata meta;
+    ASSERT_TRUE(ArchiveImporter::ParseGogInfoJson(gog_json, meta));
+    EXPECT_EQ(meta.title, "Eye of the Beholder");
+    EXPECT_EQ(meta.gog_game_id, "1432575012");
+    EXPECT_EQ(meta.developer, "Westwood Associates");
+    EXPECT_EQ(meta.release_year, 1991);
+    EXPECT_EQ(meta.source_origin, "GOG_IMPORT");
+    EXPECT_EQ(meta.primary_play_task_path, "DOSBOX\\DOSBox.exe");
+
+    // Verify Inno Setup PE marker detection
+    const std::string fake_inno = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".p7_inno.exe";
+    {
+        std::ofstream f(fake_inno.c_str(), std::ios::binary | std::ios::trunc);
+        f << "MZ" << std::string(128, '\0') << "Inno Setup Setup Data (5.6.2)";
+    }
+    EXPECT_EQ(ArchiveImporter::DetectSourceFormat(fake_inno), IngestSourceFormat::GOG_INNOSETUP);
+    std::remove(fake_inno.c_str());
+}
+
+TEST_F(KioskDatabaseFixture, Phase7ModeAApplianceContainerEndToEnd) {
+    const std::string base_tmp = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".p7_modea";
+    const std::string zip_path = base_tmp + ".zip";
+    const std::string data_root = base_tmp + "_root";
+
+    std::vector<uint8_t> fake_exe(128, 0x90);
+    fake_exe[0] = 'M'; fake_exe[1] = 'Z';
+
+    std::vector<TestZipFileSpec> specs;
+    specs.push_back({"EOB/EOB.EXE", fake_exe, true});
+    specs.push_back({"EOB/DOSBOX/DOSBox.exe", StrToBytes("MZ_CRUFT"), false});
+    specs.push_back({"EOB/SDL.dll", StrToBytes("MZ_CRUFT"), false});
+    specs.push_back({"EOB/__support/app/dosbox_eob1.conf", StrToBytes("[dosbox]\nmachine=svga_s3\n[cpu]\ncycles=fixed 6000\n"), true});
+    specs.push_back({"EOB/__support/app/dosbox_eob1_single.conf", StrToBytes("[autoexec]\nmount C \"..\\..\"\nc:\neob.exe\nexit\n"), true});
+    specs.push_back({"EOB/goggame-1432575012.info", StrToBytes("{\"name\":\"Eye of the Beholder\",\"gameId\":\"1432575012\",\"releaseDate\":\"1991-01-01\"}"), false});
+    specs.push_back({"EOB/DISC.GOG", BuildSyntheticIso9660Bytes("EOB_CD1"), false});
+    ASSERT_TRUE(WriteSyntheticZipArchive(zip_path, specs));
+
+    IngestOptions opts;
+    opts.source_path = zip_path;
+    opts.deploy_mode = IngestDeployMode::APPLIANCE_CONTAINER;
+    opts.kiosk_data_root = data_root;
+
+    IngestResult res = ArchiveImporter::ImportArchive(opts);
+    ASSERT_TRUE(res.success) << res.error_message;
+    EXPECT_EQ(res.title, "Eye of the Beholder");
+    EXPECT_EQ(res.archetype_id, KioskArchetypes::DX_386);
+    EXPECT_EQ(res.media_registered_count, 1);
+    EXPECT_EQ(res.caddy_bindings_count, 1);
+
+    CatalogItemRecord item;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetItem(res.catalog_item_id, item));
+    EXPECT_EQ(item.launch_mechanism, "INTEGRATED_AUTOEXEC");
+    EXPECT_EQ(item.guest_executable, "EOB.EXE");
+    EXPECT_EQ(item.source_origin, "GOG_IMPORT");
+    EXPECT_FALSE(item.host_container_dir.empty());
+
+    // Verify wrapper cruft was stripped from deployed container
+    std::ifstream cruft_check((item.host_container_dir + "/SDL.dll").c_str());
+    EXPECT_FALSE(cruft_check.is_open());
+    std::ifstream game_check((item.host_container_dir + "/EOB.EXE").c_str());
+    EXPECT_TRUE(game_check.is_open());
+
+    std::remove(zip_path.c_str());
+}
+
+TEST_F(KioskDatabaseFixture, Phase7ModeBFat16HddInjectionAndPathPatching) {
+    const std::string base_tmp = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".p7_modeb";
+    const std::string hdd_path = base_tmp + "_hdd.img";
+    const std::string zip_path = base_tmp + ".zip";
+    const std::string data_root = base_tmp + "_root";
+
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd_path));
+
+    MachineRecord mach;
+    mach.id = "mach-p7-modeb";
+    mach.display_name = "My 1993 486DX2";
+    mach.archetype_id = KioskArchetypes::DX2_486;
+    mach.archetype_tier = 4;
+    mach.boot_mode = "REAL_HDD_BOOT";
+    mach.os_installed = true;
+    mach.primary_hdd_path = hdd_path;
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMachine(mach));
+
+    std::vector<uint8_t> fake_exe(128, 0x90);
+    fake_exe[0] = 'M'; fake_exe[1] = 'Z';
+
+    std::vector<TestZipFileSpec> specs;
+    specs.push_back({"KQ6/SIERRA.EXE", fake_exe, true});
+    specs.push_back({"KQ6/RESOURCE.CFG", StrToBytes("patchDir=C:\\\ncdrom=D:\\\n"), false});
+    specs.push_back({"KQ6/dosbox_kq6.conf", StrToBytes("[autoexec]\nmount C \".\"\nc:\nsierra.exe\nexit\n"), false});
+    ASSERT_TRUE(WriteSyntheticZipArchive(zip_path, specs));
+
+    IngestOptions opts;
+    opts.source_path = zip_path;
+    opts.deploy_mode = IngestDeployMode::HDD_INJECT;
+    opts.target_machine_id = mach.id;
+    opts.kiosk_data_root = data_root;
+
+    IngestResult res = ArchiveImporter::ImportArchive(opts);
+    ASSERT_TRUE(res.success) << res.error_message;
+    EXPECT_EQ(res.config_files_patched, 1);
+
+    // Verify injected files & patched RESOURCE.CFG can be read back via Phase 6 FatReadOnlyVfs
+    FatReadOnlyVfs vfs;
+    ASSERT_TRUE(vfs.OpenImageFile(hdd_path));
+    FatDirEntry exe_ent;
+    ASSERT_TRUE(vfs.FindPath(res.deployed_path + "\\SIERRA.EXE", exe_ent));
+    FatDirEntry cfg_ent;
+    ASSERT_TRUE(vfs.FindPath(res.deployed_path + "\\RESOURCE.CFG", cfg_ent));
+
+    std::vector<uint8_t> cfg_bytes;
+    ASSERT_TRUE(vfs.ReadFile(cfg_ent, cfg_bytes));
+    std::string cfg_text(reinterpret_cast<const char*>(cfg_bytes.data()), cfg_bytes.size());
+    EXPECT_NE(cfg_text.find("patchDir=" + res.deployed_path + "\\"), std::string::npos);
+    EXPECT_NE(cfg_text.find("cdrom=D:\\"), std::string::npos);
+    vfs.Close();
+
+    std::remove(hdd_path.c_str());
+    std::remove(zip_path.c_str());
+}
+
+TEST_F(KioskDatabaseFixture, Phase7SteamSubdirDosExecutableSkipsWin32WrapperAndHonorsArchetypeOverride) {
+    const std::string base_tmp = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".p7_indy";
+    const std::string zip_path = base_tmp + ".zip";
+    const std::string data_root = base_tmp + "_root";
+
+    // Build a realistic Win32 PE wrapper (like Steam's root launcher) + real DOS MZ inside ATLANTIS/
+    std::vector<uint8_t> win32_pe(256, 0);
+    win32_pe[0] = 'M'; win32_pe[1] = 'Z';
+    TestWriteLe32(win32_pe.data() + 0x3C, 0x80);
+    win32_pe[0x80] = 'P'; win32_pe[0x81] = 'E'; win32_pe[0x82] = 0; win32_pe[0x83] = 0;
+
+    std::vector<uint8_t> dos_mz(40000, 0x90);
+    dos_mz[0] = 'M'; dos_mz[1] = 'Z';
+
+    std::vector<TestZipFileSpec> specs;
+    specs.push_back({"Indiana Jones and the Fate of Atlantis/Indiana Jones and the Fate of Atlantis.exe", win32_pe, false});
+    specs.push_back({"Indiana Jones and the Fate of Atlantis/testapp.exe", win32_pe, false});
+    specs.push_back({"Indiana Jones and the Fate of Atlantis/ATLANTIS/ATLANTIS.EXE", dos_mz, true});
+    specs.push_back({"Indiana Jones and the Fate of Atlantis/ATLANTIS/HELPME.EXE", std::vector<uint8_t>{'M','Z',0x90,0x90}, false});
+    ASSERT_TRUE(WriteSyntheticZipArchive(zip_path, specs));
+
+    IngestOptions opts;
+    opts.source_path = zip_path;
+    opts.deploy_mode = IngestDeployMode::APPLIANCE_CONTAINER;
+    opts.archetype_override = KioskArchetypes::AT_286;
+    opts.kiosk_data_root = data_root;
+
+    IngestResult res = ArchiveImporter::ImportArchive(opts);
+    ASSERT_TRUE(res.success) << res.error_message;
+    EXPECT_EQ(res.archetype_id, KioskArchetypes::AT_286);
+
+    CatalogItemRecord item;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetItem(res.catalog_item_id, item));
+    EXPECT_EQ(item.guest_working_dir, "C:\\ATLANTIS");
+    EXPECT_EQ(item.guest_executable, "ATLANTIS.EXE");
+
+    // Verify testapp.exe was stripped
+    std::ifstream testapp_check((item.host_container_dir + "/testapp.exe").c_str());
+    EXPECT_FALSE(testapp_check.is_open());
+
+    std::remove(zip_path.c_str());
 }
 
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

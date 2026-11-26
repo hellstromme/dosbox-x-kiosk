@@ -2,8 +2,12 @@
 #define DOSBOX_KIOSK_VIEW_CAROUSEL_H
 
 #include "../kiosk_types.h"
+#include "../ingest/archive_importer.h"
 #include "input_router.h"
+#include <atomic>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct ImDrawList;
@@ -48,10 +52,13 @@ public:
     static int ComputeNextSlotOrder(const std::vector<CaddyBindingRecord>& bindings, const std::string& target_drive);
 
     void ResetTransientModals();
+    void WaitForPendingImport();
+    void PollImportCompletion();
     bool IsContextModalOpen() const { return m_show_context_modal; }
 
 private:
     ViewCarousel() = default;
+    ~ViewCarousel();
 
     void RenderCatalogCarousel(const std::string& item_type, int& selected_idx, float& scroll_offset);
     void DrawProceduralBoxArtCard(
@@ -70,6 +77,10 @@ private:
     void RenderContextActionsModal();
     void RenderCaddyManagerModal();
     void RenderDeleteConfirmModal();
+    void RenderImportArchiveModal();
+    void RenderFilePickerModal();
+    void OpenFilePicker(const std::string& initial_dir = "");
+    void RefreshFilePickerEntries();
 
     int m_selected_game_idx = 0;
     int m_selected_app_idx = 0;
@@ -105,6 +116,33 @@ private:
     bool m_delete_modal_is_item = false;
     std::string m_delete_modal_target_id;
     std::string m_delete_modal_target_name;
+
+    // GOG / Steam archive import modal state
+    bool m_show_import_modal = false;
+    char m_import_path_buf[1024] = {0};
+    int m_import_deploy_mode = 0; // 0 = Mode A (Appliance Container), 1 = Mode B (HDD Inject)
+    int m_import_archetype_idx = 0; // 0 = Auto-Detect, 1..5 = XT_8088 .. PENTIUM_3DFX
+    int m_import_target_machine_idx = 0;
+    std::string m_import_item_type = "GAME";
+    std::string m_import_status_msg;
+    std::thread m_import_worker;
+    std::mutex m_import_mutex;
+    std::atomic<bool> m_import_in_progress{false};
+    bool m_import_result_ready = false;
+    IngestResult m_import_result;
+
+    // In-Kiosk Dear ImGui file/folder picker state (no OS dialogs, stays fullscreen)
+    struct FilePickerEntry {
+        std::string name;
+        std::string full_path;
+        bool is_dir = false;
+        uint64_t size_bytes = 0;
+    };
+    bool m_show_file_picker = false;
+    bool m_picker_filter_archives = true;
+    std::string m_picker_current_dir;
+    int m_picker_selected_idx = -1;
+    std::vector<FilePickerEntry> m_picker_entries;
 };
 
 #endif // DOSBOX_KIOSK_VIEW_CAROUSEL_H
