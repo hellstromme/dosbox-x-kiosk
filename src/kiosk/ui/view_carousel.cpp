@@ -93,6 +93,12 @@ ViewCarousel& ViewCarousel::GetInstance() {
     return instance;
 }
 
+ViewCarousel::~ViewCarousel() {
+    if (m_import_worker.joinable()) {
+        m_import_worker.join();
+    }
+}
+
 void ViewCarousel::SetSearchFilter(const std::string& filter) {
     m_search_filter = filter;
     std::snprintf(m_search_buf, sizeof(m_search_buf), "%s", filter.c_str());
@@ -513,6 +519,7 @@ void ViewCarousel::RenderCatalogCarousel(const std::string& item_type, int& sele
     ImGui::SameLine();
     if (ImGui::Button("Import GOG / Steam")) {
         m_show_import_modal = true;
+        m_import_item_type = item_type.empty() ? "GAME" : item_type;
         m_import_status_msg.clear();
     }
 
@@ -975,6 +982,7 @@ void ViewCarousel::RenderMediaPoolTab() {
     ImGui::SameLine(0.0f, 8.0f);
     if (ImGui::Button("Import GOG / Steam##MediaPool")) {
         m_show_import_modal = true;
+        m_import_item_type = "GAME";
         m_import_status_msg.clear();
     }
 
@@ -1498,7 +1506,42 @@ void ViewCarousel::RenderImportArchiveModal() {
             }
         }
 
-        if (!m_import_status_msg.empty()) {
+        // Poll background import worker completion without blocking the UI loop
+        if (!m_import_in_progress.load()) {
+            bool finished = false;
+            IngestResult done_res;
+            {
+                std::lock_guard<std::mutex> lock(m_import_mutex);
+                if (m_import_result_ready) {
+                    finished = true;
+                    done_res = m_import_result;
+                    m_import_result_ready = false;
+                }
+            }
+            if (finished) {
+                if (m_import_worker.joinable()) m_import_worker.join();
+                if (done_res.success) {
+                    ui.InvalidateCatalogCache();
+                    ui.ShowToast("Imported '" + done_res.title + "' (" + done_res.archetype_id + ")");
+                    m_import_path_buf[0] = '\0';
+                    m_import_status_msg.clear();
+                    m_show_import_modal = false;
+                    ImGui::CloseCurrentPopup();
+                    ImGui::EndPopup();
+                    return;
+                } else {
+                    m_import_status_msg = "Import failed: " + done_res.error_message;
+                }
+            }
+        }
+
+        const bool importing_now = m_import_in_progress.load();
+        if (importing_now) {
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
+            ImGui::TextUnformatted("Importing archive in background... please wait.");
+            ImGui::PopStyleColor();
+        } else if (!m_import_status_msg.empty()) {
             ImGui::Spacing();
             ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
             ImGui::TextWrapped("%s", m_import_status_msg.c_str());
@@ -1509,12 +1552,15 @@ void ViewCarousel::RenderImportArchiveModal() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        const bool can_import = (m_import_path_buf[0] != '\0') &&
+        const bool can_import = !importing_now &&
+                                (m_import_path_buf[0] != '\0') &&
                                 (m_import_deploy_mode == 0 || !hdd_machines.empty());
         if (!can_import) ImGui::BeginDisabled();
         if (ImGui::Button("Start Import", ImVec2(140.0f, 32.0f))) {
+            if (m_import_worker.joinable()) m_import_worker.join();
             IngestOptions opts;
             opts.source_path = m_import_path_buf;
+            opts.item_type = m_import_item_type.empty() ? "GAME" : m_import_item_type;
             opts.deploy_mode = (m_import_deploy_mode == 1)
                                    ? IngestDeployMode::HDD_INJECT
                                    : IngestDeployMode::APPLIANCE_CONTAINER;
@@ -1524,26 +1570,28 @@ void ViewCarousel::RenderImportArchiveModal() {
             if (m_import_deploy_mode == 1 && !hdd_machines.empty()) {
                 opts.target_machine_id = hdd_machines[static_cast<size_t>(m_import_target_machine_idx)].id;
             }
-            IngestResult res = ArchiveImporter::ImportArchive(opts);
-            if (res.success) {
-                ui.InvalidateCatalogCache();
-                ui.ShowToast("Imported '" + res.title + "' (" + res.archetype_id + ")");
-                m_import_path_buf[0] = '\0';
-                m_import_status_msg.clear();
-                m_show_import_modal = false;
-                ImGui::CloseCurrentPopup();
-            } else {
-                m_import_status_msg = "Import failed: " + res.error_message;
-            }
+            m_import_status_msg.clear();
+            m_import_in_progress.store(true);
+            m_import_worker = std::thread([this, opts]() {
+                IngestResult res = ArchiveImporter::ImportArchive(opts);
+                {
+                    std::lock_guard<std::mutex> lock(m_import_mutex);
+                    m_import_result = res;
+                    m_import_result_ready = true;
+                }
+                m_import_in_progress.store(false);
+            });
         }
         if (!can_import) ImGui::EndDisabled();
 
         ImGui::SameLine();
+        if (importing_now) ImGui::BeginDisabled();
         if (ImGui::Button("Cancel", ImVec2(100.0f, 32.0f))) {
             m_show_import_modal = false;
             m_show_file_picker = false;
             ImGui::CloseCurrentPopup();
         }
+        if (importing_now) ImGui::EndDisabled();
 
         RenderFilePickerModal();
         ImGui::EndPopup();
@@ -1684,7 +1732,7 @@ void ViewCarousel::OpenFilePicker(const std::string& initial_dir) {
         std::string norm = PickerNormalizeDir(initial_dir);
         if (PickerIsDirectory(norm)) {
             start_dir = norm;
-        } else {
+        } else if (norm.find_last_of("\\/") != std::string::npos) {
             std::string parent = PickerParentDir(norm);
             if (!parent.empty() && PickerIsDirectory(parent)) {
                 start_dir = parent;
@@ -1902,9 +1950,13 @@ void ViewCarousel::RenderFilePickerModal() {
                 m_picker_current_dir = m_picker_entries[static_cast<size_t>(navigate_idx)].full_path;
                 RefreshFilePickerEntries();
             } else if (pick_file_idx >= 0) {
-                std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s",
-                              m_picker_entries[static_cast<size_t>(pick_file_idx)].full_path.c_str());
-                m_import_status_msg.clear();
+                const std::string& picked = m_picker_entries[static_cast<size_t>(pick_file_idx)].full_path;
+                if (picked.size() >= sizeof(m_import_path_buf)) {
+                    m_import_status_msg = "Selected path exceeds maximum supported length.";
+                } else {
+                    std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", picked.c_str());
+                    m_import_status_msg.clear();
+                }
                 m_show_file_picker = false;
                 ImGui::CloseCurrentPopup();
             }
@@ -1924,8 +1976,12 @@ void ViewCarousel::RenderFilePickerModal() {
                 m_picker_current_dir = chosen.full_path;
                 RefreshFilePickerEntries();
             } else {
-                std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", chosen.full_path.c_str());
-                m_import_status_msg.clear();
+                if (chosen.full_path.size() >= sizeof(m_import_path_buf)) {
+                    m_import_status_msg = "Selected path exceeds maximum supported length.";
+                } else {
+                    std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", chosen.full_path.c_str());
+                    m_import_status_msg.clear();
+                }
                 m_show_file_picker = false;
                 ImGui::CloseCurrentPopup();
             }
@@ -1936,8 +1992,12 @@ void ViewCarousel::RenderFilePickerModal() {
         const bool can_use_folder = !m_picker_current_dir.empty();
         if (!can_use_folder) ImGui::BeginDisabled();
         if (ImGui::Button("Use This Folder", ImVec2(135.0f, 30.0f))) {
-            std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", m_picker_current_dir.c_str());
-            m_import_status_msg.clear();
+            if (m_picker_current_dir.size() >= sizeof(m_import_path_buf)) {
+                m_import_status_msg = "Selected folder path exceeds maximum supported length.";
+            } else {
+                std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", m_picker_current_dir.c_str());
+                m_import_status_msg.clear();
+            }
             m_show_file_picker = false;
             ImGui::CloseCurrentPopup();
         }

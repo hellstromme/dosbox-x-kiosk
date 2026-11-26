@@ -3700,26 +3700,48 @@ TEST(KioskPhase7Test, ZipExtractorDeflateZipSlipAndSteamBackupGuard) {
 
     // 1. Valid Deflate + Stored Steam zip with redundant SteamApps/common/MyGame/ wrapper
     const std::string good_zip = base_tmp + "_good.zip";
+    const std::string expected_exe = "MZ_FAKE_DOS_BINARY_PAYLOAD_1234567890";
+    const std::string expected_appid = "2310\n";
     std::vector<TestZipFileSpec> good_specs;
-    good_specs.push_back({"SteamApps\\common\\MyGame\\GAME.EXE", StrToBytes("MZ_FAKE_DOS_BINARY_PAYLOAD_1234567890"), true});
-    good_specs.push_back({"SteamApps\\common\\MyGame\\steam_appid.txt", StrToBytes("2310\n"), false});
+    good_specs.push_back({"SteamApps\\common\\MyGame\\GAME.EXE", StrToBytes(expected_exe), true});
+    good_specs.push_back({"SteamApps\\common\\MyGame\\steam_appid.txt", StrToBytes(expected_appid), false});
     ASSERT_TRUE(WriteSyntheticZipArchive(good_zip, good_specs));
 
     std::string err;
-    const std::string out_dir = base_tmp + "_out";
+    const std::string out_dir = base_tmp + "_out_v2";
+    std::remove((out_dir + "/GAME.EXE").c_str());
+    std::remove((out_dir + "/steam_appid.txt").c_str());
     ASSERT_TRUE(ArchiveImporter::ExtractZipArchive(good_zip, out_dir, err)) << err;
     {
         std::ifstream f((out_dir + "/GAME.EXE").c_str(), std::ios::binary);
-        EXPECT_TRUE(f.is_open());
+        ASSERT_TRUE(f.is_open());
+        std::string actual((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        EXPECT_EQ(actual, expected_exe);
     }
+    {
+        std::ifstream f((out_dir + "/steam_appid.txt").c_str(), std::ios::binary);
+        ASSERT_TRUE(f.is_open());
+        std::string actual((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        EXPECT_EQ(actual, expected_appid);
+    }
+    std::remove((out_dir + "/GAME.EXE").c_str());
+    std::remove((out_dir + "/steam_appid.txt").c_str());
 
-    // 2. Zip-Slip rejection
+    // 2. Zip-Slip rejection (both standard ".." and Win32-normalized ".. " trailing space)
     const std::string slip_zip = base_tmp + "_slip.zip";
     std::vector<TestZipFileSpec> slip_specs;
     slip_specs.push_back({"../../evil.txt", StrToBytes("pwned"), false});
     ASSERT_TRUE(WriteSyntheticZipArchive(slip_zip, slip_specs));
     EXPECT_FALSE(ArchiveImporter::ExtractZipArchive(slip_zip, out_dir + "_slip", err));
     EXPECT_NE(err.find("Zip-Slip"), std::string::npos);
+
+    const std::string win_slip_zip = base_tmp + "_winslip.zip";
+    std::vector<TestZipFileSpec> win_slip_specs;
+    win_slip_specs.push_back({".. /evil.txt", StrToBytes("pwned"), false});
+    ASSERT_TRUE(WriteSyntheticZipArchive(win_slip_zip, win_slip_specs));
+    EXPECT_FALSE(ArchiveImporter::ExtractZipArchive(win_slip_zip, out_dir + "_winslip", err));
+    EXPECT_NE(err.find("Zip-Slip"), std::string::npos);
+    std::remove(win_slip_zip.c_str());
 
     // 3. Steam encrypted backup (.csd + sku.sis) detection
     const std::string csd_zip = base_tmp + "_csd.zip";

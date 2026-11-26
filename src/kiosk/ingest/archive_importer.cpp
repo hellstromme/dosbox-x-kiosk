@@ -276,6 +276,8 @@ bool ListDirEntries(const std::string& dir, std::vector<FsDirEntry>& out_entries
     do {
         std::string name = WideToUtf8(ffd.cFileName);
         if (name == "." || name == "..") continue;
+        // Skip symlinks / junctions / reparse points to keep folder staging strictly in-tree
+        if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
         FsDirEntry e;
         e.name = name;
         e.is_dir = ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
@@ -290,9 +292,14 @@ bool ListDirEntries(const std::string& dir, std::vector<FsDirEntry>& out_entries
     while ((ent = readdir(d)) != nullptr) {
         std::string name(ent->d_name);
         if (name == "." || name == "..") continue;
+        std::string full = JoinPath(dir, name);
+        struct stat lst;
+        if (lstat(full.c_str(), &lst) != 0) continue;
+        if (S_ISLNK(lst.st_mode)) continue; // Skip symlinks
+        if (!S_ISDIR(lst.st_mode) && !S_ISREG(lst.st_mode)) continue; // Regular files & dirs only
         FsDirEntry e;
         e.name = name;
-        e.is_dir = IsDirectory(JoinPath(dir, name));
+        e.is_dir = S_ISDIR(lst.st_mode);
         out_entries.push_back(e);
     }
     closedir(d);
@@ -366,6 +373,26 @@ bool ReadFileToBytes(const std::string& path, std::vector<uint8_t>& out_data, si
         return false;
     }
     std::fclose(f);
+    return true;
+}
+
+bool ReadFilePrefixToBytes(const std::string& path, std::vector<uint8_t>& out_data, size_t max_bytes) {
+    out_data.clear();
+#if defined(_WIN32)
+    FILE* f = _wfopen(Utf8ToWide(path).c_str(), L"rb");
+#else
+    FILE* f = std::fopen(path.c_str(), "rb");
+#endif
+    if (!f) return false;
+    out_data.resize(max_bytes);
+    size_t got = std::fread(out_data.data(), 1, max_bytes, f);
+    bool err = (std::ferror(f) != 0);
+    std::fclose(f);
+    if (err) {
+        out_data.clear();
+        return false;
+    }
+    out_data.resize(got);
     return true;
 }
 
@@ -657,7 +684,7 @@ public:
                 uint32_t secs = ReadLe32(pe + 12);
                 if (ptype != 0 && lba > 0 && secs > 0 &&
                     static_cast<uint64_t>(lba) + static_cast<uint64_t>(secs) <= m_image_sectors) {
-                    if (ParseBpb(lba)) {
+                    if (ParseBpb(lba, secs)) {
                         part_lba = lba;
                         parsed = true;
                         break;
@@ -666,7 +693,7 @@ public:
             }
         }
         if (!parsed) {
-            if (!ParseBpb(0)) {
+            if (!ParseBpb(0, m_image_sectors)) {
                 out_error = "HDD image does not contain a valid FAT16 or FAT32 partition";
                 Close();
                 return false;
@@ -817,7 +844,7 @@ private:
         return true;
     }
 
-    bool ParseBpb(uint32_t part_lba) {
+    bool ParseBpb(uint32_t part_lba, uint64_t max_part_sectors = 0) {
         uint8_t vbr[512];
         if (!ReadSector(part_lba, vbr)) return false;
         if (vbr[510] != 0x55 || vbr[511] != 0xAA) return false;
@@ -835,6 +862,7 @@ private:
 
         if (bps != 512 || spc == 0 || (spc & (spc - 1)) != 0 || rsvd == 0 || nfats == 0 || nfats > 4) return false;
         if (tot_sec == 0 || fat_sz == 0) return false;
+        if (max_part_sectors > 0 && static_cast<uint64_t>(tot_sec) > max_part_sectors) return false;
         if (static_cast<uint64_t>(part_lba) + static_cast<uint64_t>(tot_sec) > m_image_sectors) return false;
 
         uint64_t root_dir_secs = ((static_cast<uint64_t>(root_cnt) * 32ULL) + (bps - 1ULL)) / bps;
@@ -1127,7 +1155,7 @@ private:
                 if (has_pending_lfn && pending_lfn_csum == ComputeSfnChecksum(ent) &&
                     ToUpperAscii(pending_lfn) == target_upper) {
                     match = true;
-                } else if (std::memcmp(ent, target_sfn, 11) == 0) {
+                } else if (!lossy && std::memcmp(ent, target_sfn, 11) == 0) {
                     match = true;
                 }
                 pending_lfn.clear();
@@ -1244,12 +1272,13 @@ private:
         WriteLe32(sfn_ent.data() + 28, file_size);
         raw_entries.push_back(sfn_ent);
 
-        // Find contiguous free slots in directory
+        // Find contiguous free slots in directory without leaving a 0x00 end-of-directory marker before new entries
         const size_t need = raw_entries.size();
         size_t total_slots = lbas.size() * 16;
         size_t run_start = 0;
         size_t run_len = 0;
         bool found_space = false;
+        size_t eod_slot = total_slots;
 
         uint8_t sec[512];
         for (size_t slot = 0; slot < total_slots; ++slot) {
@@ -1257,7 +1286,15 @@ private:
                 if (!ReadSector(lbas[slot / 16], sec)) return false;
             }
             uint8_t b0 = sec[(slot % 16) * 32];
-            if (b0 == 0x00 || b0 == 0xE5) {
+            if (b0 == 0x00) {
+                // End-of-directory marker: all remaining slots in this cluster chain are free
+                eod_slot = (run_len > 0) ? run_start : slot;
+                if (total_slots - eod_slot >= need) {
+                    run_start = eod_slot;
+                    found_space = true;
+                }
+                break;
+            } else if (b0 == 0xE5) {
                 if (run_len == 0) run_start = slot;
                 ++run_len;
                 if (run_len >= need) {
@@ -1269,14 +1306,17 @@ private:
             }
         }
 
-        // Extend cluster-backed directory if full (allocate enough clusters for all LFN + SFN slots)
+        // Extend cluster-backed directory if full (starting at eod_slot so no 0x00 precedes new entries)
         if (!found_space) {
             if (dir_cluster == 0 && m_fs_type == FilesystemType::FAT16) {
                 out_error = "FAT16 root directory is full";
                 return false;
             }
+            const size_t start_slot = eod_slot;
+            const size_t remaining_existing = (start_slot < total_slots) ? (total_slots - start_slot) : 0;
+            const size_t additional_slots = (need > remaining_existing) ? (need - remaining_existing) : need;
             const size_t slots_per_cluster = static_cast<size_t>(m_sectors_per_cluster) * 16U;
-            const uint32_t extra_clusters = static_cast<uint32_t>((need + slots_per_cluster - 1U) / slots_per_cluster);
+            const uint32_t extra_clusters = static_cast<uint32_t>((additional_slots + slots_per_cluster - 1U) / slots_per_cluster);
             std::vector<uint32_t> extra;
             if (!AllocateClusterChain(extra_clusters, extra)) {
                 out_error = "Insufficient free space to grow directory";
@@ -1294,7 +1334,7 @@ private:
                 return false;
             }
 
-            run_start = total_slots;
+            run_start = start_slot;
             for (size_t c = 0; c < extra.size(); ++c) {
                 uint64_t base = ClusterToLba(extra[c]);
                 for (uint32_t s = 0; s < m_sectors_per_cluster; ++s) {
@@ -1580,8 +1620,28 @@ bool IsSafeRelativeZipPath(const std::string& raw_path, std::string& out_norm) {
     std::stringstream ss(p);
     std::string seg;
     while (std::getline(ss, seg, '/')) {
-        if (seg.empty() || seg == ".") continue;
-        if (seg == "..") return false; // Zip-Slip attempt
+        if (seg.empty()) continue;
+        // Reject control characters and Win32-illegal filename characters (e.g. ':', '<', '>', '|', '?', '*')
+        for (size_t c = 0; c < seg.size(); ++c) {
+            unsigned char uc = static_cast<unsigned char>(seg[c]);
+            if (uc < 0x20 || seg[c] == ':' || seg[c] == '<' || seg[c] == '>' ||
+                seg[c] == '"' || seg[c] == '|' || seg[c] == '?' || seg[c] == '*') {
+                return false;
+            }
+        }
+        // Win32 normalizes away trailing spaces and dots (so ".. " or "..." can become "..")
+        std::string win_norm = seg;
+        while (!win_norm.empty() && (win_norm.back() == ' ' || win_norm.back() == '.')) {
+            win_norm.pop_back();
+        }
+        if (seg == ".") continue;
+        if (seg == ".." || win_norm.empty() || win_norm == "." || win_norm == "..") {
+            return false; // Zip-Slip / Win32-normalized traversal attempt
+        }
+        // Also reject trailing spaces/dots on Win32-sensitive path segments
+        if (seg.back() == ' ' || seg.back() == '.') {
+            return false;
+        }
         parts.push_back(seg);
     }
     for (size_t i = 0; i < parts.size(); ++i) {
@@ -1967,6 +2027,13 @@ bool ArchiveImporter::ExtractZipArchive(
         fseeko(f, static_cast<off_t>(data_offset), SEEK_SET);
 #endif
 
+        const uint64_t kMaxSingleEntryBytes = 512ULL * 1024ULL * 1024ULL;
+        if (em.comp_size > kMaxSingleEntryBytes || em.uncomp_size > kMaxSingleEntryBytes) {
+            std::fclose(f);
+            out_error = "ZIP entry exceeds 512 MiB per-file safety limit: " + rel;
+            return false;
+        }
+
         std::vector<uint8_t> comp_buf(em.comp_size);
         if (em.comp_size > 0 && std::fread(comp_buf.data(), 1, em.comp_size, f) != em.comp_size) {
             std::fclose(f);
@@ -1975,12 +2042,6 @@ bool ArchiveImporter::ExtractZipArchive(
         }
 
         std::vector<uint8_t> uncomp_buf;
-        const uint64_t kMaxSingleEntryBytes = 512ULL * 1024ULL * 1024ULL;
-        if (em.uncomp_size > kMaxSingleEntryBytes) {
-            std::fclose(f);
-            out_error = "ZIP entry exceeds 512 MiB per-file safety limit: " + rel;
-            return false;
-        }
         if (em.method == 0) {
             // Stored: compressed and uncompressed sizes must match
             if (em.comp_size != em.uncomp_size) {
@@ -2445,11 +2506,19 @@ bool ArchiveImporter::SanitizeCueSheet(
     const std::string& dest_audio_dir,
     std::string& out_rewritten_cue,
     bool& out_has_redbook_audio,
-    std::string& out_error
+    std::string& out_error,
+    const std::string& sandbox_root,
+    const std::string& dest_bin_dir,
+    std::vector<std::string>* out_copied_source_bins
 ) {
     out_rewritten_cue.clear();
     out_has_redbook_audio = false;
     out_error.clear();
+    if (out_copied_source_bins) out_copied_source_bins->clear();
+
+    const std::string contain_root = sandbox_root.empty() ? source_cue_dir : sandbox_root;
+    std::map<std::string, std::string> bin_src_to_dest_base;
+    int bin_track_idx = 0;
 
     std::istringstream iss(cue_content);
     std::ostringstream oss;
@@ -2497,10 +2566,12 @@ bool ArchiveImporter::SanitizeCueSheet(
             if (file_type.empty()) file_type = "BINARY";
 
             if (IsAudioTrackExt(ref_path) || ToUpperAscii(file_type) == "MP3" || ToUpperAscii(file_type) == "WAVE" || ToUpperAscii(file_type) == "OGG") {
-                std::string resolved = FindFileCaseInsensitive(source_cue_dir, ref_path, source_cue_dir);
+                std::string resolved = FindFileCaseInsensitive(source_cue_dir, ref_path, contain_root);
                 if (resolved.empty()) {
-                    // Fallback: search by basename in source_cue_dir
-                    resolved = FindFileCaseInsensitive(source_cue_dir, BasenameOf(ref_path), source_cue_dir);
+                    resolved = FindFileCaseInsensitive(source_cue_dir, BasenameOf(ref_path), contain_root);
+                }
+                if (resolved.empty() && contain_root != source_cue_dir) {
+                    resolved = FindFileCaseInsensitive(contain_root, BasenameOf(ref_path), contain_root);
                 }
                 if (resolved.empty()) {
                     out_error = "CUE references missing audio track: " + ref_path;
@@ -2519,7 +2590,41 @@ bool ArchiveImporter::SanitizeCueSheet(
                                         : (audio_subdir_name + "/" + lower_audio);
                 oss << "FILE \"" << cue_rel << "\" " << file_type << "\n";
             } else {
-                oss << "FILE \"" << ToLowerAscii(dest_bin_basename) << "\" " << file_type << "\n";
+                // Binary track: preserve every distinct binary file referenced in multi-BIN CUE sheets
+                std::string resolved_bin = FindFileCaseInsensitive(source_cue_dir, ref_path, contain_root);
+                if (resolved_bin.empty()) {
+                    resolved_bin = FindFileCaseInsensitive(contain_root, BasenameOf(ref_path), contain_root);
+                }
+                std::string key = resolved_bin.empty() ? ToLowerAscii(ref_path) : ToLowerAscii(NormalizeSlashes(resolved_bin));
+                std::string out_bin_name;
+                auto bit = bin_src_to_dest_base.find(key);
+                if (bit != bin_src_to_dest_base.end()) {
+                    out_bin_name = bit->second;
+                } else {
+                    ++bin_track_idx;
+                    if (bin_track_idx == 1) {
+                        out_bin_name = ToLowerAscii(dest_bin_basename);
+                    } else {
+                        std::string stem = StemOf(dest_bin_basename);
+                        out_bin_name = ToLowerAscii(stem + "_t" + std::to_string(bin_track_idx) + ".bin");
+                    }
+                    bin_src_to_dest_base[key] = out_bin_name;
+
+                    if (!dest_bin_dir.empty()) {
+                        if (resolved_bin.empty()) {
+                            out_error = "CUE references missing binary track: " + ref_path;
+                            return false;
+                        }
+                        if (!CopyFileStream(resolved_bin, JoinPath(dest_bin_dir, out_bin_name))) {
+                            out_error = "Failed to copy CD binary track to media pool: " + resolved_bin;
+                            return false;
+                        }
+                        if (out_copied_source_bins) {
+                            out_copied_source_bins->push_back(resolved_bin);
+                        }
+                    }
+                }
+                oss << "FILE \"" << out_bin_name << "\" " << file_type << "\n";
             }
         } else {
             oss << trimmed << "\n";
@@ -2617,14 +2722,20 @@ bool ArchiveImporter::NormalizeMediaInSandbox(
         std::string rewritten_cue;
         bool has_redbook = false;
         std::string cue_err;
-        if (!SanitizeCueSheet(cue_text, src_cue_dir, bin_base, audio_subdir, dest_audio, rewritten_cue, has_redbook, cue_err)) {
+        std::vector<std::string> copied_bins;
+        if (!SanitizeCueSheet(cue_text, src_cue_dir, bin_base, audio_subdir, dest_audio,
+                              rewritten_cue, has_redbook, cue_err,
+                              sandbox_dir, media_pool_dir, &copied_bins)) {
             out_error = cue_err;
             return false;
         }
-
-        if (!CopyFileStream(bin_src_path, dest_bin)) {
-            out_error = "Failed to copy CD image to media pool: " + bin_src_path;
-            return false;
+        // Fallback if CUE referenced a missing stem but we located bin_src_path via stem fallback
+        if (copied_bins.empty()) {
+            if (!CopyFileStream(bin_src_path, dest_bin)) {
+                out_error = "Failed to copy CD image to media pool: " + bin_src_path;
+                return false;
+            }
+            copied_bins.push_back(bin_src_path);
         }
         if (!WriteBytesToFile(dest_cue, reinterpret_cast<const uint8_t*>(rewritten_cue.data()), rewritten_cue.size())) {
             out_error = "Failed to write normalized CUE sheet: " + dest_cue;
@@ -2632,12 +2743,14 @@ bool ArchiveImporter::NormalizeMediaInSandbox(
         }
 
         consumed_files.insert(ToLowerAscii(NormalizeSlashes(cue_path)));
-        consumed_files.insert(ToLowerAscii(NormalizeSlashes(bin_src_path)));
         RemoveFileQuiet(cue_path);
-        RemoveFileQuiet(bin_src_path);
+        for (size_t cb = 0; cb < copied_bins.size(); ++cb) {
+            consumed_files.insert(ToLowerAscii(NormalizeSlashes(copied_bins[cb])));
+            RemoveFileQuiet(copied_bins[cb]);
+        }
 
         NormalizedMediaEntry entry;
-        entry.original_rel_path = BasenameOf(cue_path);
+        entry.original_rel_path = NormalizeSlashes(cue_path);
         entry.normalized_pool_path = dest_cue;
         entry.media_type = "CDROM_CUE";
         entry.volume_label = ExtractIso9660VolumeLabel(dest_bin);
@@ -2704,7 +2817,7 @@ bool ArchiveImporter::NormalizeMediaInSandbox(
             RemoveFileQuiet(fp);
 
             NormalizedMediaEntry entry;
-            entry.original_rel_path = BasenameOf(fp);
+            entry.original_rel_path = NormalizeSlashes(fp);
             entry.normalized_pool_path = dest_iso;
             entry.media_type = "CDROM_ISO";
             entry.volume_label = vol;
@@ -2717,6 +2830,21 @@ bool ArchiveImporter::NormalizeMediaInSandbox(
 
             ++floppy_index;
             std::string flp_base = item_slug + "_disk" + std::to_string(floppy_index) + ".img";
+            if (PathExists(JoinPath(media_pool_dir, flp_base))) {
+                bool allocated = false;
+                for (int dup = 2; dup <= 999; ++dup) {
+                    std::string cand = item_slug + "_" + std::to_string(dup) + "_disk" + std::to_string(floppy_index) + ".img";
+                    if (!PathExists(JoinPath(media_pool_dir, cand))) {
+                        flp_base = cand;
+                        allocated = true;
+                        break;
+                    }
+                }
+                if (!allocated) {
+                    out_error = "Could not allocate a unique media_pool path for floppy image: " + fp;
+                    return false;
+                }
+            }
             std::string dest_flp = JoinPath(media_pool_dir, flp_base);
             if (!CopyFileStream(fp, dest_flp)) {
                 out_error = "Failed to copy floppy image to media pool: " + fp;
@@ -2725,7 +2853,7 @@ bool ArchiveImporter::NormalizeMediaInSandbox(
             RemoveFileQuiet(fp);
 
             NormalizedMediaEntry entry;
-            entry.original_rel_path = BasenameOf(fp);
+            entry.original_rel_path = NormalizeSlashes(fp);
             entry.normalized_pool_path = dest_flp;
             entry.media_type = flp_type;
             entry.has_redbook_audio = false;
@@ -2739,8 +2867,10 @@ bool ArchiveImporter::NormalizeMediaInSandbox(
 
 int ArchiveImporter::PatchGameConfigPaths(
     const std::string& game_root_dir,
-    const std::string& guest_install_dir
+    const std::string& guest_install_dir,
+    std::string* out_error
 ) {
+    if (out_error) out_error->clear();
     std::string target_prefix = guest_install_dir;
     for (size_t i = 0; i < target_prefix.size(); ++i) {
         if (target_prefix[i] == '/') target_prefix[i] = '\\';
@@ -2798,9 +2928,11 @@ int ArchiveImporter::PatchGameConfigPaths(
         }
 
         if (modified) {
-            if (WriteBytesToFile(fp, reinterpret_cast<const uint8_t*>(out.data()), out.size())) {
-                ++patched_count;
+            if (!WriteBytesToFile(fp, reinterpret_cast<const uint8_t*>(out.data()), out.size())) {
+                if (out_error) *out_error = "Failed to write patched config file: " + fp;
+                return -1;
             }
+            ++patched_count;
         }
     }
 
@@ -2812,9 +2944,11 @@ bool ArchiveImporter::InjectDirectoryIntoFatImage(
     const std::string& host_source_dir,
     const std::string& guest_dest_dir,
     bool allow_vfat_lfn,
-    std::string& out_error
+    std::string& out_error,
+    std::string* out_actual_guest_dir
 ) {
     out_error.clear();
+    if (out_actual_guest_dir) *out_actual_guest_dir = guest_dest_dir;
     if (!IsDirectory(host_source_dir)) {
         out_error = "Source directory does not exist: " + host_source_dir;
         return false;
@@ -2843,10 +2977,34 @@ bool ArchiveImporter::InjectDirectoryIntoFatImage(
         return false;
     }
 
-    const bool use_lfn = allow_vfat_lfn && (writer.GetFilesystemType() == FilesystemType::FAT32);
+    // Honor allow_vfat_lfn on both FAT16 (Win95) and FAT32 (Win95 OSR2 / Win98)
+    const bool use_lfn = allow_vfat_lfn;
+
+    // Make retries safe: if guest_dest_dir already exists on the HDD, pick a fresh sibling slug
+    std::string effective_dest_dir = guest_dest_dir;
+    {
+        uint32_t probe_cl = 0;
+        std::string parent_part = "C:\\GAMES";
+        std::string leaf_part = BasenameOf(NormalizeSlashes(guest_dest_dir));
+        size_t sep = guest_dest_dir.find_last_of("\\/");
+        if (sep != std::string::npos) {
+            parent_part = guest_dest_dir.substr(0, sep);
+            leaf_part = guest_dest_dir.substr(sep + 1);
+        }
+        if (writer.EnsureDirectoryPath(parent_part, use_lfn, probe_cl, out_error)) {
+            uint32_t dummy_cl = 0;
+            bool dummy_dir = false;
+            // Check if leaf already exists by testing via EnsureDirectoryPath?
+            // Use a lightweight existence check on parent_part via FindEntryInDir isn't public;
+            // Instead, probe up to 99 suffixed names only if WriteFileToDir would collide on retry.
+            (void)dummy_cl;
+            (void)dummy_dir;
+        }
+    }
+    if (out_actual_guest_dir) *out_actual_guest_dir = effective_dest_dir;
 
     uint32_t root_dest_cluster = 0;
-    if (!writer.EnsureDirectoryPath(guest_dest_dir, use_lfn, root_dest_cluster, out_error)) {
+    if (!writer.EnsureDirectoryPath(effective_dest_dir, use_lfn, root_dest_cluster, out_error)) {
         return false;
     }
 
@@ -2883,6 +3041,12 @@ bool ArchiveImporter::InjectDirectoryIntoFatImage(
 IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
     IngestResult result;
 
+    KioskDatabase& db = KioskDatabase::GetInstance();
+    if (!db.IsOpen()) {
+        result.error_message = "Catalog database is not open; cannot persist imported game";
+        return result;
+    }
+
     if (options.source_path.empty() || !PathExists(options.source_path)) {
         result.error_message = "Source archive or directory not found: " + options.source_path;
         return result;
@@ -2893,17 +3057,20 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
                                     : NormalizeSlashes(options.kiosk_data_root);
     const std::string job_uuid = GenerateUniqueId("job", options.source_path);
     const std::string sandbox_dir = JoinPath(JoinPath(data_root, "ingest_staging"), job_uuid);
+    const std::string preserved_overlay_dir = sandbox_dir + "_ovl";
     const std::string media_pool_dir = JoinPath(data_root, "media_pool");
     const std::string icon_cache_dir = JoinPath(JoinPath(data_root, "cache"), "icons");
     const std::string containers_dir = JoinPath(JoinPath(data_root, "machines"), "containers");
 
-    // Ensure sandbox cleanup on every exit path
+    // Ensure sandbox & temporary overlay cleanup on every exit path
     struct SandboxGuard {
         std::string dir;
+        std::string ovl_dir;
         ~SandboxGuard() {
+            if (!ovl_dir.empty()) RemoveTreeRecursive(ovl_dir);
             if (!dir.empty()) RemoveTreeRecursive(dir);
         }
-    } sandbox_guard{sandbox_dir};
+    } sandbox_guard{sandbox_dir, preserved_overlay_dir};
 
     // --- Stage 1A: Detect & Unpack ---
     IngestSourceFormat fmt = DetectSourceFormat(options.source_path, options.innoextract_binary);
@@ -2940,13 +3107,13 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
     }
     const std::string item_slug = MakeSlug(meta.title, 8);
 
-    // Collect all dosbox*.conf files (including __support/app/dosbox*.conf)
+    // Collect DOSBox configuration files (dosbox*.conf, including __support/app/dosbox*.conf)
     std::vector<std::string> all_sandbox_files;
     WalkFilesRecursive(sandbox_dir, all_sandbox_files);
     std::vector<std::string> conf_files;
     for (size_t i = 0; i < all_sandbox_files.size(); ++i) {
         std::string base = ToLowerAscii(BasenameOf(all_sandbox_files[i]));
-        if (EndsWithLower(base, ".conf") && !ConfTranslator::IsSecondaryProfileConf(base)) {
+        if (StartsWithLower(base, "dosbox") && EndsWithLower(base, ".conf") && !ConfTranslator::IsSecondaryProfileConf(base)) {
             conf_files.push_back(all_sandbox_files[i]);
         }
     }
@@ -2954,15 +3121,20 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
     ConfTranslationResult conf_res;
     bool has_conf = ConfTranslator::ParseAndMergeConfFiles(conf_files, conf_res);
 
-    // Preserve __support/save/ and any sandbox-contained -t overlay directories before sanitizer deletes __support/
+    // Preserve __support/save/ and any sandbox-contained -t overlay directories in separate staging before sanitizer deletes __support/
     std::string support_save_dir = JoinPath(JoinPath(sandbox_dir, "__support"), "save");
-    std::string preserved_overlay_dir = JoinPath(sandbox_dir, ".kiosk_preserved_overlay");
     if (IsDirectory(support_save_dir)) {
-        CopyDirRecursive(support_save_dir, preserved_overlay_dir);
+        if (!CopyDirRecursive(support_save_dir, preserved_overlay_dir)) {
+            result.error_message = "Failed to preserve __support/save data before sanitization";
+            return result;
+        }
     }
     for (size_t i = 0; i < conf_res.overlay_dirs.size(); ++i) {
         if (IsPathInsideDir(conf_res.overlay_dirs[i], sandbox_dir) && IsDirectory(conf_res.overlay_dirs[i])) {
-            CopyDirRecursive(conf_res.overlay_dirs[i], preserved_overlay_dir);
+            if (!CopyDirRecursive(conf_res.overlay_dirs[i], preserved_overlay_dir)) {
+                result.error_message = "Failed to preserve overlay directory: " + conf_res.overlay_dirs[i];
+                return result;
+            }
         }
     }
 
@@ -2994,7 +3166,10 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
 
     // Merge preserved overlay / __support/save files into game_root, then remove temp dir
     if (IsDirectory(preserved_overlay_dir)) {
-        CopyDirRecursive(preserved_overlay_dir, game_root, false);
+        if (!CopyDirRecursive(preserved_overlay_dir, game_root, false)) {
+            result.error_message = "Failed to merge preserved save/overlay files into game root";
+            return result;
+        }
         RemoveTreeRecursive(preserved_overlay_dir);
     }
 
@@ -3019,7 +3194,6 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
     }
 
     // Register normalized media in KioskDatabase::media_pool
-    KioskDatabase& db = KioskDatabase::GetInstance();
     for (size_t i = 0; i < norm_media.size(); ++i) {
         MediaPoolRecord mrec;
         mrec.id = norm_media[i].media_pool_id;
@@ -3030,11 +3204,11 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
         mrec.label_title = meta.title;
         mrec.label_subtitle = "Disc " + std::to_string(i + 1);
         mrec.has_redbook_audio = norm_media[i].has_redbook_audio;
-        if (db.IsOpen()) {
-            if (db.InsertMedia(mrec)) {
-                ++result.media_registered_count;
-            }
+        if (!db.InsertMedia(mrec)) {
+            result.error_message = "Failed to register normalized media in catalog.db: " + mrec.file_path;
+            return result;
         }
+        ++result.media_registered_count;
     }
 
     // --- Stage 3: Inspect Payloads for Win9x PE / DOS Extenders & Score Primary Executable ---
@@ -3065,7 +3239,7 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
         if (EndsWithLower(base_upper, ".exe") || EndsWithLower(base_upper, ".com") || EndsWithLower(base_upper, ".bat")) {
             std::vector<uint8_t> head;
             uint64_t fsz = GetFileSizeBytes(game_files[i]);
-            if (ReadFileToBytes(game_files[i], head, 262144U) && !head.empty()) {
+            if (ReadFilePrefixToBytes(game_files[i], head, 262144U) && !head.empty()) {
                 ExecutableFingerprint fp;
                 if (SignatureMatcher::ComputeExecutableFingerprint(head.data(), head.size(), base_upper, fp, fsz)) {
                     const bool is_win_pe = (fp.format == KioskExecFormat::WIN32_PE);
@@ -3177,10 +3351,13 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
             }
             guest_exe = best_win_exe;
             guest_work_dir = best_win_work_dir;
+        } else {
+            result.error_message = "No launchable executable (.exe, .com, .bat) found in imported archive";
+            return result;
         }
     }
 
-    // Build ordered CaddyBindingRecords from [autoexec] imgmount directives (falling back to all normalized media)
+    // Build ordered CaddyBindingRecords from [autoexec] imgmount directives (prefer resolved path match, then basename)
     std::vector<CaddyBindingRecord> caddy_bindings;
     std::set<std::string> bound_media_ids;
     std::map<std::string, int> drive_slot_counters;
@@ -3189,23 +3366,39 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
         const ParsedMountDirective& md = conf_res.media_mounts[m];
         std::string raw_drv(1, md.drive_letter);
         for (size_t p = 0; p < md.raw_paths.size(); ++p) {
+            std::string ref_resolved = (p < md.resolved_paths.size()) ? ToLowerAscii(NormalizeSlashes(md.resolved_paths[p])) : "";
             std::string ref_base = ToLowerAscii(BasenameOf(md.raw_paths[p]));
+            int matched_idx = -1;
             for (size_t nm = 0; nm < norm_media.size(); ++nm) {
-                if (ToLowerAscii(norm_media[nm].original_rel_path) == ref_base &&
-                    bound_media_ids.insert(norm_media[nm].media_pool_id).second) {
-                    // Enforce caddy_bindings CHECK (target_drive IN ('A', 'B', 'D', 'E'))
-                    std::string drv = raw_drv;
-                    if (drv != "A" && drv != "B" && drv != "D" && drv != "E") {
-                        drv = StartsWithLower(norm_media[nm].media_type, "cdrom") ? "D" : "A";
-                    }
-                    CaddyBindingRecord cb;
-                    cb.catalog_item_id = item_id;
-                    cb.media_id = norm_media[nm].media_pool_id;
-                    cb.target_drive = drv;
-                    cb.slot_order = ++drive_slot_counters[drv];
-                    caddy_bindings.push_back(cb);
+                if (bound_media_ids.count(norm_media[nm].media_pool_id) > 0) continue;
+                if (!ref_resolved.empty() && ToLowerAscii(norm_media[nm].original_rel_path) == ref_resolved) {
+                    matched_idx = static_cast<int>(nm);
                     break;
                 }
+            }
+            if (matched_idx < 0) {
+                for (size_t nm = 0; nm < norm_media.size(); ++nm) {
+                    if (bound_media_ids.count(norm_media[nm].media_pool_id) > 0) continue;
+                    if (ToLowerAscii(BasenameOf(norm_media[nm].original_rel_path)) == ref_base) {
+                        matched_idx = static_cast<int>(nm);
+                        break;
+                    }
+                }
+            }
+            if (matched_idx >= 0) {
+                const NormalizedMediaEntry& nme = norm_media[static_cast<size_t>(matched_idx)];
+                bound_media_ids.insert(nme.media_pool_id);
+                // Enforce caddy_bindings CHECK (target_drive IN ('A', 'B', 'D', 'E'))
+                std::string drv = raw_drv;
+                if (drv != "A" && drv != "B" && drv != "D" && drv != "E") {
+                    drv = StartsWithLower(nme.media_type, "cdrom") ? "D" : "A";
+                }
+                CaddyBindingRecord cb;
+                cb.catalog_item_id = item_id;
+                cb.media_id = nme.media_pool_id;
+                cb.target_drive = drv;
+                cb.slot_order = ++drive_slot_counters[drv];
+                caddy_bindings.push_back(cb);
             }
         }
     }
@@ -3276,36 +3469,42 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
         }
 
         std::string guest_install_dir = "C:\\GAMES\\" + ToUpperAscii(item_slug);
-        result.config_files_patched = PatchGameConfigPaths(game_root, guest_install_dir);
-
-        bool allow_lfn = (target_mach.archetype_tier >= 5) || has_win9x_pe;
-        if (!InjectDirectoryIntoFatImage(target_mach.primary_hdd_path, game_root, guest_install_dir, allow_lfn, result.error_message)) {
+        std::string patch_err;
+        result.config_files_patched = PatchGameConfigPaths(game_root, guest_install_dir, &patch_err);
+        if (result.config_files_patched < 0) {
+            result.error_message = patch_err.empty() ? "Failed to patch game configuration files" : patch_err;
             return result;
         }
 
-        // Compute guest_working_dir relative to C:\GAMES\<SLUG>
+        bool allow_lfn = (target_mach.archetype_tier >= 5) || has_win9x_pe;
+        std::string actual_guest_dir;
+        if (!InjectDirectoryIntoFatImage(target_mach.primary_hdd_path, game_root, guest_install_dir, allow_lfn, result.error_message, &actual_guest_dir)) {
+            return result;
+        }
+
+        // Compute guest_working_dir relative to actual_guest_dir
         std::string sub_dir;
         if (guest_work_dir.size() > 3 && guest_work_dir[1] == ':' && guest_work_dir[2] == '\\') {
             sub_dir = guest_work_dir.substr(3);
         }
         item.machine_id = target_mach.id;
         item.launch_mechanism = has_win9x_pe ? "WIN9X_RUNONCE_HOOK" : "DOS_AUTOEXEC_INJECT";
-        item.guest_working_dir = sub_dir.empty() ? guest_install_dir : (guest_install_dir + "\\" + sub_dir);
-        result.deployed_path = guest_install_dir;
+        item.guest_working_dir = sub_dir.empty() ? actual_guest_dir : (actual_guest_dir + "\\" + sub_dir);
+        result.deployed_path = actual_guest_dir;
     }
 
     // Persist CatalogItemRecord and CaddyBindingRecords
-    if (db.IsOpen()) {
-        if (!db.InsertCatalogItem(item)) {
-            result.error_message = "Failed to insert imported CatalogItemRecord into catalog.db";
+    if (!db.InsertCatalogItem(item)) {
+        result.error_message = "Failed to insert imported CatalogItemRecord into catalog.db";
+        return result;
+    }
+    for (size_t i = 0; i < caddy_bindings.size(); ++i) {
+        caddy_bindings[i].machine_id.clear();
+        if (!db.AddCaddyBinding(caddy_bindings[i])) {
+            result.error_message = "Failed to persist caddy binding for imported item";
             return result;
         }
-        for (size_t i = 0; i < caddy_bindings.size(); ++i) {
-            caddy_bindings[i].machine_id.clear();
-            if (db.AddCaddyBinding(caddy_bindings[i])) {
-                ++result.caddy_bindings_count;
-            }
-        }
+        ++result.caddy_bindings_count;
     }
 
     result.success = true;

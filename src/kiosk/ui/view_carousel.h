@@ -2,8 +2,12 @@
 #define DOSBOX_KIOSK_VIEW_CAROUSEL_H
 
 #include "../kiosk_types.h"
+#include "../ingest/archive_importer.h"
 #include "input_router.h"
+#include <atomic>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct ImDrawList;
@@ -52,6 +56,7 @@ public:
 
 private:
     ViewCarousel() = default;
+    ~ViewCarousel();
 
     void RenderCatalogCarousel(const std::string& item_type, int& selected_idx, float& scroll_offset);
     void DrawProceduralBoxArtCard(
@@ -116,7 +121,13 @@ private:
     int m_import_deploy_mode = 0; // 0 = Mode A (Appliance Container), 1 = Mode B (HDD Inject)
     int m_import_archetype_idx = 0; // 0 = Auto-Detect, 1..5 = XT_8088 .. PENTIUM_3DFX
     int m_import_target_machine_idx = 0;
+    std::string m_import_item_type = "GAME";
     std::string m_import_status_msg;
+    std::thread m_import_worker;
+    std::mutex m_import_mutex;
+    std::atomic<bool> m_import_in_progress{false};
+    bool m_import_result_ready = false;
+    IngestResult m_import_result;
 
     // In-Kiosk Dear ImGui file/folder picker state (no OS dialogs, stays fullscreen)
     struct FilePickerEntry {

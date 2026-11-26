@@ -108,7 +108,10 @@ public:
         const std::string& dest_audio_dir,
         std::string& out_rewritten_cue,
         bool& out_has_redbook_audio,
-        std::string& out_error
+        std::string& out_error,
+        const std::string& sandbox_root = "",
+        const std::string& dest_bin_dir = "",
+        std::vector<std::string>* out_copied_source_bins = nullptr
     );
     static bool NormalizeMediaInSandbox(
         const std::string& sandbox_dir,
@@ -121,14 +124,16 @@ public:
     // Stage 4B helpers: Mode B config path patching & userspace FAT16/FAT32 HDD injection
     static int PatchGameConfigPaths(
         const std::string& game_root_dir,
-        const std::string& guest_install_dir
+        const std::string& guest_install_dir,
+        std::string* out_error = nullptr
     );
     static bool InjectDirectoryIntoFatImage(
         const std::string& hdd_img_path,
         const std::string& host_source_dir,
         const std::string& guest_dest_dir,
         bool allow_vfat_lfn,
-        std::string& out_error
+        std::string& out_error,
+        std::string* out_actual_guest_dir = nullptr
     );
 
     // Utility helpers

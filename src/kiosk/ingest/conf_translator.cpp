@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -259,6 +261,7 @@ std::vector<std::string> ConfTranslator::TokenizeCommandLine(const std::string& 
     std::vector<std::string> tokens;
     std::string current;
     bool in_quotes = false;
+    bool has_token = false;
     char quote_char = 0;
 
     for (size_t i = 0; i < line.size(); ++i) {
@@ -272,18 +275,21 @@ std::vector<std::string> ConfTranslator::TokenizeCommandLine(const std::string& 
         } else {
             if (c == '"' || c == '\'') {
                 in_quotes = true;
+                has_token = true;
                 quote_char = c;
             } else if (c == ' ' || c == '\t') {
-                if (!current.empty()) {
+                if (has_token) {
                     tokens.push_back(current);
                     current.clear();
+                    has_token = false;
                 }
             } else {
                 current.push_back(c);
+                has_token = true;
             }
         }
     }
-    if (!current.empty()) {
+    if (has_token) {
         tokens.push_back(current);
     }
     return tokens;
@@ -369,8 +375,12 @@ int ConfTranslator::ParseCyclesValue(const std::string& raw_cycles) {
         if (!tok.empty() && std::isdigit(static_cast<unsigned char>(tok[0]))) {
             // Skip percentage tokens like "100%"
             if (tok.find('%') != std::string::npos) continue;
-            long val = std::strtol(tok.c_str(), nullptr, 10);
-            if (val > 0) return static_cast<int>(val);
+            errno = 0;
+            char* endp = nullptr;
+            long val = std::strtol(tok.c_str(), &endp, 10);
+            if (errno == 0 && endp && *endp == '\0' && val > 0 && val <= INT_MAX) {
+                return static_cast<int>(val);
+            }
         }
     }
     return 0;
@@ -381,12 +391,25 @@ bool ConfTranslator::ParseConfString(
     const std::string& conf_dir,
     ConfTranslationResult& in_out_result
 ) {
-    std::istringstream iss(content);
+    // Strip UTF-8 BOM if present so first [section] header parses cleanly
+    std::string clean_content = content;
+    if (clean_content.size() >= 3 &&
+        static_cast<unsigned char>(clean_content[0]) == 0xEF &&
+        static_cast<unsigned char>(clean_content[1]) == 0xBB &&
+        static_cast<unsigned char>(clean_content[2]) == 0xBF) {
+        clean_content.erase(0, 3);
+    }
+
+    std::istringstream iss(clean_content);
     std::string raw_line;
     std::string current_section;
     std::string current_guest_dir = in_out_result.guest_working_dir.empty()
                                         ? "C:\\"
                                         : in_out_result.guest_working_dir;
+    std::map<char, std::string> drive_cwds;
+    if (current_guest_dir.size() >= 2 && std::isalpha(static_cast<unsigned char>(current_guest_dir[0])) && current_guest_dir[1] == ':') {
+        drive_cwds[static_cast<char>(std::toupper(static_cast<unsigned char>(current_guest_dir[0])))] = current_guest_dir;
+    }
 
     while (std::getline(iss, raw_line)) {
         std::string line = Trim(raw_line);
@@ -427,10 +450,14 @@ bool ConfTranslator::ParseConfString(
                 cmd_lower = ToLowerAscii(tokens[0]);
             }
 
-            // Handle drive letter switch (e.g., "c:" or "d:")
+            // Handle drive letter switch (e.g., "c:" or "d:"), restoring saved per-drive CWD
             if (cmd_lower.size() == 2 && std::isalpha(static_cast<unsigned char>(cmd_lower[0])) && cmd_lower[1] == ':') {
+                if (current_guest_dir.size() >= 2 && current_guest_dir[1] == ':') {
+                    drive_cwds[static_cast<char>(std::toupper(static_cast<unsigned char>(current_guest_dir[0])))] = current_guest_dir;
+                }
                 char drv = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd_lower[0])));
-                current_guest_dir = std::string(1, drv) + ":\\";
+                auto it = drive_cwds.find(drv);
+                current_guest_dir = (it != drive_cwds.end()) ? it->second : (std::string(1, drv) + ":\\");
                 continue;
             }
 
@@ -442,12 +469,18 @@ bool ConfTranslator::ParseConfString(
                         ++arg_idx;
                     }
                     current_guest_dir = UpdateGuestWorkingDir(current_guest_dir, tokens[arg_idx]);
+                    if (current_guest_dir.size() >= 2 && current_guest_dir[1] == ':') {
+                        drive_cwds[static_cast<char>(std::toupper(static_cast<unsigned char>(current_guest_dir[0])))] = current_guest_dir;
+                    }
                 }
                 continue;
             }
             if (StartsWithLower(cmd_lower, "cd\\") || StartsWithLower(cmd_lower, "cd/") || cmd_lower == "cd..") {
                 std::string arg = tokens[0].substr(2);
                 current_guest_dir = UpdateGuestWorkingDir(current_guest_dir, arg);
+                if (current_guest_dir.size() >= 2 && current_guest_dir[1] == ':') {
+                    drive_cwds[static_cast<char>(std::toupper(static_cast<unsigned char>(current_guest_dir[0])))] = current_guest_dir;
+                }
                 continue;
             }
 
@@ -492,7 +525,11 @@ bool ConfTranslator::ParseConfString(
             std::string effective_dir = current_guest_dir;
             std::string effective_exe = exec_tok;
             if (slash_pos != std::string::npos) {
-                std::string dir_part = exec_tok.substr(0, slash_pos);
+                std::string dir_part = (slash_pos == 0) ? "\\" : exec_tok.substr(0, slash_pos);
+                // Preserve root backslash for drive-rooted paths like "C:\GAME.EXE"
+                if (slash_pos == 2 && exec_tok.size() >= 3 && exec_tok[1] == ':') {
+                    dir_part = exec_tok.substr(0, 3);
+                }
                 effective_exe = exec_tok.substr(slash_pos + 1);
                 if (!dir_part.empty()) {
                     effective_dir = UpdateGuestWorkingDir(current_guest_dir, dir_part);
@@ -506,7 +543,7 @@ bool ConfTranslator::ParseConfString(
                     break;
                 }
                 if (!args.empty()) args.push_back(' ');
-                if (tokens[i].find(' ') != std::string::npos) {
+                if (tokens[i].empty() || tokens[i].find(' ') != std::string::npos) {
                     args += "\"" + tokens[i] + "\"";
                 } else {
                     args += tokens[i];
@@ -597,8 +634,16 @@ std::string ConfTranslator::ScoreArchetype(
     out_override_delta.clear();
 
     const std::string machine_val = ToLowerAscii(GetIniValue(parsed.merged_sections, "dosbox", "machine"));
-    const std::string memsize_val = GetIniValue(parsed.merged_sections, "dosbox", "memsize");
-    const int memsize_mb = memsize_val.empty() ? 0 : std::atoi(memsize_val.c_str());
+    const std::string memsize_val = Trim(GetIniValue(parsed.merged_sections, "dosbox", "memsize"));
+    int memsize_mb = 0;
+    if (!memsize_val.empty() && std::isdigit(static_cast<unsigned char>(memsize_val[0]))) {
+        errno = 0;
+        char* endp = nullptr;
+        long parsed_mem = std::strtol(memsize_val.c_str(), &endp, 10);
+        if (errno == 0 && endp && *endp == '\0' && parsed_mem > 0 && parsed_mem <= INT_MAX) {
+            memsize_mb = static_cast<int>(parsed_mem);
+        }
+    }
 
     const std::string cycles_val = GetIniValue(parsed.merged_sections, "cpu", "cycles");
     const int cycles_num = ParseCyclesValue(cycles_val);
@@ -626,7 +671,7 @@ std::string ConfTranslator::ScoreArchetype(
     // Tier 4: ARCH_486DX2
     if (cycles_num == -1 || cycles_num > 15000 || has_dos_extender_or_vbe ||
         IsExplicitTrueIni(gus_val) || cputype_val.find("486") != std::string::npos) {
-        if (cycles_num > 40000) {
+        if (cycles_num == -1 || cycles_num > 40000) {
             out_override_delta = "[cpu]\ncycles = max\n";
         }
         return KioskArchetypes::DX2_486;
