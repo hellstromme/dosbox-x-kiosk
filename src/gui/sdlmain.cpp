@@ -8682,11 +8682,14 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
     if (control->opt_kiosk_mode) {
         fprintf(stderr, "KIOSK: DOSBox-X Kiosk Edition flag detected.\n");
         LOG_MSG("KIOSK: DOSBox-X Kiosk Edition flag detected.");
-        saved_kiosk_db = control->opt_kiosk_db;
+        const std::string effective_kiosk_db = control->opt_kiosk_db.empty()
+            ? KioskDatabase::GetDefaultDatabasePath()
+            : control->opt_kiosk_db;
+        saved_kiosk_db = effective_kiosk_db;
         saved_kiosk_conf = control->opt_kiosk_conf;
         KioskManager::GetInstance().SetKioskModeActive(true);
         KioskManager::GetInstance().SetSkipCountdown(control->opt_kiosk_skip_countdown);
-        if (KioskManager::GetInstance().Initialize(control->opt_kiosk_db, control->opt_kiosk_conf)) {
+        if (KioskManager::GetInstance().Initialize(effective_kiosk_db, control->opt_kiosk_conf)) {
             fprintf(stderr, "KIOSK: Subsystems initialized successfully (SQLite %s, ImGui %s).\n",
                     KioskDatabase::GetInstance().GetSQLiteVersion().c_str(),
                     KioskUI::GetInstance().GetImGuiVersion().c_str());

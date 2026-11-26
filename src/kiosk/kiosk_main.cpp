@@ -80,8 +80,11 @@ bool KioskManager::Initialize(const std::string& db_path, const std::string& bas
 
     // 1. Initialize SQLite Catalog Database (preserve existing open DB if db_path is empty during tests)
     if (!db_path.empty() || !KioskDatabase::GetInstance().IsOpen()) {
-        if (!KioskDatabase::GetInstance().Open(db_path)) {
-            LOG_MSG("KIOSK: Warning: Failed to open catalog DB '%s', falling back to in-memory database", db_path.c_str());
+        const std::string resolved_db = db_path.empty()
+                                            ? KioskDatabase::GetDefaultDatabasePath()
+                                            : db_path;
+        if (!KioskDatabase::GetInstance().Open(resolved_db)) {
+            LOG_MSG("KIOSK: Warning: Failed to open catalog DB '%s', falling back to in-memory database", resolved_db.c_str());
             if (!KioskDatabase::GetInstance().Open(":memory:")) {
                 LOG_MSG("KIOSK: Error: Failed to open in-memory fallback catalog database");
             }

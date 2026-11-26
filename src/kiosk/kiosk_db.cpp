@@ -7,9 +7,40 @@
 #include "sqlite3.h"
 #include "logging.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
+#if defined(_WIN32)
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
 namespace {
+
+void EnsureDirectoryRecursive(const std::string& dir_path) {
+    if (dir_path.empty()) return;
+    std::string cur;
+    for (size_t i = 0; i < dir_path.size(); ++i) {
+        char c = dir_path[i];
+        cur.push_back(c);
+        if ((c == '\\' || c == '/') && cur.size() > 1) {
+            if (cur.size() == 3 && cur[1] == ':') continue;
+#if defined(_WIN32)
+            _mkdir(cur.c_str());
+#else
+            mkdir(cur.c_str(), 0755);
+#endif
+        }
+    }
+#if defined(_WIN32)
+    _mkdir(dir_path.c_str());
+#else
+    mkdir(dir_path.c_str(), 0755);
+#endif
+}
 
 // Helper to bind nullable std::string
 void BindTextOrNull(sqlite3_stmt* stmt, int index, const std::string& val) {
@@ -54,6 +85,46 @@ bool KioskDatabase::IsOpen() const {
     return m_db != nullptr;
 }
 
+std::string KioskDatabase::GetActiveDatabasePath() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_active_path;
+}
+
+std::string KioskDatabase::GetDefaultDatabasePath() {
+#if defined(_WIN32)
+    const char* local_app = std::getenv("LOCALAPPDATA");
+    if (local_app && local_app[0] != '\0') {
+        std::string dir = std::string(local_app) + "\\DOSBox-Kiosk";
+        EnsureDirectoryRecursive(dir);
+        return dir + "\\catalog.db";
+    }
+    const char* app_data = std::getenv("APPDATA");
+    if (app_data && app_data[0] != '\0') {
+        std::string dir = std::string(app_data) + "\\DOSBox-Kiosk";
+        EnsureDirectoryRecursive(dir);
+        return dir + "\\catalog.db";
+    }
+    return ".\\dosbox-kiosk-catalog.db";
+#else
+    if (access("/var/lib/dosbox-kiosk", W_OK) == 0) {
+        return "/var/lib/dosbox-kiosk/catalog.db";
+    }
+    const char* xdg_data = std::getenv("XDG_DATA_HOME");
+    if (xdg_data && xdg_data[0] != '\0') {
+        std::string dir = std::string(xdg_data) + "/dosbox-kiosk";
+        EnsureDirectoryRecursive(dir);
+        return dir + "/catalog.db";
+    }
+    const char* home = std::getenv("HOME");
+    if (home && home[0] != '\0') {
+        std::string dir = std::string(home) + "/.local/share/dosbox-kiosk";
+        EnsureDirectoryRecursive(dir);
+        return dir + "/catalog.db";
+    }
+    return "./dosbox-kiosk-catalog.db";
+#endif
+}
+
 bool KioskDatabase::Open(const std::string& db_path) {
     std::lock_guard<std::mutex> lock(m_mutex);
     return OpenInternal(db_path);
@@ -85,6 +156,7 @@ bool KioskDatabase::OpenInternal(const std::string& db_path) {
     }
 
     LOG_MSG("KIOSK: Opened SQLite database '%s' (SQLite v%s)", path.c_str(), sqlite3_libversion());
+    m_active_path = path;
 
     if (!InitializeSchema()) {
         LOG_MSG("KIOSK: Failed to initialize schema in '%s'", path.c_str());
@@ -110,6 +182,7 @@ void KioskDatabase::CloseInternal() {
         sqlite3_close_v2(m_db);
         m_db = nullptr;
     }
+    m_active_path.clear();
 }
 
 std::string KioskDatabase::GetSQLiteVersion() const {

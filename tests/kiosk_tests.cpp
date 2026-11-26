@@ -3299,4 +3299,40 @@ TEST(KioskCrawlerTest, ScanAndCatalogMachineDeduplicatesOnRescan) {
     KioskDatabase::GetInstance().Close();
 }
 
+TEST(KioskDatabasePersistenceTest, DefaultPathAndMachinePersistsAcrossReopen) {
+    const std::string def_path = KioskDatabase::GetDefaultDatabasePath();
+    EXPECT_FALSE(def_path.empty());
+    EXPECT_NE(def_path, ":memory:");
+    EXPECT_NE(def_path.find("catalog.db"), std::string::npos);
+
+    const std::string temp_db = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".persist_test.db";
+    std::remove(temp_db.c_str());
+    std::remove((temp_db + "-wal").c_str());
+    std::remove((temp_db + "-shm").c_str());
+
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(temp_db));
+    EXPECT_EQ(KioskDatabase::GetInstance().GetActiveDatabasePath(), temp_db);
+
+    MachineRecord mach;
+    mach.id = "mach-persist-01";
+    mach.display_name = "Persistent 386DX";
+    mach.archetype_id = KioskArchetypes::DX_386;
+    mach.archetype_tier = 3;
+    mach.boot_mode = "INTEGRATED_DOS";
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMachine(mach));
+    KioskDatabase::GetInstance().Close();
+
+    // Reopen from disk and confirm the machine survived restart
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(temp_db));
+    MachineRecord loaded;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMachine("mach-persist-01", loaded));
+    EXPECT_EQ(loaded.display_name, "Persistent 386DX");
+    EXPECT_EQ(loaded.archetype_id, KioskArchetypes::DX_386);
+    KioskDatabase::GetInstance().Close();
+
+    std::remove(temp_db.c_str());
+    std::remove((temp_db + "-wal").c_str());
+    std::remove((temp_db + "-shm").c_str());
+}
+
 #endif // defined(C_DEBUG) && defined(C_KIOSK)
