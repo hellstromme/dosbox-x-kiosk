@@ -12,6 +12,7 @@
 #include "stb_image_write.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -27,10 +28,15 @@
 #endif
 #include <windows.h>
 #include <direct.h>
+#include <fcntl.h>
+#include <io.h>
+#include <process.h>
 #include <sys/stat.h>
 #else
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -422,9 +428,39 @@ bool DecodeIconPayloadToRgba(
 bool WriteRawBytesToFile(const std::string& path, const uint8_t* data, size_t size) {
     if (path.empty() || !data || size == 0) return false;
     EnsureParentDirsExist(path);
-    const std::string tmp_path = path + ".tmp";
-    std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
-    if (!f) return false;
+
+    static std::atomic<uint64_t> s_tmp_seq(0);
+    const uint64_t seq = s_tmp_seq.fetch_add(1) + 1;
+#if defined(_WIN32)
+    const unsigned long pid = static_cast<unsigned long>(_getpid());
+#else
+    const unsigned long pid = static_cast<unsigned long>(getpid());
+#endif
+    char suffix[64];
+    snprintf(suffix, sizeof(suffix), ".tmp.%lu.%llu", pid, static_cast<unsigned long long>(seq));
+    const std::string tmp_path = path + suffix;
+
+    std::FILE* f = nullptr;
+#if defined(_WIN32)
+    int fd = _open(tmp_path.c_str(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE);
+    if (fd < 0) return false;
+    f = _fdopen(fd, "wb");
+    if (!f) {
+        _close(fd);
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+#else
+    int fd = ::open(tmp_path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd < 0) return false;
+    f = fdopen(fd, "wb");
+    if (!f) {
+        ::close(fd);
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+#endif
+
     const size_t written = std::fwrite(data, 1, size, f);
     const bool closed_ok = (std::fclose(f) == 0);
     if (written != size || !closed_ok) {
@@ -2443,7 +2479,11 @@ bool ImageCrawler::ScanAndCatalogMachine(
         return (norm_dir.back() == '\\') ? (norm_dir + exec) : (norm_dir + "\\" + exec);
     };
 
-    std::vector<CatalogItemRecord> existing = db.GetItemsForMachine(machine_id);
+    std::vector<CatalogItemRecord> existing;
+    if (!db.GetItemsForMachine(machine_id, existing)) {
+        out_summary.error_message = "Failed to query existing catalog items for machine";
+        return false;
+    }
     std::vector<std::pair<std::string, size_t>> existing_index;
     std::vector<std::pair<uint32_t, size_t>> existing_clusters;
     existing_index.reserve(existing.size());

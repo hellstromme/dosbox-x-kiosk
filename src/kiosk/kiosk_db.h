@@ -39,6 +39,7 @@ public:
     std::vector<CatalogItemRecord> GetItemsByType(const std::string& item_type);
     bool GetItem(const std::string& id, CatalogItemRecord& out_item);
     std::vector<CatalogItemRecord> GetItemsForMachine(const std::string& machine_id);
+    bool GetItemsForMachine(const std::string& machine_id, std::vector<CatalogItemRecord>& out_items);
     bool InsertCatalogItem(const CatalogItemRecord& item);
     bool UpdateCatalogItem(const CatalogItemRecord& item);
     bool DeleteCatalogItem(const std::string& id);

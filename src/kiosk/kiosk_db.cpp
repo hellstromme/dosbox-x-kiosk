@@ -781,10 +781,10 @@ bool KioskDatabase::GetItem(const std::string& id, CatalogItemRecord& out_item) 
     return found;
 }
 
-std::vector<CatalogItemRecord> KioskDatabase::GetItemsForMachine(const std::string& machine_id) {
+bool KioskDatabase::GetItemsForMachine(const std::string& machine_id, std::vector<CatalogItemRecord>& out_items) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    std::vector<CatalogItemRecord> list;
-    if (!m_db || machine_id.empty()) return list;
+    out_items.clear();
+    if (!m_db || machine_id.empty()) return false;
 
     const char* sql = "SELECT id, machine_id, item_type, title, developer, release_year, "
                       "source_origin, launch_mechanism, host_container_dir, guest_working_dir, "
@@ -792,10 +792,11 @@ std::vector<CatalogItemRecord> KioskDatabase::GetItemsForMachine(const std::stri
                       "screenshot_cache_path, executable_crc32, play_count, last_launched_at, "
                       "is_favorite FROM catalog_items WHERE machine_id = ? ORDER BY title ASC;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return list;
+    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
 
     sqlite3_bind_text(stmt, 1, machine_id.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         CatalogItemRecord it;
         it.id = ColumnTextSafe(stmt, 0);
         it.machine_id = ColumnTextSafe(stmt, 1);
@@ -816,9 +817,19 @@ std::vector<CatalogItemRecord> KioskDatabase::GetItemsForMachine(const std::stri
         it.play_count = sqlite3_column_int(stmt, 16);
         it.last_launched_at = ColumnTextSafe(stmt, 17);
         it.is_favorite = sqlite3_column_int(stmt, 18) != 0;
-        list.push_back(it);
+        out_items.push_back(it);
     }
     sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        out_items.clear();
+        return false;
+    }
+    return true;
+}
+
+std::vector<CatalogItemRecord> KioskDatabase::GetItemsForMachine(const std::string& machine_id) {
+    std::vector<CatalogItemRecord> list;
+    GetItemsForMachine(machine_id, list);
     return list;
 }
 
