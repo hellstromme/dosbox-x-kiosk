@@ -10,6 +10,7 @@
 #include "../machine/archetypes.h"
 #include "../ingest/image_crawler.h"
 #include "../ingest/archive_importer.h"
+#include "../../libs/tinyfiledialogs/tinyfiledialogs.h"
 #include "logging.h"
 #include "imgui.h"
 
@@ -1339,8 +1340,8 @@ void ViewCarousel::RenderImportArchiveModal() {
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     if (vp) {
-        const float mw = (std::min)(540.0f, (std::max)(340.0f, vp->WorkSize.x - 24.0f));
-        const float mh = (std::min)(330.0f, (std::max)(260.0f, vp->WorkSize.y - 24.0f));
+        const float mw = (std::min)(560.0f, (std::max)(340.0f, vp->WorkSize.x - 24.0f));
+        const float mh = (std::min)(370.0f, (std::max)(280.0f, vp->WorkSize.y - 24.0f));
         ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(mw, mh), ImGuiCond_Always);
     }
@@ -1362,6 +1363,32 @@ void ViewCarousel::RenderImportArchiveModal() {
         ImGui::Text("Archive / Folder Path:");
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint("##ImportSourcePath", "e.g. setup_game.exe or steam_game.zip", m_import_path_buf, sizeof(m_import_path_buf));
+        if (ImGui::Button("Browse File...##ImportBrowseFile", ImVec2(130.0f, 26.0f))) {
+            static const char* kImportFilters[2] = { "*.exe", "*.zip" };
+            const char* picked = tinyfd_openFileDialog(
+                "Select GOG Installer or Steam Archive",
+                "",
+                2,
+                kImportFilters,
+                "GOG Installers & Steam Archives (*.exe, *.zip)",
+                0
+            );
+            if (picked && picked[0] != '\0') {
+                std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", picked);
+                m_import_status_msg.clear();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Browse Folder...##ImportBrowseFolder", ImVec2(140.0f, 26.0f))) {
+            const char* picked_dir = tinyfd_selectFolderDialog(
+                "Select Unpacked Game Folder",
+                ""
+            );
+            if (picked_dir && picked_dir[0] != '\0') {
+                std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", picked_dir);
+                m_import_status_msg.clear();
+            }
+        }
         ImGui::Spacing();
 
         ImGui::Text("Deployment Mode:");

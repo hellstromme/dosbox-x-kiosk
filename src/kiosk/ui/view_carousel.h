@@ -109,7 +109,7 @@ private:
 
     // GOG / Steam archive import modal state
     bool m_show_import_modal = false;
-    char m_import_path_buf[512] = {0};
+    char m_import_path_buf[1024] = {0};
     int m_import_deploy_mode = 0; // 0 = Mode A (Appliance Container), 1 = Mode B (HDD Inject)
     int m_import_target_machine_idx = 0;
     std::string m_import_status_msg;
