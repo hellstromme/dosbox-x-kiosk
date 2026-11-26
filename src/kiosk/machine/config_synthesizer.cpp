@@ -40,7 +40,12 @@ std::string ConfigSynthesizer::GetDefaultBaseConfig() const {
         "aspect              = true\n"
         "char9               = true\n"
         "scaler              = none\n"
-        "glshader            = crt-aperture.glsl\n\n";
+        "glshader            = crt-aperture.glsl\n"
+        "\n"
+        "[dos]\n"
+        "automount           = false\n"
+        "automountall        = false\n"
+        "mountwarning        = false\n\n";
 }
 
 std::string ConfigSynthesizer::SynthesizeAutoexec(

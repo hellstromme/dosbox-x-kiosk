@@ -3112,6 +3112,19 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
                         }
                         // Mild preference for larger main game binaries over tiny stubs
                         if (fsz >= 32768ULL) score += 20;
+                        // Penalize .BAT scripts that hardcode drive switches (e.g. "d:\n cd \games\...")
+                        if (fp.format == KioskExecFormat::BATCH_SCRIPT) {
+                            std::string bat_text(reinterpret_cast<const char*>(head.data()), head.size());
+                            std::istringstream bss(bat_text);
+                            std::string bline;
+                            while (std::getline(bss, bline)) {
+                                std::string t = Trim(bline);
+                                if (t.size() == 2 && std::isalpha(static_cast<unsigned char>(t[0])) && t[1] == ':') {
+                                    score -= 120;
+                                    break;
+                                }
+                            }
+                        }
 
                         if (is_dos_bin) {
                             if (score > best_dos_score) {
