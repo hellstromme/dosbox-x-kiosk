@@ -417,7 +417,11 @@ bool KioskDatabase::UpdateConfig(const KioskConfigRecord& config) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) {
+        KioskUI::GetInstance().InvalidateCatalogCache();
+        KioskUI::GetInstance().InvalidateSettingsDraft();
+        return true;
+    }
     return false;
 }
 

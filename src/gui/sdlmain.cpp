@@ -11157,11 +11157,11 @@ void Kiosk_ApplyPreBootFullscreen(bool enable) {
     if (sdl.desktop.prevent_fullscreen || sdl.window == NULL) {
         return;
     }
-    sdl.desktop.fullscreen = enable;
     if (SDL_SetWindowFullscreen(sdl.window, enable ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) != 0) {
         LOG_MSG("KIOSK: SDL_SetWindowFullscreen(%d) failed: %s", enable ? 1 : 0, SDL_GetError());
         return;
     }
+    sdl.desktop.fullscreen = enable;
     if (sdl.mouse.locked) {
         GFX_CaptureMouse();
     }

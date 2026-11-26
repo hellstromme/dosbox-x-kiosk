@@ -59,6 +59,7 @@ public:
 
     // Zero-per-frame-SQLite catalog cache
     void InvalidateCatalogCache();
+    void InvalidateSettingsDraft();
     void EnsureCatalogCacheLoaded();
     const KioskConfigRecord& GetCachedConfig() const { return m_cached_config; }
     const std::vector<CatalogItemRecord>& GetCachedItems() const { return m_cached_items; }

@@ -813,7 +813,6 @@ void ViewCarousel::RenderMachinesTab() {
                 if (ImGui::Button("Scan Software", ImVec2(135.0f, 34.0f))) {
                     ImageCrawler::CrawlSummary summary;
                     if (ImageCrawler::ScanAndCatalogMachine(mach.id, "", summary)) {
-                        ui.InvalidateCatalogCache();
                         char toast_buf[192];
                         if (summary.newly_inserted > 0) {
                             std::snprintf(toast_buf, sizeof(toast_buf),
@@ -834,6 +833,14 @@ void ViewCarousel::RenderMachinesTab() {
                                           "Scanned '%s': no new software found",
                                           mach.display_name.c_str());
                         }
+                        ui.ShowToast(toast_buf, 4.0f);
+                    } else if (summary.newly_inserted > 0 && summary.failed_inserts > 0) {
+                        char toast_buf[192];
+                        std::snprintf(toast_buf, sizeof(toast_buf),
+                                      "Scanned '%s': +%d added, %d failed to save",
+                                      mach.display_name.c_str(),
+                                      summary.newly_inserted,
+                                      summary.failed_inserts);
                         ui.ShowToast(toast_buf, 4.0f);
                     } else {
                         ui.ShowToast("Scan failed: " + summary.error_message, 4.0f);
@@ -1049,7 +1056,6 @@ void ViewCarousel::RenderContextActionsModal() {
             if (ImGui::Button("Scan Disk for Software", ImVec2(-1.0f, 32.0f))) {
                 ImageCrawler::CrawlSummary summary;
                 if (ImageCrawler::ScanAndCatalogMachine(m_context_modal_target_id, "", summary)) {
-                    ui.InvalidateCatalogCache();
                     char toast_buf[192];
                     if (summary.newly_inserted > 0) {
                         std::snprintf(toast_buf, sizeof(toast_buf),
@@ -1065,6 +1071,14 @@ void ViewCarousel::RenderContextActionsModal() {
                                       m_context_modal_target_name.c_str(),
                                       summary.skipped_duplicates);
                     }
+                    ui.ShowToast(toast_buf, 4.0f);
+                } else if (summary.newly_inserted > 0 && summary.failed_inserts > 0) {
+                    char toast_buf[192];
+                    std::snprintf(toast_buf, sizeof(toast_buf),
+                                  "Scanned '%s': +%d added, %d failed to save",
+                                  m_context_modal_target_name.c_str(),
+                                  summary.newly_inserted,
+                                  summary.failed_inserts);
                     ui.ShowToast(toast_buf, 4.0f);
                 } else {
                     ui.ShowToast("Scan failed: " + summary.error_message, 4.0f);

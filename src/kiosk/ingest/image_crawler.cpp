@@ -420,9 +420,13 @@ bool WriteRawBytesToFile(const std::string& path, const uint8_t* data, size_t si
     EnsureParentDirsExist(path);
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) return false;
-    size_t written = std::fwrite(data, 1, size, f);
-    std::fclose(f);
-    return written == size;
+    const size_t written = std::fwrite(data, 1, size, f);
+    const bool closed_ok = (std::fclose(f) == 0);
+    if (written != size || !closed_ok) {
+        std::remove(path.c_str());
+        return false;
+    }
+    return true;
 }
 
 struct SelectedIconVariant {
@@ -941,11 +945,12 @@ bool FatReadOnlyVfs::OpenFromImageDisk(imageDisk* non_owning_disk) {
 }
 
 bool FatReadOnlyVfs::ReadSector(uint32_t abs_lba, uint8_t out_sector[512]) const {
-    if (!m_disk) return false;
+    if (!m_disk || m_disk->getSectSize() != 512) return false;
     return m_disk->Read_AbsoluteSector(abs_lba, out_sector) == Int13Status::NoError;
 }
 
 bool FatReadOnlyVfs::MountPartition() {
+    if (!m_disk || m_disk->getSectSize() != 512) return false;
     uint8_t sec0[512];
     if (!ReadSector(0, sec0)) return false;
 
@@ -1019,12 +1024,18 @@ bool FatReadOnlyVfs::ParseBpb(uint32_t part_lba) {
 
     FilesystemType fs = FilesystemType::FAT16;
     uint32_t root_clus = 0;
+    uint32_t active_fat = 0;
     if (clus_cnt < 4085u) {
         fs = FilesystemType::FAT12;
     } else if (clus_cnt < 65525u) {
         fs = FilesystemType::FAT16;
     } else {
         fs = FilesystemType::FAT32;
+        uint16_t ext_flags = ReadLe16(vbr + 40);
+        if (ext_flags & 0x0080u) {
+            active_fat = static_cast<uint32_t>(ext_flags & 0x000Fu);
+            if (active_fat >= num_fats) return false;
+        }
         root_clus = ReadLe32(vbr + 44) & 0x0FFFFFFFu;
         if (root_clus < 2 || (root_clus - 2u) >= clus_cnt) return false;
     }
@@ -1042,6 +1053,7 @@ bool FatReadOnlyVfs::ParseBpb(uint32_t part_lba) {
     m_cluster_count = clus_cnt;
     m_fs_type = fs;
     m_root_cluster = root_clus;
+    m_active_fat_index = active_fat;
     return true;
 }
 
@@ -1061,7 +1073,7 @@ uint32_t FatReadOnlyVfs::GetNextCluster(uint32_t cluster) const {
         return 0x0FFFFFFFu;
     }
 
-    const uint32_t fat_lba = m_part_lba + m_reserved_sectors;
+    const uint32_t fat_lba = m_part_lba + m_reserved_sectors + (m_active_fat_index * m_fat_size_sectors);
     uint8_t sec[512];
 
     if (m_fs_type == FilesystemType::FAT12) {
@@ -1329,7 +1341,7 @@ bool FatReadOnlyVfs::ReadFile(
         cur_cluster = GetNextCluster(cur_cluster);
     }
 
-    return !out_data.empty();
+    return out_data.size() == target_bytes;
 }
 
 // ============================================================================
@@ -1517,17 +1529,22 @@ bool ImageCrawler::ParseWin31GrpBuffer(
     std::vector<Win31GrpItem>& out_items
 ) {
     out_items.clear();
-    if (!data || size < 32) return false;
+    if (!data || size < 34) return false;
     if (std::memcmp(data, "PMCC", 4) != 0) return false;
 
-    uint16_t p_group_name = ReadLe16(data + 20);
-    uint16_t c_items = ReadLe16(data + 30);
+    // Native Windows 3.1 GROUPHEADER layout (34 bytes before rgiItems[]):
+    // +0: cIdentifier[4], +4: wCheckSum(2), +6: cbGroup(2), +8: nCmdShow(2),
+    // +10: rcNormal[4](8), +18: ptMin[2](4), +22: pName(2), +24: wLogPixelsX(2),
+    // +26: wLogPixelsY(2), +28: bBitsPerPixel(1), +29: bPlanes(1),
+    // +30: wReserved(2), +32: cItems(2), +34: rgiItems[cItems]
+    uint16_t p_group_name = ReadLe16(data + 22);
+    uint16_t c_items = ReadLe16(data + 32);
     std::string group_title = ReadNullTermAscii(data, size, p_group_name);
 
-    if (32U + static_cast<size_t>(c_items) * 2U > size) return false;
+    if (static_cast<size_t>(c_items) * 2U > (size - 34U)) return false;
 
     for (uint16_t i = 0; i < c_items; ++i) {
-        uint16_t item_off = ReadLe16(data + 32U + static_cast<size_t>(i) * 2U);
+        uint16_t item_off = ReadLe16(data + 34U + static_cast<size_t>(i) * 2U);
         if (item_off == 0) continue;
         if (static_cast<size_t>(item_off) + 24U > size) continue;
 
@@ -1774,29 +1791,98 @@ std::string ImageCrawler::GetDefaultIconCacheDir() {
 #endif
 }
 
+std::string ResolveRelativeGuestPath(const std::string& base_dir, const std::string& raw_target) {
+    std::string t = TrimAscii(raw_target);
+    for (size_t i = 0; i < t.size(); ++i) {
+        if (t[i] == '/') t[i] = '\\';
+    }
+    if (t.empty()) return "";
+
+    // Absolute path with drive letter or leading backslash
+    if ((t.size() >= 2 && t[1] == ':') || t[0] == '\\') {
+        return (t[0] == '\\') ? (std::string("C:") + t) : t;
+    }
+
+    // Relative path: split base_dir + raw_target and normalize '.' / '..'
+    std::string combined = NormalizeGuestDir(base_dir);
+    if (combined.back() != '\\') combined.push_back('\\');
+    combined += t;
+
+    std::string drive_prefix = "C:";
+    std::string rest = combined;
+    if (combined.size() >= 2 && combined[1] == ':') {
+        drive_prefix = combined.substr(0, 2);
+        rest = combined.substr(2);
+    }
+
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos < rest.size()) {
+        while (pos < rest.size() && rest[pos] == '\\') ++pos;
+        if (pos >= rest.size()) break;
+        size_t next = rest.find('\\', pos);
+        std::string seg = (next == std::string::npos) ? rest.substr(pos) : rest.substr(pos, next - pos);
+        pos = (next == std::string::npos) ? rest.size() : (next + 1);
+        if (seg == "." || seg.empty()) continue;
+        if (seg == "..") {
+            if (!parts.empty()) parts.pop_back();
+        } else {
+            parts.push_back(seg);
+        }
+    }
+
+    std::string out = drive_prefix;
+    if (parts.empty()) {
+        out.push_back('\\');
+    } else {
+        for (size_t i = 0; i < parts.size(); ++i) {
+            out.push_back('\\');
+            out += parts[i];
+        }
+    }
+    return out;
+}
+
 std::vector<ImageCrawler::CrawlResult> ImageCrawler::ScanDiskImage(
     const std::string& hdd_img_path,
-    const std::string& icon_cache_dir
+    const std::string& icon_cache_dir,
+    const std::string& cache_namespace
 ) {
     FatReadOnlyVfs vfs;
     if (!vfs.OpenImageFile(hdd_img_path)) {
         return std::vector<CrawlResult>();
     }
-    return ScanMountedVfs(vfs, icon_cache_dir);
+    return ScanMountedVfs(vfs, icon_cache_dir, cache_namespace, nullptr);
 }
 
 std::vector<ImageCrawler::CrawlResult> ImageCrawler::ScanMountedVfs(
     const FatReadOnlyVfs& vfs,
-    const std::string& icon_cache_dir
+    const std::string& icon_cache_dir,
+    const std::string& cache_namespace,
+    std::string* out_error
 ) {
     std::vector<CrawlResult> results;
-    if (!vfs.IsOpen()) return results;
+    if (out_error) out_error->clear();
+    if (!vfs.IsOpen()) {
+        if (out_error) *out_error = "FAT filesystem is not mounted";
+        return results;
+    }
 
-    std::set<std::string> seen_targets; // key: UPPER(working_dir + "\" + executable)
+    // Verify root directory is readable up front so truncated images report an error
+    std::vector<FatDirEntry> root_probe;
+    if (!vfs.ListDirectory(nullptr, root_probe)) {
+        if (out_error) *out_error = "Failed to read FAT root directory (image may be truncated or corrupted)";
+        return results;
+    }
+
+    std::set<std::string> seen_targets; // key: UPPER(full_target_path)
 
     auto make_icon_path = [&](const std::string& seed_key) -> std::string {
         if (icon_cache_dir.empty()) return "";
-        uint32_t h = SignatureMatcher::ComputeCrc32(seed_key.data(), seed_key.size());
+        const std::string namespaced_seed = cache_namespace.empty()
+                                                ? seed_key
+                                                : (cache_namespace + "|" + seed_key);
+        uint32_t h = SignatureMatcher::ComputeCrc32(namespaced_seed.data(), namespaced_seed.size());
         return JoinHostPath(icon_cache_dir, "icon_" + SignatureMatcher::FormatCrc32Hex(h) + ".png");
     };
 
@@ -1814,22 +1900,26 @@ std::vector<ImageCrawler::CrawlResult> ImageCrawler::ScanMountedVfs(
     // ------------------------------------------------------------------------
     FatDirEntry start_menu_dir;
     if (vfs.FindPath("\\WINDOWS\\Start Menu\\Programs", start_menu_dir) && start_menu_dir.is_directory) {
-        std::vector<std::pair<FatDirEntry, int>> dir_stack;
-        dir_stack.push_back(std::make_pair(start_menu_dir, 0));
+        struct LnkDirNode {
+            FatDirEntry entry;
+            std::string guest_dir;
+            int depth;
+        };
+        std::vector<LnkDirNode> dir_stack;
+        dir_stack.push_back(LnkDirNode{start_menu_dir, "C:\\WINDOWS\\Start Menu\\Programs", 0});
 
         while (!dir_stack.empty()) {
-            FatDirEntry cur_dir = dir_stack.back().first;
-            int depth = dir_stack.back().second;
+            LnkDirNode cur = dir_stack.back();
             dir_stack.pop_back();
-            if (depth > 6) continue;
+            if (cur.depth > 6) continue;
 
             std::vector<FatDirEntry> entries;
-            if (!vfs.ListDirectory(&cur_dir, entries)) continue;
+            if (!vfs.ListDirectory(&cur.entry, entries)) continue;
 
             for (size_t i = 0; i < entries.size(); ++i) {
                 const FatDirEntry& e = entries[i];
                 if (e.is_directory) {
-                    dir_stack.push_back(std::make_pair(e, depth + 1));
+                    dir_stack.push_back(LnkDirNode{e, cur.guest_dir + "\\" + e.name, cur.depth + 1});
                     continue;
                 }
                 if (GetUpperExtension(e.name) != ".LNK") continue;
@@ -1840,52 +1930,60 @@ std::vector<ImageCrawler::CrawlResult> ImageCrawler::ScanMountedVfs(
                 Win9xLnkInfo lnk;
                 if (!ParseWin9xLnkBuffer(lnk_bytes.data(), lnk_bytes.size(), lnk)) continue;
 
+                std::string resolved_target = ResolveRelativeGuestPath(cur.guest_dir, lnk.target_path);
+                if (resolved_target.empty()) continue;
+
                 std::string dir_part, file_part;
-                SplitGuestPath(lnk.target_path, dir_part, file_part);
+                SplitGuestPath(resolved_target, dir_part, file_part);
                 if (file_part.empty() || IsIgnoredUtilityBinary(file_part)) continue;
 
                 std::string ext = GetUpperExtension(file_part);
                 if (ext != ".EXE" && ext != ".COM" && ext != ".BAT") continue;
 
+                FatDirEntry target_fe;
+                if (!vfs.FindPath(resolved_target, target_fe) || target_fe.is_directory) {
+                    continue; // Skip broken shortcuts whose target does not exist on the image
+                }
+
                 std::string work_dir = lnk.working_dir.empty() ? dir_part : NormalizeGuestDir(lnk.working_dir);
-                std::string target_key = ToUpperAscii(work_dir + "\\" + file_part);
+                std::string canonical_target = (dir_part.back() == '\\') ? (dir_part + file_part) : (dir_part + "\\" + file_part);
+                std::string target_key = ToUpperAscii(canonical_target);
                 if (!seen_targets.insert(target_key).second) continue;
 
                 CrawlResult cr;
                 cr.title = !lnk.description.empty() ? lnk.description : SignatureMatcher::PrettifyTitle(e.name);
                 cr.working_dir = work_dir;
-                cr.executable = file_part;
+                // Preserve full target path if working directory differs from executable's directory
+                cr.executable = (ToUpperAscii(work_dir) == ToUpperAscii(dir_part)) ? file_part : canonical_target;
                 cr.arguments = lnk.arguments;
                 cr.launch_mechanism = "WIN9X_RUNONCE_HOOK";
                 cr.item_type = "APPLICATION";
 
                 // Inspect target binary for fingerprint & icon
-                FatDirEntry target_fe;
-                if (vfs.FindPath(lnk.target_path, target_fe) && !target_fe.is_directory) {
-                    std::vector<uint8_t> bin;
-                    if (vfs.ReadFile(target_fe, bin, 8U * 1024U * 1024U)) {
-                        ExecutableFingerprint fp;
-                        if (SignatureMatcher::ComputeExecutableFingerprint(bin.data(), bin.size(), file_part, fp, target_fe.file_size)) {
-                            cr.executable_crc32 = fp.header_crc32;
-                            SoftwareSignatureRecord sig;
-                            if (SignatureMatcher::MatchSignature(file_part, fp, sig)) {
-                                if (sig.item_type == "IGNORE_SYSTEM") continue;
-                                cr.title = sig.detected_title;
-                                cr.item_type = sig.item_type;
-                                cr.matched_signature = true;
-                            }
+                std::vector<uint8_t> bin;
+                if (vfs.ReadFile(target_fe, bin, 8U * 1024U * 1024U)) {
+                    ExecutableFingerprint fp;
+                    if (SignatureMatcher::ComputeExecutableFingerprint(bin.data(), bin.size(), file_part, fp, target_fe.file_size)) {
+                        cr.executable_crc32 = fp.header_crc32;
+                        SoftwareSignatureRecord sig;
+                        if (SignatureMatcher::MatchSignature(file_part, fp, sig)) {
+                            if (sig.item_type == "IGNORE_SYSTEM") continue;
+                            cr.title = sig.detected_title;
+                            cr.item_type = sig.item_type;
+                            cr.matched_signature = true;
                         }
-                        std::string icon_png = make_icon_path(target_key);
-                        if (!icon_png.empty()) {
-                            bool got_icon = false;
-                            if (!lnk.icon_location.empty()) {
-                                got_icon = try_extract_icon_from_vfs_file(lnk.icon_location, lnk.icon_index, icon_png);
-                            }
-                            if (!got_icon) {
-                                got_icon = ExtractPeNeIcon(bin.data(), bin.size(), icon_png, lnk.icon_index);
-                            }
-                            if (got_icon) cr.icon_output_path = icon_png;
+                    }
+                    std::string icon_png = make_icon_path(target_key);
+                    if (!icon_png.empty()) {
+                        bool got_icon = false;
+                        if (!lnk.icon_location.empty()) {
+                            std::string resolved_icon = ResolveRelativeGuestPath(cur.guest_dir, lnk.icon_location);
+                            got_icon = try_extract_icon_from_vfs_file(resolved_icon, lnk.icon_index, icon_png);
                         }
+                        if (!got_icon) {
+                            got_icon = ExtractPeNeIcon(bin.data(), bin.size(), icon_png, lnk.icon_index);
+                        }
+                        if (got_icon) cr.icon_output_path = icon_png;
                     }
                 }
                 results.push_back(cr);
@@ -2215,7 +2313,12 @@ bool ImageCrawler::ScanAndCatalogMachine(
     }
 
     const std::string cache_dir = icon_cache_dir.empty() ? GetDefaultIconCacheDir() : icon_cache_dir;
-    std::vector<CrawlResult> discovered = ScanMountedVfs(vfs, cache_dir);
+    std::string scan_error;
+    std::vector<CrawlResult> discovered = ScanMountedVfs(vfs, cache_dir, machine_id, &scan_error);
+    if (!scan_error.empty()) {
+        out_summary.error_message = scan_error;
+        return false;
+    }
     out_summary.total_discovered = static_cast<int>(discovered.size());
 
     // Build existing-items lookup set for deduplication
@@ -2256,16 +2359,27 @@ bool ImageCrawler::ScanAndCatalogMachine(
                 out_summary.icons_extracted++;
             }
             existing_keys.insert(key);
+        } else {
+            out_summary.failed_inserts++;
         }
     }
 
-    LOG_MSG("KIOSK: Scanned machine '%s' (%s): discovered=%d, inserted=%d, duplicates=%d, icons=%d",
+    LOG_MSG("KIOSK: Scanned machine '%s' (%s): discovered=%d, inserted=%d, duplicates=%d, failed=%d, icons=%d",
             mach.display_name.c_str(),
             mach.primary_hdd_path.c_str(),
             out_summary.total_discovered,
             out_summary.newly_inserted,
             out_summary.skipped_duplicates,
+            out_summary.failed_inserts,
             out_summary.icons_extracted);
+
+    if (out_summary.failed_inserts > 0) {
+        char err_buf[128];
+        snprintf(err_buf, sizeof(err_buf), "Failed to save %d of %d discovered title(s)",
+                 out_summary.failed_inserts, out_summary.total_discovered);
+        out_summary.error_message = err_buf;
+        return false;
+    }
     return true;
 }
 

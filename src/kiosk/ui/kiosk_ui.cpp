@@ -235,8 +235,11 @@ void KioskUI::RenderFrame() {
 
 void KioskUI::InvalidateCatalogCache() {
     m_cache_loaded = false;
-    m_settings_draft_loaded = false;
     ViewWatchdog::GetInstance().InvalidatePreview();
+}
+
+void KioskUI::InvalidateSettingsDraft() {
+    m_settings_draft_loaded = false;
 }
 
 void KioskUI::EnsureCatalogCacheLoaded() {

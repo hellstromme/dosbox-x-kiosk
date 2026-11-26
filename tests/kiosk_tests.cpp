@@ -2999,10 +2999,11 @@ TEST(KioskCrawlerTest, Fat32MbrClusterChainAndCycleProtection) {
     EXPECT_EQ(good_data[512], 'B');
 
     // Cycle-protected read terminates cleanly after 2 unique clusters (1024 bytes)
+    // and reports false because fewer than file_size (4096) bytes were readable.
     FatDirEntry loop_entry;
     ASSERT_TRUE(vfs.FindPath("\\LOOP.BIN", loop_entry));
     std::vector<uint8_t> loop_data;
-    ASSERT_TRUE(vfs.ReadFile(loop_entry, loop_data));
+    EXPECT_FALSE(vfs.ReadFile(loop_entry, loop_data));
     EXPECT_EQ(loop_data.size(), 1024U);
 
     vfs.Close();
@@ -3059,13 +3060,15 @@ TEST(KioskCrawlerTest, Dos4gwStubStrippingFingerprintAndSignatureMatch) {
 }
 
 TEST(KioskCrawlerTest, Win31GrpParserAndEmbeddedIcon) {
-    // Build a minimal valid Windows 3.1 "PMCC" .GRP buffer with 1 item + 16x16 embedded 4bpp icon
+    // Build a minimal valid native Windows 3.1 "PMCC" .GRP buffer (34-byte GROUPHEADER + rgiItems[])
+    // with 1 item + 16x16 embedded 4bpp icon
     std::vector<uint8_t> grp(512, 0);
     std::memcpy(grp.data(), "PMCC", 4);
     TestWriteLe16(grp.data() + 6, static_cast<uint16_t>(grp.size()));
-    TestWriteLe16(grp.data() + 20, 40); // pName = offset 40 ("Games")
-    TestWriteLe16(grp.data() + 30, 1);  // cItems = 1
-    TestWriteLe16(grp.data() + 32, 64); // Item 0 offset = 64
+    TestWriteLe16(grp.data() + 22, 40); // pName = offset 40 ("Games")
+    TestWriteLe16(grp.data() + 30, 0);  // wReserved = 0
+    TestWriteLe16(grp.data() + 32, 1);  // cItems = 1
+    TestWriteLe16(grp.data() + 34, 64); // rgiItems[0] = offset 64
 
     std::memcpy(grp.data() + 40, "Games", 6);
 
@@ -3333,6 +3336,74 @@ TEST(KioskDatabasePersistenceTest, DefaultPathAndMachinePersistsAcrossReopen) {
     std::remove(temp_db.c_str());
     std::remove((temp_db + "-wal").c_str());
     std::remove((temp_db + "-shm").c_str());
+}
+
+TEST(KioskCrawlerTest, Fat32ActiveFatAndSectorSizeGuard) {
+    // 1. Non-512B sector size disk must be rejected before reading into 512B buffer
+    imageDiskMemory non512_disk(10, 2, 8, 1024);
+    FatReadOnlyVfs bad_vfs;
+    EXPECT_FALSE(bad_vfs.OpenFromImageDisk(&non512_disk));
+
+    // 2. FAT32 with BPB_ExtFlags = 0x0081 (mirroring disabled, FAT 1 active):
+    // FAT 0 has stale EOC at cluster 3, while FAT 1 chains cluster 3 -> cluster 4.
+    const std::string img_path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fat32_active.img";
+    const uint32_t part_lba = 32;
+    const uint32_t rsvd_secs = 32;
+    const uint32_t fat_secs = 8;
+    const uint32_t data_lba = part_lba + rsvd_secs + (2 * fat_secs); // 80
+    std::vector<uint8_t> img(160U * 512U, 0);
+
+    img[510] = 0x55; img[511] = 0xAA;
+    img[0x1BE + 0] = 0x80;
+    img[0x1BE + 4] = 0x0C;
+    TestWriteLe32(img.data() + 0x1BE + 8, part_lba);
+    TestWriteLe32(img.data() + 0x1BE + 12, 70100);
+
+    uint8_t* vbr = img.data() + part_lba * 512U;
+    vbr[0] = 0xEB; vbr[1] = 0x58; vbr[2] = 0x90;
+    TestWriteLe16(vbr + 11, 512);
+    vbr[13] = 1;
+    TestWriteLe16(vbr + 14, rsvd_secs);
+    vbr[16] = 2; // 2 FATs
+    TestWriteLe32(vbr + 32, 70100);
+    TestWriteLe32(vbr + 36, fat_secs);
+    TestWriteLe16(vbr + 40, 0x0081u); // Mirroring off, active FAT = 1
+    TestWriteLe32(vbr + 44, 2);       // Root cluster = 2
+    vbr[510] = 0x55; vbr[511] = 0xAA;
+
+    // FAT 0: stale EOC on cluster 3
+    uint8_t* fat0 = img.data() + (part_lba + rsvd_secs) * 512U;
+    TestWriteLe32(fat0 + 2 * 4, 0x0FFFFFFFu);
+    TestWriteLe32(fat0 + 3 * 4, 0x0FFFFFFFu);
+
+    // FAT 1 (authoritative): cluster 3 -> cluster 4 -> EOC
+    uint8_t* fat1 = img.data() + (part_lba + rsvd_secs + fat_secs) * 512U;
+    TestWriteLe32(fat1 + 2 * 4, 0x0FFFFFFFu);
+    TestWriteLe32(fat1 + 3 * 4, 4);
+    TestWriteLe32(fat1 + 4 * 4, 0x0FFFFFFFu);
+
+    uint8_t* root = img.data() + data_lba * 512U;
+    TestWriteDirEntry83(root, "ACTIVE  TXT", 0x20, 3, 600);
+    std::memset(img.data() + (data_lba + 1) * 512U, 'X', 512);
+    std::memset(img.data() + (data_lba + 2) * 512U, 'Y', 512);
+
+    std::FILE* f = std::fopen(img_path.c_str(), "wb");
+    ASSERT_NE(f, nullptr);
+    ASSERT_EQ(std::fwrite(img.data(), 1, img.size(), f), img.size());
+    std::fclose(f);
+
+    FatReadOnlyVfs vfs;
+    ASSERT_TRUE(vfs.OpenImageFile(img_path));
+    FatDirEntry active_entry;
+    ASSERT_TRUE(vfs.FindPath("\\ACTIVE.TXT", active_entry));
+    std::vector<uint8_t> data;
+    ASSERT_TRUE(vfs.ReadFile(active_entry, data));
+    ASSERT_EQ(data.size(), 600U);
+    EXPECT_EQ(data[0], 'X');
+    EXPECT_EQ(data[512], 'Y');
+
+    vfs.Close();
+    std::remove(img_path.c_str());
 }
 
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

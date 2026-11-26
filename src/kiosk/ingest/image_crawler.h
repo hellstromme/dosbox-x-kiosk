@@ -83,6 +83,7 @@ private:
     uint32_t m_first_data_sector = 0;
     uint32_t m_cluster_count = 0;
     uint32_t m_root_cluster = 0;
+    uint32_t m_active_fat_index = 0;
 };
 
 struct Win31GrpItem {
@@ -128,6 +129,7 @@ public:
         int total_discovered = 0;
         int newly_inserted = 0;
         int skipped_duplicates = 0;
+        int failed_inserts = 0;
         int icons_extracted = 0;
         std::string error_message;
     };
@@ -135,13 +137,16 @@ public:
     // Scans a raw/VHD read-only disk image (partition -> VFAT walker -> Win3.1/Win9x/DOS discovery)
     static std::vector<CrawlResult> ScanDiskImage(
         const std::string& hdd_img_path,
-        const std::string& icon_cache_dir = ""
+        const std::string& icon_cache_dir = "",
+        const std::string& cache_namespace = ""
     );
 
     // Scans an already-mounted FatReadOnlyVfs (used directly by unit tests)
     static std::vector<CrawlResult> ScanMountedVfs(
         const FatReadOnlyVfs& vfs,
-        const std::string& icon_cache_dir = ""
+        const std::string& icon_cache_dir = "",
+        const std::string& cache_namespace = "",
+        std::string* out_error = nullptr
     );
 
     // Scans a registered machine's primary_hdd_path and persists deduplicated SCANNED items to KioskDatabase.
