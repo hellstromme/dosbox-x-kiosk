@@ -1,0 +1,6 @@
+# DOSBox-X Kiosk Zero-Daemon USB & Optical Automount Rule (eudev)
+# Delegates to /usr/libexec/kiosk-usb-mount.sh for safe label sanitization and rw mounting.
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/libexec/kiosk-usb-mount.sh add '/dev/%k' '%E{ID_FS_LABEL}' '%E{ID_FS_UUID}' '%E{ID_FS_TYPE}'"
+ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", RUN+="/usr/libexec/kiosk-usb-mount.sh remove '/dev/%k' '%E{ID_FS_LABEL}' '%E{ID_FS_UUID}' '%E{ID_FS_TYPE}'"
+ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA}=="1", RUN+="/usr/libexec/kiosk-usb-mount.sh add '/dev/%k' '%E{ID_FS_LABEL}' 'CDROM_%k' '%E{ID_FS_TYPE}'"
+ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA}!="1", RUN+="/usr/libexec/kiosk-usb-mount.sh remove '/dev/%k' '%E{ID_FS_LABEL}' 'CDROM_%k' '%E{ID_FS_TYPE}'"

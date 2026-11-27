@@ -4,6 +4,9 @@
 
 #include "config_synthesizer.h"
 #include "archetypes.h"
+#include "../kiosk_host.h"
+#include "../kiosk_main.h"
+#include "../ingest/usb_bridge.h"
 #include <fstream>
 #include <sstream>
 #include <map>
@@ -16,6 +19,7 @@ ConfigSynthesizer& ConfigSynthesizer::GetInstance() {
 }
 
 std::string ConfigSynthesizer::GetDefaultBaseConfig() const {
+    const std::string mapper_path = KioskHost::GetDefaultMapperPath();
     return
         "# --- DOSBox-X Kiosk Appliance Base Configuration ---\n"
         "[sdl]\n"
@@ -26,7 +30,7 @@ std::string ConfigSynthesizer::GetDefaultBaseConfig() const {
         "autolock            = true\n"
         "sensitivity         = 100\n"
         "waitonerror         = false\n"
-        "mapperfile          = /var/lib/dosbox-kiosk/config/kiosk_mapper.map\n"
+        "mapperfile          = " + mapper_path + "\n"
         "\n"
         "[dosbox]\n"
         "title               = DOSBox-X Kiosk Appliance\n"
@@ -214,6 +218,12 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
                 ss << " \"" << b.resolved_file_path << "\"";
             }
             ss << " -t iso\n";
+        } else if (KioskManager::GetInstance().GetConfig().auto_mount_usb_docs) {
+            const std::string usb_docs = KioskUsbBridge::GetInstance().GetPreferredUsbDocumentsDir();
+            if (!usb_docs.empty()) {
+                ss << "# Auto-mount removable USB DOCUMENTS folder as E:\n"
+                   << "MOUNT E \"" << usb_docs << "\"\n";
+            }
         }
 
         // 4. Dispatch executable

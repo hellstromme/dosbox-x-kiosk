@@ -4,6 +4,8 @@
 
 #include "kiosk_main.h"
 #include "kiosk_db.h"
+#include "kiosk_host.h"
+#include "ingest/usb_bridge.h"
 #include "machine/archetypes.h"
 #include "machine/config_synthesizer.h"
 #include "machine/boot_injector.h"
@@ -54,6 +56,7 @@ KioskManager::KioskManager()
     (void)DiskCaddyView::GetInstance();
     (void)RuntimeOverlay::GetInstance();
     (void)BootInjector::GetInstance();
+    (void)KioskUsbBridge::GetInstance();
 }
 
 KioskManager& KioskManager::GetInstance() {
@@ -77,7 +80,11 @@ void KioskManager::CleanupSessionArtifactsLocked() {
 }
 
 bool KioskManager::Initialize(const std::string& db_path, const std::string& base_conf) {
-    LOG_MSG("KIOSK: Initializing DOSBox-X Kiosk Subsystems...");
+    LOG_MSG("KIOSK: Initializing DOSBox-X Kiosk Subsystems (%s)...",
+            KioskHost::GetHostProfileDisplayName(KioskHost::DetectHostProfile()));
+
+    // 0. Ensure cross-platform Kiosk data directory hierarchy exists
+    KioskHost::EnsureDataDirectories();
 
     // 1. Initialize SQLite Catalog Database (preserve existing open DB if db_path is empty during tests)
     if (!db_path.empty() || !KioskDatabase::GetInstance().IsOpen()) {
@@ -91,6 +98,12 @@ bool KioskManager::Initialize(const std::string& db_path, const std::string& bas
             }
         }
     }
+
+    // 1b. Purge any stale removable USB records from previous sessions and start USB bridge
+    KioskDatabase::GetInstance().PurgeStaleRemovableUsbMedia();
+    const bool enable_live_usb_poll = (control == nullptr || !control->opt_test);
+    KioskUsbBridge::GetInstance().Initialize("", enable_live_usb_poll);
+    KioskHost::NotifySystemdReady();
 
     // 2. Load global Kiosk configuration from catalog_db
     KioskConfigRecord loaded_cfg;
@@ -183,6 +196,8 @@ void KioskManager::RunMainLoop() {
                 UpdateWatchdog(delta_sec);
             }
 
+            KioskUsbBridge::GetInstance().PollEventsNonBlocking();
+            KioskHost::PingSystemdWatchdog();
             Kiosk_PumpPreBootFrame();
         }
         KioskInputRouter::GetInstance().ShutdownControllers();
@@ -200,6 +215,8 @@ void KioskManager::Shutdown() {
 
     if (was_init) {
         LOG_MSG("KIOSK: Shutting down Kiosk Subsystems...");
+        KioskHost::NotifySystemdStopping();
+        KioskUsbBridge::GetInstance().Shutdown();
         ViewCarousel::GetInstance().WaitForPendingImport();
         KioskUI::GetInstance().Shutdown();
         KioskDatabase::GetInstance().Close();

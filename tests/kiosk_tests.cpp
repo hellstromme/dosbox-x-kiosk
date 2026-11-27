@@ -4,6 +4,8 @@
 
 #include "kiosk_types.h"
 #include "kiosk_db.h"
+#include "kiosk_host.h"
+#include "ingest/usb_bridge.h"
 #include "machine/archetypes.h"
 #include "machine/config_synthesizer.h"
 #include "machine/kioskext_bin.h"
@@ -4178,6 +4180,211 @@ TEST(KioskMediaGroupTest, DerivesGroupPersistsAndFormatsDisplayName) {
     ASSERT_TRUE(KioskDatabase::GetInstance().GetMedia(m3.id, r3));
     EXPECT_EQ(r3.media_group, "WordPerfect51");
 
+    KioskDatabase::GetInstance().Close();
+}
+
+// ----------------------------------------------------------------------------
+// Phase 8: Dual-Target Host Layer & Cross-Platform Removable Storage Bridge
+// ----------------------------------------------------------------------------
+
+TEST(KioskPhase8Test, HostDataRootAndSubdirectoryCreation) {
+#if defined(_WIN32)
+    const char* tmp_env = std::getenv("TEMP");
+    const std::string base_tmp = (tmp_env && tmp_env[0] != '\0') ? std::string(tmp_env) : ".";
+#else
+    const std::string base_tmp = "/tmp";
+#endif
+    const std::string root = KioskHost::JoinPath(base_tmp, "dosbox_kiosk_p8_host_test");
+    ASSERT_TRUE(KioskHost::EnsureDataDirectories(root));
+
+    EXPECT_EQ(KioskHost::GetDefaultDatabasePath(root), KioskHost::JoinPath(root, "catalog.db"));
+    EXPECT_EQ(KioskHost::GetDefaultMapperPath(root),
+              KioskHost::JoinPath(KioskHost::JoinPath(root, "config"), "kiosk_mapper.map"));
+    EXPECT_EQ(KioskHost::GetDefaultBaseConfPath(root),
+              KioskHost::JoinPath(KioskHost::JoinPath(root, "config"), "kiosk_base.conf"));
+
+    // Verify subdirectories actually exist by creating a probe file inside config/ and cache/icons/
+    const std::string probe1 = KioskHost::JoinPath(KioskHost::GetConfigDir(root), "probe.tmp");
+    const std::string probe2 = KioskHost::JoinPath(KioskHost::GetIconCacheDir(root), "probe.tmp");
+    {
+        std::ofstream f1(probe1.c_str(), std::ios::binary);
+        ASSERT_TRUE(f1.is_open());
+        f1 << "ok";
+    }
+    {
+        std::ofstream f2(probe2.c_str(), std::ios::binary);
+        ASSERT_TRUE(f2.is_open());
+        f2 << "ok";
+    }
+    std::remove(probe1.c_str());
+    std::remove(probe2.c_str());
+}
+
+TEST(KioskPhase8Test, HostProfileDetectionAndSystemdNoOp) {
+    const KioskHostProfile profile = KioskHost::DetectHostProfile();
+#if defined(_WIN32)
+    EXPECT_EQ(profile, KioskHostProfile::DESKTOP_BIG_PICTURE);
+    EXPECT_FALSE(KioskHost::IsSystemdSupportCompiled());
+#endif
+    EXPECT_NE(KioskHost::GetHostProfileDisplayName(profile), nullptr);
+    // Must be safe no-ops without libsystemd
+    KioskHost::NotifySystemdReady();
+    KioskHost::PingSystemdWatchdog(0);
+    KioskHost::NotifySystemdStopping();
+}
+
+TEST(KioskPhase8Test, UsbBridgeExtensionAndArchiveClassification) {
+    EXPECT_TRUE(KioskUsbBridge::IsSupportedDiskImageExtension("disk1.img"));
+    EXPECT_TRUE(KioskUsbBridge::IsSupportedDiskImageExtension("DISK2.IMA"));
+    EXPECT_TRUE(KioskUsbBridge::IsSupportedDiskImageExtension("boot.vfd"));
+    EXPECT_TRUE(KioskUsbBridge::IsSupportedDiskImageExtension("game.ISO"));
+    EXPECT_TRUE(KioskUsbBridge::IsSupportedDiskImageExtension("audio.cue"));
+    EXPECT_FALSE(KioskUsbBridge::IsSupportedDiskImageExtension("readme.txt"));
+    EXPECT_FALSE(KioskUsbBridge::IsSupportedDiskImageExtension("doom.exe"));
+
+    bool is_gog = false;
+    EXPECT_TRUE(KioskUsbBridge::IsImportableArchiveFilename("setup_doom_2.0.exe", &is_gog));
+    EXPECT_TRUE(is_gog);
+
+    is_gog = true;
+    EXPECT_TRUE(KioskUsbBridge::IsImportableArchiveFilename("Indiana_Jones.zip", &is_gog));
+    EXPECT_FALSE(is_gog);
+
+    EXPECT_FALSE(KioskUsbBridge::IsImportableArchiveFilename("dosbox.exe", &is_gog));
+    EXPECT_FALSE(KioskUsbBridge::IsImportableArchiveFilename("notes.txt", &is_gog));
+}
+
+TEST(KioskPhase8Test, UsbBridgeMountScanThreeLevelsAndRemovePurge) {
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(":memory:"));
+    KioskUsbBridge& bridge = KioskUsbBridge::GetInstance();
+    ASSERT_TRUE(bridge.Initialize("", false));
+
+    // Seed a permanent non-USB media entry to verify removal never touches it
+    MediaPoolRecord perm;
+    perm.id = "perm-floppy-1";
+    perm.file_path = "C:\\Permanent\\disk1.img";
+    perm.media_type = "FLOPPY_35_1440K";
+    perm.physical_style = "BEIGE_35";
+    perm.label_title = "Permanent Disk";
+    perm.is_removable_usb = false;
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMedia(perm));
+
+    // Build a temporary simulated USB mount tree with depths 0..4
+#if defined(_WIN32)
+    const char* tmp_env = std::getenv("TEMP");
+    const std::string base_tmp = (tmp_env && tmp_env[0] != '\0') ? std::string(tmp_env) : ".";
+#else
+    const std::string base_tmp = "/tmp";
+#endif
+    const std::string usb_root = KioskHost::JoinPath(base_tmp, "dosbox_kiosk_p8_usb_sim");
+    const std::string d1 = KioskHost::JoinPath(usb_root, "L1");
+    const std::string d2 = KioskHost::JoinPath(d1, "L2");
+    const std::string d3 = KioskHost::JoinPath(d2, "L3");
+    const std::string d4 = KioskHost::JoinPath(d3, "L4");
+    const std::string docs = KioskHost::JoinPath(usb_root, "DOCUMENTS");
+    ASSERT_TRUE(KioskHost::EnsureDirectoryRecursive(d4));
+    ASSERT_TRUE(KioskHost::EnsureDirectoryRecursive(docs));
+
+    // Create a valid 1.44MB floppy image at depth 0 and depth 3, plus a depth 4 image that must be skipped
+    std::vector<uint8_t> floppy_144(1474560, 0);
+    const std::string img_d0 = KioskHost::JoinPath(usb_root, "boot_d0.img");
+    const std::string img_d3 = KioskHost::JoinPath(d3, "deep_d3.img");
+    const std::string img_d4 = KioskHost::JoinPath(d4, "too_deep_d4.img");
+    const std::string zip_d1 = KioskHost::JoinPath(d1, "steam_game.zip");
+    const std::string gog_d2 = KioskHost::JoinPath(d2, "setup_eob_1.0.exe");
+
+    auto write_bytes = [](const std::string& p, const uint8_t* data, size_t sz) {
+        std::ofstream f(p.c_str(), std::ios::binary | std::ios::trunc);
+        if (f.is_open() && sz > 0) {
+            f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(sz));
+        }
+    };
+    write_bytes(img_d0, floppy_144.data(), floppy_144.size());
+    write_bytes(img_d3, floppy_144.data(), floppy_144.size());
+    write_bytes(img_d4, floppy_144.data(), floppy_144.size());
+    const uint8_t dummy_zip[4] = { 'P', 'K', 3, 4 };
+    write_bytes(zip_d1, dummy_zip, sizeof(dummy_zip));
+    const uint8_t dummy_mz[2] = { 'M', 'Z' };
+    write_bytes(gog_d2, dummy_mz, sizeof(dummy_mz));
+
+    // 1. Mount simulated USB volume
+    ASSERT_TRUE(bridge.OnVolumeMounted(usb_root, "RETRO_USB", false));
+
+    const std::vector<UsbVolumeInfo> vols = bridge.GetActiveVolumes();
+    ASSERT_EQ(vols.size(), 1u);
+    EXPECT_EQ(vols[0].volume_label, "RETRO_USB");
+    EXPECT_EQ(vols[0].media_count, 2);   // depth 0 + depth 3 (depth 4 skipped)
+    EXPECT_EQ(vols[0].archive_count, 2); // zip + setup_*.exe
+    EXPECT_EQ(bridge.GetPreferredUsbDocumentsDir(), docs);
+
+    const std::vector<MediaPoolRecord> usb_media = KioskDatabase::GetInstance().GetRemovableUsbMedia();
+    ASSERT_EQ(usb_media.size(), 2u);
+    EXPECT_EQ(usb_media[0].media_group, "USB: RETRO_USB");
+    EXPECT_TRUE(usb_media[0].is_removable_usb);
+
+    const std::vector<UsbArchiveCandidate> archives = bridge.GetDiscoveredArchives();
+    ASSERT_EQ(archives.size(), 2u);
+
+    // 2. Verify ConfigSynthesizer emits portable mapperfile & USB DOCUMENTS auto-mount on Drive E:
+    MachineRecord m;
+    m.id = "mach-usb-docs";
+    m.display_name = "USB Docs Test";
+    m.archetype_id = KioskArchetypes::DX_386;
+    m.archetype_tier = 3;
+    m.boot_mode = "INTEGRATED_DOS";
+    m.primary_hdd_path = "C:\\Games\\Test";
+
+    KioskConfigRecord cfg;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetConfig(cfg));
+    cfg.auto_mount_usb_docs = true;
+    ASSERT_TRUE(KioskDatabase::GetInstance().UpdateConfig(cfg));
+    KioskManager::GetInstance().ReloadConfig();
+
+    const std::string synth_with_usb = ConfigSynthesizer::GetInstance().SynthesizeConfig(m);
+    EXPECT_NE(synth_with_usb.find(KioskHost::GetDefaultMapperPath()), std::string::npos);
+    EXPECT_NE(synth_with_usb.find("MOUNT E \"" + docs + "\""), std::string::npos);
+
+    // When an optical E: binding already exists, USB DOCUMENTS must NOT shadow E:
+    CaddyBindingRecord cd_e;
+    cd_e.target_drive = "E";
+    cd_e.slot_order = 1;
+    cd_e.resolved_file_path = "C:\\Media\\disc2.iso";
+    std::vector<CaddyBindingRecord> caddy_e;
+    caddy_e.push_back(cd_e);
+    const std::string synth_with_cd_e = ConfigSynthesizer::GetInstance().SynthesizeConfig(m, nullptr, caddy_e);
+    EXPECT_NE(synth_with_cd_e.find("IMGMOUNT E \"C:\\Media\\disc2.iso\""), std::string::npos);
+    EXPECT_EQ(synth_with_cd_e.find("MOUNT E \"" + docs + "\""), std::string::npos);
+
+    // 3. Remove simulated USB volume and verify DB purge preserves permanent media
+    ASSERT_TRUE(bridge.OnVolumeRemoved(usb_root));
+    EXPECT_TRUE(bridge.GetActiveVolumes().empty());
+    EXPECT_TRUE(bridge.GetDiscoveredArchives().empty());
+    EXPECT_TRUE(KioskDatabase::GetInstance().GetRemovableUsbMedia().empty());
+
+    MediaPoolRecord perm_check;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMedia(perm.id, perm_check));
+    EXPECT_FALSE(perm_check.is_removable_usb);
+
+    // 4. Test PurgeStaleRemovableUsbMedia() removes orphaned rows whose files no longer exist
+    MediaPoolRecord stale_usb;
+    stale_usb.id = "usb-stale-999";
+    stale_usb.file_path = KioskHost::JoinPath(usb_root, "nonexistent_ghost.img");
+    stale_usb.media_type = "FLOPPY_35_1440K";
+    stale_usb.physical_style = "BLUE_35";
+    stale_usb.label_title = "Ghost USB Disk";
+    stale_usb.is_removable_usb = true;
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMedia(stale_usb));
+    EXPECT_EQ(KioskDatabase::GetInstance().PurgeStaleRemovableUsbMedia(), 1);
+    EXPECT_TRUE(KioskDatabase::GetInstance().GetRemovableUsbMedia().empty());
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMedia(perm.id, perm_check));
+
+    // Clean up temporary files
+    std::remove(img_d0.c_str());
+    std::remove(img_d3.c_str());
+    std::remove(img_d4.c_str());
+    std::remove(zip_d1.c_str());
+    std::remove(gog_d2.c_str());
+    bridge.Shutdown();
     KioskDatabase::GetInstance().Close();
 }
 

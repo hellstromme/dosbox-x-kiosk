@@ -1,0 +1,31 @@
+[Unit]
+Description=DOSBox-X Kiosk Appliance Service
+After=systemd-user-sessions.service systemd-logind.service sound.target
+Conflicts=getty@tty1.service
+
+[Service]
+Type=notify
+User=kiosk
+Group=kiosk
+SupplementaryGroups=video audio input render disk optical storage
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Environment="SDL_VIDEODRIVER=kmsdrm"
+Environment="SDL_AUDIODRIVER=alsa"
+Environment="SDL_RENDER_VSYNC=1"
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="MESA_SHADER_CACHE_DIR=/var/lib/dosbox-kiosk/cache/mesa"
+Environment="DOSBOX_KIOSK_APPLIANCE=1"
+ExecStartPre=+/usr/bin/mkdir -p /run/user/1000/kiosk /run/media/kiosk /var/lib/dosbox-kiosk/cache/mesa
+ExecStartPre=+/usr/bin/chown -R kiosk:kiosk /run/user/1000 /var/lib/dosbox-kiosk/cache/mesa
+ExecStartPre=/usr/bin/rm -f /run/user/1000/kiosk/kiosk_dispatch.img
+ExecStart=/usr/bin/dosbox-x -kiosk-mode -kiosk-db /var/lib/dosbox-kiosk/catalog.db -kiosk-conf /var/lib/dosbox-kiosk/config/kiosk_base.conf
+WatchdogSec=30
+Restart=always
+RestartSec=500ms
+
+[Install]
+WantedBy=multi-user.target

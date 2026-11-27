@@ -5,6 +5,7 @@
 #include "runtime_overlay.h"
 #include "../kiosk_main.h"
 #include "../kiosk_db.h"
+#include "../ingest/usb_bridge.h"
 #include "../../dos/drives.h"
 #include "bios_disk.h"
 #include "ide.h"
@@ -736,6 +737,14 @@ void RuntimeOverlay::RenderCompactListView() {
 void RuntimeOverlay::RenderGlobalMediaPoolDrawer() {
     if (!m_show_global_pool_drawer) {
         return;
+    }
+
+    const uint64_t usb_rev = KioskUsbBridge::GetInstance().GetChangeRevision();
+    if (usb_rev != m_usb_change_revision) {
+        m_usb_change_revision = usb_rev;
+        if (KioskDatabase::GetInstance().IsOpen()) {
+            m_global_pool_cache = KioskDatabase::GetInstance().GetAllMedia();
+        }
     }
 
     ImGui::BeginChild("##GlobalMediaPoolDrawer", ImVec2(0.0f, -76.0f), true);

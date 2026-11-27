@@ -1,0 +1,6 @@
+# /etc/fstab — DOSBox-X Kiosk Appliance (OverlayFS Root mounted by initramfs + Crash-Safe Ext4 Data)
+# <file system>        <mount point>           <type>    <options>                                             <dump> <pass>
+LABEL=KIOSK_DATA       /var/lib/dosbox-kiosk   ext4      rw,noatime,commit=5,data=ordered,errors=remount-ro    0      2
+tmpfs                  /tmp                    tmpfs     rw,nosuid,nodev,size=512M                             0      0
+tmpfs                  /var/log                tmpfs     rw,nosuid,nodev,size=64M,mode=0755                    0      0
+tmpfs                  /run                    tmpfs     rw,nosuid,nodev,size=128M,mode=0755                   0      0

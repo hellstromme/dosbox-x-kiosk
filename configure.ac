@@ -260,9 +260,17 @@ AC_ARG_ENABLE(x11,AC_HELP_STRING([--disable-x11],[Don't enable X11 integration])
 
 dnl DOSBox-X Kiosk Edition
 AH_TEMPLATE(C_KIOSK,[Define to 1 to enable DOSBox-X Kiosk Edition appliance features])
+AH_TEMPLATE(HAVE_LIBSYSTEMD,[Define to 1 if libsystemd sd_notify support is available])
 AC_ARG_ENABLE(kiosk,AC_HELP_STRING([--enable-kiosk],[Enable DOSBox-X Kiosk Edition appliance features]),enable_kiosk=$enableval,enable_kiosk=no)
 if test "x$enable_kiosk" = "xyes"; then
     AC_DEFINE(C_KIOSK, 1, [Define to 1 to enable DOSBox-X Kiosk Edition])
+    PKG_CHECK_MODULES([LIBSYSTEMD], [libsystemd], [
+        AC_DEFINE(HAVE_LIBSYSTEMD, 1, [Define to 1 if libsystemd sd_notify support is available])
+        LIBS="$LIBS $LIBSYSTEMD_LIBS"
+        CXXFLAGS="$CXXFLAGS $LIBSYSTEMD_CFLAGS"
+    ], [
+        AC_MSG_NOTICE([libsystemd not found; building Kiosk without sd_notify watchdog support])
+    ])
 fi
 AM_CONDITIONAL(C_KIOSK, test "x$enable_kiosk" = "xyes")
 

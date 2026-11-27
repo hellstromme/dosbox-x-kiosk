@@ -10,6 +10,7 @@
 #include "runtime_overlay.h"
 #include "../kiosk_main.h"
 #include "../kiosk_db.h"
+#include "../kiosk_host.h"
 #include "logging.h"
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
@@ -505,6 +506,14 @@ void KioskUI::RenderSettingsTab() {
     }
 
     ImGui::Checkbox("Auto-mount removable USB DOCUMENTS folder as Drive E:", &m_settings_draft.auto_mount_usb_docs);
+
+    ImGui::Spacing();
+    static const KioskHostProfile host_profile = KioskHost::DetectHostProfile();
+    static const std::string cached_data_root = KioskHost::GetDataRootDir();
+    ImGui::PushStyleColor(ImGuiCol_Text, m_theme.text_muted);
+    ImGui::Text("Host Profile: %s", KioskHost::GetHostProfileDisplayName(host_profile));
+    ImGui::Text("Data Root:    %s", cached_data_root.c_str());
+    ImGui::PopStyleColor();
 
     ImGui::Spacing();
     ImGui::Separator();

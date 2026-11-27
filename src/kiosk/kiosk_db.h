@@ -55,6 +55,8 @@ public:
     bool RenameMediaGroup(const std::string& old_group, const std::string& new_group);
     bool AssignMediaGroupBatch(const std::vector<std::string>& media_ids, const std::string& new_group);
     std::vector<MediaPoolRecord> GetRemovableUsbMedia();
+    int DeleteRemovableUsbMediaByPrefix(const std::string& mount_prefix);
+    int PurgeStaleRemovableUsbMedia();
 
     // 5. Session Caddy Bindings
     std::vector<CaddyBindingRecord> GetCaddyBindingsForMachine(const std::string& machine_id);
