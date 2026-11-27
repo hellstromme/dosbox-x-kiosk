@@ -3,6 +3,7 @@
 #if defined(C_KIOSK)
 
 #include "view_disk_caddy.h"
+#include "../ingest/usb_bridge.h"
 #include "imgui.h"
 #include <cstdio>
 #include <cstring>
@@ -302,6 +303,65 @@ bool DiskCaddyView::ExtractIso9660VolumeLabelFromFile(const std::string& file_pa
     return false;
 }
 
+namespace {
+
+bool ReadLogicalLine(FILE* fp, std::string& out_line) {
+    out_line.clear();
+    char buf[1024];
+    bool got_any = false;
+    while (std::fgets(buf, sizeof(buf), fp) != nullptr) {
+        got_any = true;
+        out_line.append(buf);
+        if (!out_line.empty() && out_line.back() == '\n') {
+            break;
+        }
+    }
+    while (!out_line.empty() && (out_line.back() == '\n' || out_line.back() == '\r')) {
+        out_line.pop_back();
+    }
+    return got_any;
+}
+
+} // anonymous namespace
+
+bool DiskCaddyView::ExtractCueReferencedFiles(
+    const std::string& cue_path,
+    std::vector<std::string>& out_raw_names,
+    std::vector<std::string>& out_resolved_paths
+) {
+    out_raw_names.clear();
+    out_resolved_paths.clear();
+    if (cue_path.empty()) return false;
+
+    FILE* fp = OpenRegularFileReadOnly(cue_path);
+    if (!fp) return false;
+
+    const std::string parent_dir = ExtractParentDirectory(cue_path);
+    std::string line;
+    while (ReadLogicalLine(fp, line)) {
+        std::string upper = ToUpperAscii(line);
+        size_t file_pos = upper.find("FILE");
+        if (file_pos != std::string::npos &&
+            (file_pos == 0 || std::isspace(static_cast<unsigned char>(upper[file_pos - 1])))) {
+            size_t q1 = line.find('"', file_pos + 4);
+            if (q1 != std::string::npos) {
+                size_t q2 = line.find('"', q1 + 1);
+                if (q2 != std::string::npos && q2 > q1 + 1) {
+                    std::string raw = line.substr(q1 + 1, q2 - q1 - 1);
+                    out_raw_names.push_back(raw);
+                    if (raw.find(':') != std::string::npos || (!raw.empty() && (raw[0] == '/' || raw[0] == '\\'))) {
+                        out_resolved_paths.push_back(raw);
+                    } else {
+                        out_resolved_paths.push_back(parent_dir + raw);
+                    }
+                }
+            }
+        }
+    }
+    std::fclose(fp);
+    return true;
+}
+
 bool DiskCaddyView::DetectCueSheetRedbookAudio(const std::string& cue_path, std::string& out_first_bin_path) {
     out_first_bin_path.clear();
     if (cue_path.empty()) {
@@ -315,13 +375,9 @@ bool DiskCaddyView::DetectCueSheetRedbookAudio(const std::string& cue_path, std:
 
     const std::string parent_dir = ExtractParentDirectory(cue_path);
     bool has_audio = false;
-    char line_buf[1024];
+    std::string line;
 
-    while (std::fgets(line_buf, sizeof(line_buf), fp) != nullptr) {
-        std::string line(line_buf);
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-            line.pop_back();
-        }
+    while (ReadLogicalLine(fp, line)) {
         std::string upper = ToUpperAscii(line);
 
         // Parse FILE "<filename>" BINARY
@@ -397,7 +453,18 @@ bool DiskCaddyView::InspectMediaFile(const std::string& file_path, InspectedMedi
         }
 
         if (!first_bin_path.empty()) {
-            ExtractIso9660VolumeLabelFromFile(first_bin_path, out_info.volume_label);
+            // If this CUE sheet lives on a removable volume, ensure its referenced BIN is also contained
+            bool allow_bin_read = true;
+            const std::vector<UsbVolumeInfo> vols = KioskUsbBridge::GetInstance().GetActiveVolumes();
+            for (size_t vi = 0; vi < vols.size(); ++vi) {
+                if (KioskUsbBridge::PathStartsWithMount(file_path, vols[vi].mount_path)) {
+                    allow_bin_read = KioskUsbBridge::GetInstance().IsPathContainedInActiveRemovableMount(file_path);
+                    break;
+                }
+            }
+            if (allow_bin_read) {
+                ExtractIso9660VolumeLabelFromFile(first_bin_path, out_info.volume_label);
+            }
         }
         out_info.label_subtitle = out_info.has_redbook_audio
                                       ? "CD-ROM + Redbook Audio"

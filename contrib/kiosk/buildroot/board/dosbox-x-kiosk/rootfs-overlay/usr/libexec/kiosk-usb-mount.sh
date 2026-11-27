@@ -22,12 +22,31 @@ if [ -z "$SAFE_NAME" ] || [ "$SAFE_NAME" = "." ] || [ "$SAFE_NAME" = ".." ]; the
     SAFE_NAME="$DEV_BASE"
 fi
 
+is_mountpoint_occupied() {
+    target_mp="$1"
+    while read -r _src mp _rest; do
+        [ "$mp" = "$target_mp" ] && return 0
+    done < /proc/mounts 2>/dev/null
+    return 1
+}
+
+is_mounted_by_dev() {
+    target_dev="$1"
+    target_mp="$2"
+    while read -r src mp _rest; do
+        if [ "$src" = "$target_dev" ] && [ "$mp" = "$target_mp" ]; then
+            return 0
+        fi
+    done < /proc/mounts 2>/dev/null
+    return 1
+}
+
 case "$ACTION" in
     add)
         mkdir -p "$STATE_DIR"
         MOUNT_POINT="${MOUNT_BASE}/${SAFE_NAME}"
         # If another device already occupies MOUNT_POINT, disambiguate with device name
-        if [ -d "$MOUNT_POINT" ] && grep -q " ${MOUNT_POINT} " /proc/mounts 2>/dev/null; then
+        if [ -d "$MOUNT_POINT" ] && is_mountpoint_occupied "$MOUNT_POINT"; then
             MOUNT_POINT="${MOUNT_BASE}/${SAFE_NAME}_${DEV_BASE}"
         fi
         mkdir -p "$MOUNT_POINT"
@@ -71,8 +90,8 @@ case "$ACTION" in
             RECORDED_MP="$(cat "$STATE_FILE" 2>/dev/null || true)"
             rm -f "$STATE_FILE"
             if [ -n "$RECORDED_MP" ] && [ -d "$RECORDED_MP" ]; then
-                # Unmount only if this exact device still owns the recorded mountpoint
-                if grep -q "^${DEVNODE} ${RECORDED_MP} " /proc/mounts 2>/dev/null; then
+                # Unmount only if this exact device still owns the recorded mountpoint (literal comparison)
+                if is_mounted_by_dev "$DEVNODE" "$RECORDED_MP"; then
                     umount -l "$RECORDED_MP" 2>/dev/null || true
                     rmdir "$RECORDED_MP" 2>/dev/null || true
                 fi

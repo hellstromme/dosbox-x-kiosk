@@ -1141,6 +1141,7 @@ bool KioskUsbBridge::IsPathContainedInActiveRemovableMount(const std::string& fi
     resolved_file = resolved_buf;
 #endif
 
+    bool self_contained = false;
     for (size_t i = 0; i < vols.size(); ++i) {
         std::string resolved_root = vols[i].mount_path;
 #if !defined(_WIN32)
@@ -1150,10 +1151,32 @@ bool KioskUsbBridge::IsPathContainedInActiveRemovableMount(const std::string& fi
         }
 #endif
         if (PathStartsWithMount(resolved_file, resolved_root)) {
-            return true;
+            self_contained = true;
+            break;
         }
     }
-    return false;
+    if (!self_contained) return false;
+
+    // For CUE sheets, validate every referenced FILE entry (matching DOSBox-X GetRealFileName resolution)
+    if (GetFileExtensionLower(resolved_file) == ".cue") {
+        std::vector<std::string> raw_names;
+        std::vector<std::string> resolved_refs;
+        if (!DiskCaddyView::ExtractCueReferencedFiles(resolved_file, raw_names, resolved_refs)) {
+            return false;
+        }
+        for (size_t r = 0; r < raw_names.size(); ++r) {
+            // Reject any raw reference that is absolute or resolves outside an active removable mount
+            const std::string& raw = raw_names[r];
+            const std::string& candidate = KioskHost::FileExists(raw) ? raw : resolved_refs[r];
+            if (GetFileExtensionLower(candidate) == ".cue") {
+                return false; // Disallow recursive CUE-in-CUE references
+            }
+            if (!IsPathContainedInActiveRemovableMount(candidate)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 #endif // defined(C_KIOSK)

@@ -73,5 +73,9 @@ For full Linux distributions using `systemd`:
    sudo udevadm control --reload-rules
    sudo udevadm trigger --subsystem-match=block --action=add
    sudo systemctl daemon-reload
+   # Mount any already-connected USB partitions immediately (systemd only runs SYSTEMD_WANTS on new device activation)
+   for dev in $(lsblk -lnpo NAME,TRAN,FSTYPE | awk '$2=="usb" && $3!="" {sub(/^\/dev\//,"",$1); print $1}'); do
+       sudo systemctl start "kiosk-usb-mount@${dev}.service"
+   done
    sudo systemctl enable --now dosbox-kiosk.service
    ```

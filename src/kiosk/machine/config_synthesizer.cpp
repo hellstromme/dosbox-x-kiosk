@@ -82,8 +82,9 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
         if (!b.media_id.empty() && KioskDatabase::GetInstance().IsOpen()) {
             MediaPoolRecord mrec;
             if (KioskDatabase::GetInstance().GetMedia(b.media_id, mrec) && mrec.is_removable_usb) {
-                if (!KioskUsbBridge::GetInstance().IsPathContainedInActiveRemovableMount(b.resolved_file_path)) {
-                    continue; // Reject USB media path that no longer resolves inside an active removable root
+                if (!IsSafeAutoexecMountPath(b.resolved_file_path) ||
+                    !KioskUsbBridge::GetInstance().IsPathContainedInActiveRemovableMount(b.resolved_file_path)) {
+                    continue; // Reject unsafe or escaped USB media path before emitting IMGMOUNT
                 }
             }
         }
