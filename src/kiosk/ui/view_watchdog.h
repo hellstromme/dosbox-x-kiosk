@@ -2,6 +2,8 @@
 #define DOSBOX_KIOSK_VIEW_WATCHDOG_H
 
 #include "../kiosk_types.h"
+#include <atomic>
+#include <cstdint>
 #include <string>
 
 struct WatchdogTargetPreview {
@@ -18,7 +20,7 @@ public:
 
     // Resolves the default boot target once from KioskManager/KioskDatabase (zero per-frame SQLite)
     void RefreshPreview();
-    void InvalidatePreview() { m_preview_loaded = false; }
+    void InvalidatePreview() { m_preview_generation.fetch_add(1, std::memory_order_acq_rel); }
 
     // Renders the full-screen STATE_COUNTDOWN_IDLE autoboot watchdog overlay
     void Render(float remaining_sec);
@@ -28,7 +30,8 @@ public:
 private:
     ViewWatchdog() = default;
 
-    bool m_preview_loaded = false;
+    std::atomic<uint64_t> m_preview_generation{1};
+    uint64_t m_loaded_preview_generation = 0;
     WatchdogTargetPreview m_preview;
 };
 

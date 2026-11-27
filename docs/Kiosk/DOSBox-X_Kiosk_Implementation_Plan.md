@@ -311,6 +311,10 @@ flowchart TD
   - Abrupt power cut simulation during game execution and disk writing; verify OverlayFS and Ext4 recovery with zero catalog corruption.
 - **9.4 Upstream Regression Testing:**
   - Verify standard DOSBox-X builds and legacy options run unaffected when `ENABLE_KIOSK` is disabled or `--kiosk-mode` is omitted.
+- **9.5 Deferred Linux / Buildroot Bring-Up Items (from Phase 8):**
+  - Wire a verified no-X11 KMSDRM rendering path for Buildroot 2025.02 (GLES2/3 support in DOSBox-X's OpenGL/Kiosk renderer or no-X11 Desktop OpenGL provider, since Buildroot's `BR2_PACKAGE_SDL2_OPENGL` currently depends on X11).
+  - Run a full Linux/WSL2 Buildroot image build (`make BR2_EXTERNAL=.../contrib/kiosk/buildroot dosbox_x_kiosk_x86_64_defconfig`) and end-to-end UEFI/initramfs/OverlayFS boot test on target hardware or QEMU.
+  - Evaluate optional opt-in support for Windows `DRIVE_FIXED` external USB SSDs (intentionally excluded from automatic Phase 8 hotplug polling to avoid waking/indexing external backup drives; accessible via the Media Pool File Picker).
 
 ---
 

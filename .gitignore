@@ -6,6 +6,8 @@
 
 # build artifacts
 bin
+!contrib/kiosk/buildroot/board/dosbox-x-kiosk/rootfs-overlay/usr/bin/
+!contrib/kiosk/buildroot/board/dosbox-x-kiosk/rootfs-overlay/usr/bin/**
 obj
 
 # autoconfig nonsense

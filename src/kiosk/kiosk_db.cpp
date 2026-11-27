@@ -3,6 +3,8 @@
 #if defined(C_KIOSK)
 
 #include "kiosk_db.h"
+#include "kiosk_host.h"
+#include "ingest/usb_bridge.h"
 #include "ui/kiosk_ui.h"
 #include "sqlite3.h"
 #include "logging.h"
@@ -24,44 +26,6 @@
 #endif
 
 namespace {
-
-#if defined(_WIN32)
-void EnsureDirectoryRecursiveWide(const std::wstring& dir_path) {
-    if (dir_path.empty()) return;
-    std::wstring cur;
-    for (size_t i = 0; i < dir_path.size(); ++i) {
-        wchar_t c = dir_path[i];
-        cur.push_back(c);
-        if ((c == L'\\' || c == L'/') && cur.size() > 1) {
-            if (cur.size() == 3 && cur[1] == L':') continue;
-            _wmkdir(cur.c_str());
-        }
-    }
-    _wmkdir(dir_path.c_str());
-}
-
-std::string WideToUtf8(const std::wstring& ws) {
-    if (ws.empty()) return "";
-    int needed = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
-    if (needed <= 0) return "";
-    std::string out(static_cast<size_t>(needed), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), &out[0], needed, nullptr, nullptr);
-    return out;
-}
-#else
-void EnsureDirectoryRecursive(const std::string& dir_path) {
-    if (dir_path.empty()) return;
-    std::string cur;
-    for (size_t i = 0; i < dir_path.size(); ++i) {
-        char c = dir_path[i];
-        cur.push_back(c);
-        if ((c == '\\' || c == '/') && cur.size() > 1) {
-            mkdir(cur.c_str(), 0755);
-        }
-    }
-    mkdir(dir_path.c_str(), 0755);
-}
-#endif
 
 // Helper to bind nullable std::string
 void BindTextOrNull(sqlite3_stmt* stmt, int index, const std::string& val) {
@@ -112,40 +76,7 @@ std::string KioskDatabase::GetActiveDatabasePath() const {
 }
 
 std::string KioskDatabase::GetDefaultDatabasePath() {
-#if defined(_WIN32)
-    const wchar_t* local_app = _wgetenv(L"LOCALAPPDATA");
-    if (local_app && local_app[0] != L'\0') {
-        std::wstring dir = std::wstring(local_app) + L"\\DOSBox-Kiosk";
-        EnsureDirectoryRecursiveWide(dir);
-        std::string utf8 = WideToUtf8(dir + L"\\catalog.db");
-        if (!utf8.empty()) return utf8;
-    }
-    const wchar_t* app_data = _wgetenv(L"APPDATA");
-    if (app_data && app_data[0] != L'\0') {
-        std::wstring dir = std::wstring(app_data) + L"\\DOSBox-Kiosk";
-        EnsureDirectoryRecursiveWide(dir);
-        std::string utf8 = WideToUtf8(dir + L"\\catalog.db");
-        if (!utf8.empty()) return utf8;
-    }
-    return ".\\dosbox-kiosk-catalog.db";
-#else
-    if (access("/var/lib/dosbox-kiosk", W_OK) == 0) {
-        return "/var/lib/dosbox-kiosk/catalog.db";
-    }
-    const char* xdg_data = std::getenv("XDG_DATA_HOME");
-    if (xdg_data && xdg_data[0] != '\0') {
-        std::string dir = std::string(xdg_data) + "/dosbox-kiosk";
-        EnsureDirectoryRecursive(dir);
-        return dir + "/catalog.db";
-    }
-    const char* home = std::getenv("HOME");
-    if (home && home[0] != '\0') {
-        std::string dir = std::string(home) + "/.local/share/dosbox-kiosk";
-        EnsureDirectoryRecursive(dir);
-        return dir + "/catalog.db";
-    }
-    return "./dosbox-kiosk-catalog.db";
-#endif
+    return KioskHost::GetDefaultDatabasePath();
 }
 
 bool KioskDatabase::Open(const std::string& db_path) {
@@ -1189,7 +1120,7 @@ std::vector<MediaPoolRecord> KioskDatabase::GetRemovableUsbMedia() {
 
     const char* sql = "SELECT id, file_path, file_sha1, media_type, physical_style, "
                       "volume_label, label_title, label_subtitle, label_font_style, "
-                      "has_redbook_audio, is_write_protected, is_removable_usb, created_at "
+                      "has_redbook_audio, is_write_protected, is_removable_usb, created_at, media_group "
                       "FROM media_pool WHERE is_removable_usb = 1 ORDER BY label_title ASC;";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return list;
@@ -1209,10 +1140,139 @@ std::vector<MediaPoolRecord> KioskDatabase::GetRemovableUsbMedia() {
         m.is_write_protected = sqlite3_column_int(stmt, 10) != 0;
         m.is_removable_usb = sqlite3_column_int(stmt, 11) != 0;
         m.created_at = ColumnTextSafe(stmt, 12);
+        m.media_group = ColumnTextSafe(stmt, 13);
         list.push_back(m);
     }
     sqlite3_finalize(stmt);
     return list;
+}
+
+int KioskDatabase::DeleteRemovableUsbMediaByPrefix(const std::string& mount_prefix) {
+    int deleted = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_db || mount_prefix.empty()) return 0;
+
+        std::vector<std::string> ids_to_delete;
+        const char* sel_sql = "SELECT id, file_path FROM media_pool WHERE is_removable_usb = 1;";
+        sqlite3_stmt* sel = nullptr;
+        if (sqlite3_prepare_v2(m_db, sel_sql, -1, &sel, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(sel) == SQLITE_ROW) {
+                const std::string id = ColumnTextSafe(sel, 0);
+                const std::string fp = ColumnTextSafe(sel, 1);
+                if (KioskUsbBridge::PathStartsWithMount(fp, mount_prefix)) {
+                    ids_to_delete.push_back(id);
+                }
+            }
+            sqlite3_finalize(sel);
+        }
+
+        if (!ids_to_delete.empty()) {
+            if (!ExecuteSqlInternal("BEGIN IMMEDIATE;")) {
+                return 0;
+            }
+            bool ok = true;
+            int pending_deleted = 0;
+            const char* del_sql = "DELETE FROM media_pool WHERE id = ?;";
+            sqlite3_stmt* del = nullptr;
+            if (sqlite3_prepare_v2(m_db, del_sql, -1, &del, nullptr) != SQLITE_OK) {
+                ok = false;
+            } else {
+                for (size_t i = 0; i < ids_to_delete.size(); ++i) {
+                    sqlite3_reset(del);
+                    sqlite3_bind_text(del, 1, ids_to_delete[i].c_str(), -1, SQLITE_TRANSIENT);
+                    if (sqlite3_step(del) == SQLITE_DONE) {
+                        ++pending_deleted;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                sqlite3_finalize(del);
+            }
+            if (ok && ExecuteSqlInternal("COMMIT;")) {
+                deleted = pending_deleted;
+            } else {
+                ExecuteSqlInternal("ROLLBACK;");
+                deleted = 0;
+            }
+        }
+    }
+    if (deleted > 0) {
+        KioskUI::GetInstance().InvalidateCatalogCache();
+    }
+    return deleted;
+}
+
+int KioskDatabase::PurgeStaleRemovableUsbMedia() {
+    // 1. Snapshot removable USB rows under mutex
+    std::vector<std::pair<std::string, std::string> > candidates;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_db) return 0;
+
+        const char* sel_sql = "SELECT id, file_path FROM media_pool WHERE is_removable_usb = 1;";
+        sqlite3_stmt* sel = nullptr;
+        if (sqlite3_prepare_v2(m_db, sel_sql, -1, &sel, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(sel) == SQLITE_ROW) {
+                candidates.push_back(std::make_pair(ColumnTextSafe(sel, 0), ColumnTextSafe(sel, 1)));
+            }
+            sqlite3_finalize(sel);
+        }
+    }
+
+    if (candidates.empty()) return 0;
+
+    // 2. Check UTF-8-safe confirmed-missing status outside DB mutex (preserves rows on EACCES)
+    std::vector<std::pair<std::string, std::string> > stale_entries;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (KioskHost::IsFileConfirmedMissing(candidates[i].second)) {
+            stale_entries.push_back(candidates[i]);
+        }
+    }
+
+    if (stale_entries.empty()) return 0;
+
+    // 3. Batch-delete stale rows in a single transaction, revalidating is_removable_usb and file_path
+    int deleted = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_db) return 0;
+
+        if (!ExecuteSqlInternal("BEGIN IMMEDIATE;")) {
+            return 0;
+        }
+        bool ok = true;
+        int pending_deleted = 0;
+        const char* del_sql = "DELETE FROM media_pool WHERE id = ? AND is_removable_usb = 1 AND file_path = ?;";
+        sqlite3_stmt* del = nullptr;
+        if (sqlite3_prepare_v2(m_db, del_sql, -1, &del, nullptr) != SQLITE_OK) {
+            ok = false;
+        } else {
+            for (size_t i = 0; i < stale_entries.size(); ++i) {
+                sqlite3_reset(del);
+                sqlite3_bind_text(del, 1, stale_entries[i].first.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(del, 2, stale_entries[i].second.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(del) == SQLITE_DONE) {
+                    pending_deleted += sqlite3_changes(m_db);
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            sqlite3_finalize(del);
+        }
+        if (ok && ExecuteSqlInternal("COMMIT;")) {
+            deleted = pending_deleted;
+        } else {
+            ExecuteSqlInternal("ROLLBACK;");
+            deleted = 0;
+        }
+    }
+    if (deleted > 0) {
+        KioskUI::GetInstance().InvalidateCatalogCache();
+    }
+    return deleted;
 }
 
 // ----------------------------------------------------------------------------

@@ -76,6 +76,7 @@ private:
     std::vector<RuntimeDriveSlotStatus> m_drive_statuses;
     std::vector<RuntimeCaddyEntry> m_session_caddy;
     std::vector<MediaPoolRecord> m_global_pool_cache;
+    uint64_t m_usb_change_revision = 0;
     bool m_show_global_pool_drawer = false;
     int m_selected_caddy_index = 0;
     float m_cd_volume_percent = 100.0f;

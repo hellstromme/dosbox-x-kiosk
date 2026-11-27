@@ -1,0 +1,3 @@
+
+# DOSBox-X Kiosk Linux appliance scripts & Buildroot configs must always use LF
+contrib/kiosk/** text eol=lf

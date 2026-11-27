@@ -53,6 +53,7 @@ public:
     static bool ExtractFatVolumeLabelFromBytes(const uint8_t* data, size_t size, std::string& out_label);
     static bool ExtractIso9660VolumeLabelFromFile(const std::string& file_path, std::string& out_label);
     static bool DetectCueSheetRedbookAudio(const std::string& cue_path, std::string& out_first_bin_path);
+    static bool ExtractCueReferencedFiles(const std::string& cue_path, std::vector<std::string>& out_raw_names, std::vector<std::string>& out_resolved_paths);
     static std::string HumanReadableMediaTypeBadge(const std::string& media_type);
     static std::string DeriveDefaultMediaGroup(const std::string& file_path);
     static std::string FormatMediaDisplayName(const MediaPoolRecord& media);

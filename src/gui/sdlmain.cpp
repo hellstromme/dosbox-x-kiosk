@@ -138,6 +138,8 @@ char* revert_escape_newlines(const char* aMessage);
 #if defined(C_KIOSK)
 #include "kiosk/kiosk_main.h"
 #include "kiosk/kiosk_db.h"
+#include "kiosk/kiosk_host.h"
+#include "kiosk/ingest/usb_bridge.h"
 #include "kiosk/ui/kiosk_ui.h"
 #include "kiosk/ui/runtime_overlay.h"
 #endif
@@ -1665,6 +1667,11 @@ void PauseDOSBoxLoop(Bitu /*unused*/) {
             break;
         }
 
+#if defined(C_KIOSK)
+        if (KioskManager::GetInstance().IsKioskModeActive()) {
+            KioskHost::PingSystemdWatchdog();
+        }
+#endif
 #if C_EMSCRIPTEN
         emscripten_sleep(0);
         SDL_PollEvent(&event);
@@ -1673,6 +1680,14 @@ void PauseDOSBoxLoop(Bitu /*unused*/) {
         SDL_Delay(100);
         OUTPUT_GAMELINK_Transfer();
         SDL_PollEvent(&event);
+#elif defined(C_KIOSK) && defined(C_SDL2)
+        if (KioskManager::GetInstance().IsKioskModeActive()) {
+            if (!SDL_WaitEventTimeout(&event, 1000)) {
+                continue;
+            }
+        } else {
+            SDL_WaitEvent(&event);    // since we're not polling, cpu usage drops to 0.
+        }
 #else
         SDL_WaitEvent(&event);    // since we're not polling, cpu usage drops to 0.
 #endif
@@ -5960,6 +5975,9 @@ static void Kiosk_RunRuntimeOverlayLoop(void) {
             KioskUI::GetInstance().ProcessEvent(&overlay_event);
         }
 
+        KioskUsbBridge::GetInstance().PollEventsNonBlocking();
+        KioskHost::PingSystemdWatchdog();
+
 #if C_OPENGL
         if (OpenGL_using() && sdl.window != NULL) {
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -6008,6 +6026,12 @@ static void Kiosk_RunRuntimeOverlayLoop(void) {
 
 void GFX_Events() {
     CheckMapperKeyboardLayout();
+#if defined(C_KIOSK)
+    if (KioskManager::GetInstance().IsKioskModeActive()) {
+        KioskHost::PingSystemdWatchdog();
+        KioskUsbBridge::GetInstance().PollEventsNonBlocking();
+    }
+#endif
 #if defined(C_SDL2) /* SDL 2.x---------------------------------- */
     //Don't poll too often. This can be heavy on the OS, especially Macs.
     //In idle mode 3000-4000 polls are done per second without this check.

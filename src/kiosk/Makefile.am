@@ -3,6 +3,7 @@ AM_CPPFLAGS = -I$(top_srcdir)/include -I$(top_srcdir)/src/kiosk -I$(top_srcdir)/
 noinst_LIBRARIES = libkiosk.a
 libkiosk_a_SOURCES = kiosk_main.cpp kiosk_main.h kiosk_types.h \
                      kiosk_db.cpp kiosk_db.h \
+                     kiosk_host.cpp kiosk_host.h \
                      ui/kiosk_ui.cpp ui/kiosk_ui.h \
                      ui/input_router.cpp ui/input_router.h \
                      ui/view_watchdog.cpp ui/view_watchdog.h \
@@ -16,4 +17,5 @@ libkiosk_a_SOURCES = kiosk_main.cpp kiosk_main.h kiosk_types.h \
                      ingest/signature_matcher.cpp ingest/signature_matcher.h \
                      ingest/image_crawler.cpp ingest/image_crawler.h \
                      ingest/conf_translator.cpp ingest/conf_translator.h \
-                     ingest/archive_importer.cpp ingest/archive_importer.h
+                     ingest/archive_importer.cpp ingest/archive_importer.h \
+                     ingest/usb_bridge.cpp ingest/usb_bridge.h

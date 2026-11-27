@@ -10,6 +10,7 @@
 #include "../machine/archetypes.h"
 #include "../ingest/image_crawler.h"
 #include "../ingest/archive_importer.h"
+#include "../ingest/usb_bridge.h"
 #include "logging.h"
 #include "imgui.h"
 
@@ -1052,6 +1053,56 @@ void ViewCarousel::RenderMediaPoolTab() {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
+
+    // Removable USB / Optical Drives strip (zero per-frame SQLite; cached by KioskUsbBridge)
+    const std::vector<UsbVolumeInfo> usb_volumes = KioskUsbBridge::GetInstance().GetActiveVolumes();
+    const std::vector<UsbArchiveCandidate> usb_archives = KioskUsbBridge::GetInstance().GetDiscoveredArchives();
+    if (!usb_volumes.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.14f, 0.18f, 0.90f));
+        const float strip_h = (std::min)(160.0f, 34.0f * static_cast<float>(usb_volumes.size()) + 38.0f);
+        ImGui::BeginChild("##UsbVolumesStrip", ImVec2(0.0f, strip_h), true);
+        ImGui::TextColored(ImVec4(0.40f, 0.90f, 0.95f, 1.0f), "Removable USB / Optical Drives (%u connected)",
+                           static_cast<unsigned int>(usb_volumes.size()));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Rescan Drives##UsbRescan")) {
+            KioskUsbBridge::GetInstance().RescanNow();
+            ui.InvalidateCatalogCache();
+        }
+        if (!usb_archives.empty()) {
+            ImGui::SameLine();
+            char imp_lbl[96];
+            snprintf(imp_lbl, sizeof(imp_lbl), "Import USB Archive (%u)##UsbImportBtn",
+                     static_cast<unsigned int>(usb_archives.size()));
+            if (ImGui::SmallButton(imp_lbl)) {
+                snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", usb_archives[0].file_path.c_str());
+                m_show_file_picker = false;
+                m_show_import_modal = true;
+                m_import_item_type = "GAME";
+                m_import_status_msg.clear();
+            }
+        }
+        for (size_t vi = 0; vi < usb_volumes.size(); ++vi) {
+            const UsbVolumeInfo& v = usb_volumes[vi];
+            ImGui::PushID(static_cast<int>(vi));
+            ImGui::Text("  [%s] %s (%s) — %d image(s), %d archive(s)",
+                        v.is_optical ? "CD/DVD" : "USB",
+                        v.volume_label.c_str(),
+                        v.mount_path.c_str(),
+                        v.media_count,
+                        v.archive_count);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Safe Eject##UsbEject")) {
+                if (!KioskUsbBridge::GetInstance().SafeUnmountDevice(v.mount_path)) {
+                    ui.ShowToast("Disconnected '" + v.volume_label + "' from Kiosk (OS dismount may require manual eject).", 4.0f);
+                }
+                ui.InvalidateCatalogCache();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
 
     if (media.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);

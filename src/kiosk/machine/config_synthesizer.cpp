@@ -4,6 +4,10 @@
 
 #include "config_synthesizer.h"
 #include "archetypes.h"
+#include "../kiosk_db.h"
+#include "../kiosk_host.h"
+#include "../kiosk_main.h"
+#include "../ingest/usb_bridge.h"
 #include <fstream>
 #include <sstream>
 #include <map>
@@ -15,7 +19,20 @@ ConfigSynthesizer& ConfigSynthesizer::GetInstance() {
     return instance;
 }
 
+bool ConfigSynthesizer::IsSafeAutoexecMountPath(const std::string& path) {
+    if (path.empty()) return false;
+    for (size_t i = 0; i < path.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(path[i]);
+        // Reject control chars (including \r, \n, 0x1A DOS EOF), quotes, and '%' (expanded by BatchFile::ReadLine)
+        if (ch < 0x20u || ch == '"' || ch == '%') {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::string ConfigSynthesizer::GetDefaultBaseConfig() const {
+    const std::string mapper_path = KioskHost::GetDefaultMapperPath();
     return
         "# --- DOSBox-X Kiosk Appliance Base Configuration ---\n"
         "[sdl]\n"
@@ -26,7 +43,7 @@ std::string ConfigSynthesizer::GetDefaultBaseConfig() const {
         "autolock            = true\n"
         "sensitivity         = 100\n"
         "waitonerror         = false\n"
-        "mapperfile          = /var/lib/dosbox-kiosk/config/kiosk_mapper.map\n"
+        "mapperfile          = " + mapper_path + "\n"
         "\n"
         "[dosbox]\n"
         "title               = DOSBox-X Kiosk Appliance\n"
@@ -59,9 +76,18 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
     ss << "[autoexec]\n"
        << "@echo off\n";
 
-    // Group caddy bindings by target drive ('A', 'B', 'D', 'E')
+    // Group caddy bindings by target drive ('A', 'B', 'D', 'E'), verifying USB path containment
     std::map<std::string, std::vector<CaddyBindingRecord>> drive_bindings;
     for (const auto& b : caddy) {
+        if (!b.media_id.empty() && KioskDatabase::GetInstance().IsOpen()) {
+            MediaPoolRecord mrec;
+            if (KioskDatabase::GetInstance().GetMedia(b.media_id, mrec) && mrec.is_removable_usb) {
+                if (!IsSafeAutoexecMountPath(b.resolved_file_path) ||
+                    !KioskUsbBridge::GetInstance().IsPathContainedInActiveRemovableMount(b.resolved_file_path)) {
+                    continue; // Reject unsafe or escaped USB media path before emitting IMGMOUNT
+                }
+            }
+        }
         drive_bindings[b.target_drive].push_back(b);
     }
     for (auto& pair : drive_bindings) {
@@ -214,6 +240,12 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
                 ss << " \"" << b.resolved_file_path << "\"";
             }
             ss << " -t iso\n";
+        } else if (KioskManager::GetInstance().GetConfig().auto_mount_usb_docs) {
+            const std::string usb_docs = KioskUsbBridge::GetInstance().GetPreferredUsbDocumentsDir();
+            if (IsSafeAutoexecMountPath(usb_docs)) {
+                ss << "# Auto-mount removable USB DOCUMENTS folder as E:\n"
+                   << "MOUNT E \"" << usb_docs << "\"\n";
+            }
         }
 
         // 4. Dispatch executable

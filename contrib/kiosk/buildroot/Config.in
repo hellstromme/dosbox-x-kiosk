@@ -1,0 +1,1 @@
+source "$BR2_EXTERNAL_DOSBOX_X_KIOSK_PATH/package/dosbox-x-kiosk/Config.in"

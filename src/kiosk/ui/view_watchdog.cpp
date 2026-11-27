@@ -32,6 +32,7 @@ ViewWatchdog& ViewWatchdog::GetInstance() {
 }
 
 void ViewWatchdog::RefreshPreview() {
+    const uint64_t target_gen = m_preview_generation.load(std::memory_order_acquire);
     KioskManager& mgr = KioskManager::GetInstance();
     KioskDatabase& db = KioskDatabase::GetInstance();
     const KioskConfigRecord cfg = mgr.GetConfig();
@@ -57,7 +58,7 @@ void ViewWatchdog::RefreshPreview() {
                 m_preview.archetype_badge = "386DX DEFAULT";
                 m_preview.boot_mode_badge = "INTEGRATED DOS";
             }
-            m_preview_loaded = true;
+            m_loaded_preview_generation = target_gen;
             return;
         }
     }
@@ -71,7 +72,7 @@ void ViewWatchdog::RefreshPreview() {
             m_preview.boot_mode_badge = (mach.boot_mode == "REAL_HDD_BOOT")
                                             ? "REAL HDD BOOT"
                                             : "INTEGRATED DOS";
-            m_preview_loaded = true;
+            m_loaded_preview_generation = target_gen;
             return;
         }
     }
@@ -80,11 +81,11 @@ void ViewWatchdog::RefreshPreview() {
     m_preview.subtitle = "Integrated DOS Shell with C: Drive";
     m_preview.archetype_badge = "386DX-33 SVGA";
     m_preview.boot_mode_badge = "INTEGRATED DOS";
-    m_preview_loaded = true;
+    m_loaded_preview_generation = target_gen;
 }
 
 void ViewWatchdog::Render(float remaining_sec) {
-    if (!m_preview_loaded) {
+    if (m_loaded_preview_generation != m_preview_generation.load(std::memory_order_acquire)) {
         RefreshPreview();
     }
 

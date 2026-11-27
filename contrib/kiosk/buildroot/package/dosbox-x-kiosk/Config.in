@@ -1,0 +1,22 @@
+config BR2_PACKAGE_DOSBOX_X_KIOSK
+	bool "dosbox-x-kiosk"
+	depends on BR2_INSTALL_LIBSTDCPP
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	depends on BR2_USE_WCHAR
+	depends on BR2_PACKAGE_HAS_LIBEGL
+	depends on BR2_PACKAGE_HAS_LIBGLES
+	depends on BR2_PACKAGE_HAS_LIBGBM
+	depends on BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_EUDEV
+	select BR2_PACKAGE_SDL2
+	select BR2_PACKAGE_SDL2_KMSDRM
+	select BR2_PACKAGE_SDL2_OPENGLES
+	select BR2_PACKAGE_ALSA_LIB
+	select BR2_PACKAGE_FLUIDSYNTH
+	select BR2_PACKAGE_ZLIB
+	select BR2_PACKAGE_LIBPNG
+	help
+	  DOSBox-X Kiosk Edition — turn-key retro computing appliance with
+	  in-process Dear ImGui Big-Picture shell, skeuomorphic F12+D disk
+	  caddy, ephemeral FAT12 boot injector, and direct SDL2 KMSDRM output.
+
+	  https://github.com/hellstromme/dosbox-x-kiosk

@@ -1,0 +1,10 @@
+[Unit]
+Description=DOSBox-X Kiosk USB/Optical Mount Helper for /dev/%i
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'L="$$(blkid -o value -s LABEL /dev/%i 2>/dev/null || true)"; U="$$(blkid -o value -s UUID /dev/%i 2>/dev/null || true)"; T="$$(blkid -o value -s TYPE /dev/%i 2>/dev/null || true)"; exec /usr/libexec/kiosk-usb-mount.sh add "/dev/%i" "$$L" "$$U" "$$T"'
+ExecStop=/usr/libexec/kiosk-usb-mount.sh remove /dev/%i

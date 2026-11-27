@@ -34,6 +34,9 @@ public:
     // Returns standard kiosk base configuration
     std::string GetDefaultBaseConfig() const;
 
+    // Validates that a host path can be safely emitted as a single quoted [autoexec] MOUNT argument
+    static bool IsSafeAutoexecMountPath(const std::string& path);
+
 private:
     ConfigSynthesizer() = default;
 };

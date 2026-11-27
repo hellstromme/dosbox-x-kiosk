@@ -1,0 +1,19 @@
+# /etc/inittab — DOSBox-X Kiosk Edition (Buildroot BusyBox Init)
+::sysinit:/bin/mount -t proc proc /proc
+::sysinit:/bin/mount -t sysfs sysfs /sys
+::sysinit:/bin/mount -t devtmpfs devtmpfs /dev
+::sysinit:/bin/mkdir -p /dev/pts /dev/shm /run/media/kiosk /run/user/1000/kiosk
+::sysinit:/bin/mount -a
+::sysinit:/sbin/udevd --daemon
+::sysinit:/sbin/udevadm trigger --action=add
+::sysinit:/etc/init.d/rcS
+
+# Launch DOSBox-X Kiosk directly on tty1 with automatic respawn
+tty1::respawn:/usr/bin/kiosk-session-wrapper.sh
+
+# Emergency debug shell on tty2 (Ctrl+Alt+F2)
+tty2::askfirst:-/bin/sh
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/etc/init.d/rcK
+::shutdown:/bin/umount -a -r

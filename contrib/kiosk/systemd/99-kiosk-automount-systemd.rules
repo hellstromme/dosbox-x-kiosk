@@ -1,0 +1,5 @@
+# DOSBox-X Kiosk USB & Optical Automount Rule for systemd hosts
+# Dispatches mount operations to kiosk-usb-mount@%k.service outside systemd-udevd's mount sandbox.
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}="kiosk-usb-mount@%k.service"
+ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA}=="1", TAG+="systemd", ENV{SYSTEMD_WANTS}="kiosk-usb-mount@%k.service"
+ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA}!="1", RUN+="/usr/bin/systemctl stop --no-block kiosk-usb-mount@%k.service"

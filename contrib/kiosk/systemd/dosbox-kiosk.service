@@ -1,0 +1,43 @@
+# DOSBox-X Kiosk Appliance systemd Service Unit
+# Default uses Type=simple so the unit starts cleanly whether or not libsystemd
+# (HAVE_LIBSYSTEMD=1) was linked at build time.
+# If built with libsystemd-dev (HAVE_LIBSYSTEMD=1), you may switch Type=simple
+# to Type=notify and uncomment WatchdogSec=30 below for sd_notify supervision.
+
+[Unit]
+Description=DOSBox-X Kiosk Appliance Service
+After=systemd-user-sessions.service systemd-logind.service sound.target
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+# Type=notify
+# WatchdogSec=30
+User=kiosk
+Group=kiosk
+# Universal DRM/KMS, ALSA, and evdev groups (add distro-specific optical/storage or cdrom/plugdev via drop-in if needed)
+SupplementaryGroups=video audio input render
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+RuntimeDirectory=dosbox-kiosk
+RuntimeDirectoryMode=0700
+StateDirectory=dosbox-kiosk
+StateDirectoryMode=0755
+Environment="SDL_VIDEODRIVER=kmsdrm"
+Environment="SDL_AUDIODRIVER=alsa"
+Environment="SDL_RENDER_VSYNC=1"
+Environment="XDG_RUNTIME_DIR=/run/dosbox-kiosk"
+Environment="MESA_SHADER_CACHE_DIR=/var/lib/dosbox-kiosk/cache/mesa"
+Environment="DOSBOX_KIOSK_APPLIANCE=1"
+ExecStartPre=+/usr/bin/mkdir -p /run/media/kiosk
+ExecStartPre=/usr/bin/mkdir -p /run/dosbox-kiosk/kiosk /var/lib/dosbox-kiosk/cache/mesa
+ExecStartPre=/usr/bin/rm -f /run/dosbox-kiosk/kiosk/kiosk_dispatch.img
+ExecStart=/usr/bin/dosbox-x -kiosk-mode -kiosk-db /var/lib/dosbox-kiosk/catalog.db -kiosk-conf /var/lib/dosbox-kiosk/config/kiosk_base.conf
+Restart=always
+RestartSec=500ms
+
+[Install]
+WantedBy=multi-user.target

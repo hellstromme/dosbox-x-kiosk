@@ -3,6 +3,7 @@
 #if defined(C_KIOSK)
 
 #include "view_disk_caddy.h"
+#include "../ingest/usb_bridge.h"
 #include "imgui.h"
 #include <cstdio>
 #include <cstring>
@@ -12,7 +13,39 @@
 #include <fstream>
 #include <sstream>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace {
+
+// Opens a path read-only without blocking on FIFOs/special files on POSIX.
+FILE* OpenRegularFileReadOnly(const std::string& path) {
+    if (path.empty()) return nullptr;
+#if !defined(_WIN32)
+    int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+    if (fd < 0) return nullptr;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return nullptr;
+    }
+    int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0) {
+        (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    }
+    FILE* fp = fdopen(fd, "rb");
+    if (!fp) {
+        close(fd);
+        return nullptr;
+    }
+    return fp;
+#else
+    return std::fopen(path.c_str(), "rb");
+#endif
+}
 
 std::string ToUpperAscii(const std::string& s) {
     std::string out = s;
@@ -238,7 +271,7 @@ bool DiskCaddyView::ExtractIso9660VolumeLabelFromFile(const std::string& file_pa
         return false;
     }
 
-    FILE* fp = std::fopen(file_path.c_str(), "rb");
+    FILE* fp = OpenRegularFileReadOnly(file_path);
     if (!fp) {
         return false;
     }
@@ -270,14 +303,73 @@ bool DiskCaddyView::ExtractIso9660VolumeLabelFromFile(const std::string& file_pa
     return false;
 }
 
+namespace {
+
+bool ReadLogicalLine(FILE* fp, std::string& out_line) {
+    out_line.clear();
+    char buf[1024];
+    bool got_any = false;
+    while (std::fgets(buf, sizeof(buf), fp) != nullptr) {
+        got_any = true;
+        out_line.append(buf);
+        if (!out_line.empty() && out_line.back() == '\n') {
+            break;
+        }
+    }
+    while (!out_line.empty() && (out_line.back() == '\n' || out_line.back() == '\r')) {
+        out_line.pop_back();
+    }
+    return got_any;
+}
+
+} // anonymous namespace
+
+bool DiskCaddyView::ExtractCueReferencedFiles(
+    const std::string& cue_path,
+    std::vector<std::string>& out_raw_names,
+    std::vector<std::string>& out_resolved_paths
+) {
+    out_raw_names.clear();
+    out_resolved_paths.clear();
+    if (cue_path.empty()) return false;
+
+    FILE* fp = OpenRegularFileReadOnly(cue_path);
+    if (!fp) return false;
+
+    const std::string parent_dir = ExtractParentDirectory(cue_path);
+    std::string line;
+    while (ReadLogicalLine(fp, line)) {
+        std::string upper = ToUpperAscii(line);
+        size_t file_pos = upper.find("FILE");
+        if (file_pos != std::string::npos &&
+            (file_pos == 0 || std::isspace(static_cast<unsigned char>(upper[file_pos - 1])))) {
+            size_t q1 = line.find('"', file_pos + 4);
+            if (q1 != std::string::npos) {
+                size_t q2 = line.find('"', q1 + 1);
+                if (q2 != std::string::npos && q2 > q1 + 1) {
+                    std::string raw = line.substr(q1 + 1, q2 - q1 - 1);
+                    out_raw_names.push_back(raw);
+                    if (raw.find(':') != std::string::npos || (!raw.empty() && (raw[0] == '/' || raw[0] == '\\'))) {
+                        out_resolved_paths.push_back(raw);
+                    } else {
+                        out_resolved_paths.push_back(parent_dir + raw);
+                    }
+                }
+            }
+        }
+    }
+    std::fclose(fp);
+    return true;
+}
+
 bool DiskCaddyView::DetectCueSheetRedbookAudio(const std::string& cue_path, std::string& out_first_bin_path) {
     out_first_bin_path.clear();
     if (cue_path.empty()) {
         return false;
     }
 
-    std::ifstream ifs(cue_path.c_str());
-    if (!ifs.is_open()) {
+    FILE* fp = OpenRegularFileReadOnly(cue_path);
+    if (!fp) {
         return false;
     }
 
@@ -285,7 +377,7 @@ bool DiskCaddyView::DetectCueSheetRedbookAudio(const std::string& cue_path, std:
     bool has_audio = false;
     std::string line;
 
-    while (std::getline(ifs, line)) {
+    while (ReadLogicalLine(fp, line)) {
         std::string upper = ToUpperAscii(line);
 
         // Parse FILE "<filename>" BINARY
@@ -318,6 +410,7 @@ bool DiskCaddyView::DetectCueSheetRedbookAudio(const std::string& cue_path, std:
         }
     }
 
+    std::fclose(fp);
     return has_audio;
 }
 
@@ -348,7 +441,7 @@ bool DiskCaddyView::InspectMediaFile(const std::string& file_path, InspectedMedi
         std::string first_bin_path;
         out_info.has_redbook_audio = DetectCueSheetRedbookAudio(file_path, first_bin_path);
 
-        FILE* fp = std::fopen(file_path.c_str(), "rb");
+        FILE* fp = OpenRegularFileReadOnly(file_path);
         if (!fp) {
             return false;
         }
@@ -360,7 +453,18 @@ bool DiskCaddyView::InspectMediaFile(const std::string& file_path, InspectedMedi
         }
 
         if (!first_bin_path.empty()) {
-            ExtractIso9660VolumeLabelFromFile(first_bin_path, out_info.volume_label);
+            // If this CUE sheet lives on a removable volume, ensure its referenced BIN is also contained
+            bool allow_bin_read = true;
+            const std::vector<UsbVolumeInfo> vols = KioskUsbBridge::GetInstance().GetActiveVolumes();
+            for (size_t vi = 0; vi < vols.size(); ++vi) {
+                if (KioskUsbBridge::PathStartsWithMount(file_path, vols[vi].mount_path)) {
+                    allow_bin_read = KioskUsbBridge::GetInstance().IsPathContainedInActiveRemovableMount(file_path);
+                    break;
+                }
+            }
+            if (allow_bin_read) {
+                ExtractIso9660VolumeLabelFromFile(first_bin_path, out_info.volume_label);
+            }
         }
         out_info.label_subtitle = out_info.has_redbook_audio
                                       ? "CD-ROM + Redbook Audio"
@@ -371,7 +475,7 @@ bool DiskCaddyView::InspectMediaFile(const std::string& file_path, InspectedMedi
         return true;
     }
 
-    FILE* fp = std::fopen(file_path.c_str(), "rb");
+    FILE* fp = OpenRegularFileReadOnly(file_path);
     if (!fp) {
         return false;
     }
