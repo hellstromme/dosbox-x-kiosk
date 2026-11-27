@@ -1675,6 +1675,15 @@ void PauseDOSBoxLoop(Bitu /*unused*/) {
         SDL_Delay(100);
         OUTPUT_GAMELINK_Transfer();
         SDL_PollEvent(&event);
+#elif defined(C_KIOSK) && defined(C_SDL2)
+        if (KioskManager::GetInstance().IsKioskModeActive()) {
+            KioskHost::PingSystemdWatchdog();
+            if (!SDL_WaitEventTimeout(&event, 1000)) {
+                continue;
+            }
+        } else {
+            SDL_WaitEvent(&event);    // since we're not polling, cpu usage drops to 0.
+        }
 #else
         SDL_WaitEvent(&event);    // since we're not polling, cpu usage drops to 0.
 #endif

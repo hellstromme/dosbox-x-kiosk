@@ -659,6 +659,9 @@ case "$host" in
          AC_DEFINE(C_OPENGL,1)
        else
          AC_MSG_RESULT(no)
+         if test "x$enable_kiosk" = "xyes"; then
+           AC_MSG_ERROR([--enable-kiosk requires OpenGL (C_OPENGL). Install OpenGL development headers/libraries.])
+         fi
        fi
        ;;
 esac

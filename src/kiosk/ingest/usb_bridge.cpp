@@ -110,8 +110,9 @@ struct DirEntryItem {
     bool is_dir = false;
 };
 
-std::vector<DirEntryItem> ListDirectoryEntries(const std::string& dir_path) {
+std::vector<DirEntryItem> ListDirectoryEntries(const std::string& dir_path, bool* out_ok = nullptr) {
     std::vector<DirEntryItem> entries;
+    if (out_ok) *out_ok = false;
 #if defined(_WIN32)
     ScopedWinErrorMode guard;
     std::string pattern = KioskHost::JoinPath(dir_path, "*");
@@ -120,7 +121,11 @@ std::vector<DirEntryItem> ListDirectoryEntries(const std::string& dir_path) {
 
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(wpattern.c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return entries;
+    if (h == INVALID_HANDLE_VALUE) {
+        if (GetLastError() == ERROR_FILE_NOT_FOUND && out_ok) *out_ok = true;
+        return entries;
+    }
+    if (out_ok) *out_ok = true;
     do {
         if (std::wcscmp(fd.cFileName, L".") == 0 || std::wcscmp(fd.cFileName, L"..") == 0) {
             continue;
@@ -143,6 +148,7 @@ std::vector<DirEntryItem> ListDirectoryEntries(const std::string& dir_path) {
 #else
     DIR* d = opendir(dir_path.c_str());
     if (!d) return entries;
+    if (out_ok) *out_ok = true;
     struct dirent* ent = nullptr;
     while ((ent = readdir(d)) != nullptr) {
         if (std::strcmp(ent->d_name, ".") == 0 || std::strcmp(ent->d_name, "..") == 0) {
@@ -187,6 +193,7 @@ KioskUsbBridge::KioskUsbBridge()
       m_last_poll_ticks(0),
       m_inotify_fd(-1),
       m_last_drive_mask(0) {
+    std::memset(m_drive_serials, 0, sizeof(m_drive_serials));
 }
 
 KioskUsbBridge::~KioskUsbBridge() {
@@ -202,10 +209,12 @@ std::string KioskUsbBridge::NormalizeMountPath(const std::string& path) {
     std::string out = path;
     while (out.size() > 1) {
         const char back = out[out.size() - 1];
-        if (back != '/' && back != '\\') break;
 #if defined(_WIN32)
+        if (back != '/' && back != '\\') break;
         // Preserve Windows drive root trailing slash ("E:\")
         if (out.size() == 3 && out[1] == ':') break;
+#else
+        if (back != '/') break;
 #endif
         out.pop_back();
     }
@@ -220,13 +229,13 @@ bool KioskUsbBridge::PathStartsWithMount(const std::string& file_path, const std
 
     std::string lhs = file_path;
     std::string rhs = norm_mount;
+#if defined(_WIN32)
     for (size_t i = 0; i < lhs.size(); ++i) {
         if (lhs[i] == '\\') lhs[i] = '/';
     }
     for (size_t i = 0; i < rhs.size(); ++i) {
         if (rhs[i] == '\\') rhs[i] = '/';
     }
-#if defined(_WIN32)
     lhs = ToLowerAscii(lhs);
     rhs = ToLowerAscii(rhs);
 #endif
@@ -284,6 +293,7 @@ bool KioskUsbBridge::Initialize(const std::string& watch_root, bool enable_os_po
         m_os_polling_enabled = enable_os_polling;
         m_last_poll_ticks = 0;
         m_last_drive_mask = 0;
+        std::memset(m_drive_serials, 0, sizeof(m_drive_serials));
         m_watch_roots.clear();
         m_watch_descriptors.clear();
         m_active_volumes.clear();
@@ -336,6 +346,7 @@ void KioskUsbBridge::Shutdown() {
     m_active_volumes.clear();
     m_discovered_archives.clear();
     m_last_drive_mask = 0;
+    std::memset(m_drive_serials, 0, sizeof(m_drive_serials));
     m_initialized.store(false);
 }
 
@@ -415,11 +426,17 @@ void KioskUsbBridge::ScanExistingLinuxMounts() {
     }
 
     std::vector<std::string> seen_mounts;
+    std::vector<std::string> failed_roots;
     for (size_t i = 0; i < roots.size(); ++i) {
         if (!DirectoryExists(roots[i])) continue;
         struct stat parent_st;
         const bool have_parent_st = (stat(roots[i].c_str(), &parent_st) == 0);
-        std::vector<DirEntryItem> subdirs = ListDirectoryEntries(roots[i]);
+        bool list_ok = false;
+        std::vector<DirEntryItem> subdirs = ListDirectoryEntries(roots[i], &list_ok);
+        if (!list_ok) {
+            failed_roots.push_back(roots[i]);
+            continue;
+        }
         for (size_t j = 0; j < subdirs.size(); ++j) {
             if (!subdirs[j].is_dir) continue;
             const std::string mp = NormalizeMountPath(KioskHost::JoinPath(roots[i], subdirs[j].name));
@@ -435,11 +452,19 @@ void KioskUsbBridge::ScanExistingLinuxMounts() {
         }
     }
 
-    // Detect any previously active volumes that disappeared
+    // Detect any previously active volumes that disappeared (skip roots whose opendir failed)
     std::vector<std::string> stale;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         for (size_t i = 0; i < m_active_volumes.size(); ++i) {
+            bool under_failed_root = false;
+            for (size_t f = 0; f < failed_roots.size(); ++f) {
+                if (PathStartsWithMount(m_active_volumes[i].mount_path, failed_roots[f])) {
+                    under_failed_root = true;
+                    break;
+                }
+            }
+            if (under_failed_root) continue;
             if (std::find(seen_mounts.begin(), seen_mounts.end(), m_active_volumes[i].mount_path) == seen_mounts.end()) {
                 stale.push_back(m_active_volumes[i].mount_path);
             }
@@ -507,11 +532,15 @@ void KioskUsbBridge::PollWindowsLogicalDrives() {
     uint32_t active_removable_mask = 0;
 
     struct DriveProbe {
+        int bit;
         std::string root;
         std::string label;
+        uint32_t serial;
         bool is_optical;
     };
     std::vector<DriveProbe> current_drives;
+    uint32_t current_serials[26];
+    std::memset(current_serials, 0, sizeof(current_serials));
 
     // Start at C: (index 2) to avoid slow legacy floppy A:/B: polls on older hardware
     for (int i = 2; i < 26; ++i) {
@@ -530,38 +559,50 @@ void KioskUsbBridge::PollWindowsLogicalDrives() {
         }
 
         active_removable_mask |= (1u << i);
+        current_serials[i] = static_cast<uint32_t>(serial);
         DriveProbe dp;
+        dp.bit = i;
         dp.root = std::string(1, static_cast<char>('A' + i)) + ":\\";
         dp.label = WideToUtf8Local(vol_name);
         if (dp.label.empty()) {
             dp.label = DeriveVolumeLabelFromPath(dp.root);
         }
+        dp.serial = static_cast<uint32_t>(serial);
         dp.is_optical = (dtype == DRIVE_CDROM);
         current_drives.push_back(dp);
     }
 
     uint32_t prev_mask = 0;
+    uint32_t prev_serials[26];
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         prev_mask = m_last_drive_mask;
+        std::memcpy(prev_serials, m_drive_serials, sizeof(prev_serials));
         m_last_drive_mask = active_removable_mask;
+        std::memcpy(m_drive_serials, current_serials, sizeof(m_drive_serials));
     }
 
-    // Handle removals first
+    // Handle removals and media swaps (serial change on same drive letter) first
     const uint32_t removed_mask = prev_mask & ~active_removable_mask;
+    uint32_t swapped_mask = 0;
     for (int i = 2; i < 26; ++i) {
+        const bool was_present = (prev_mask & (1u << i)) != 0;
+        const bool now_present = (active_removable_mask & (1u << i)) != 0;
         if ((removed_mask & (1u << i)) != 0) {
+            std::string root = std::string(1, static_cast<char>('A' + i)) + ":\\";
+            OnVolumeRemoved(root);
+        } else if (was_present && now_present && prev_serials[i] != current_serials[i]) {
+            swapped_mask |= (1u << i);
             std::string root = std::string(1, static_cast<char>('A' + i)) + ":\\";
             OnVolumeRemoved(root);
         }
     }
 
-    // Handle newly arrived drives
-    const uint32_t added_mask = active_removable_mask & ~prev_mask;
+    // Handle newly arrived or swapped drives
+    const uint32_t added_or_swapped_mask = (active_removable_mask & ~prev_mask) | swapped_mask;
     for (size_t k = 0; k < current_drives.size(); ++k) {
-        const char letter = static_cast<char>(std::toupper(static_cast<unsigned char>(current_drives[k].root[0])));
-        const int bit = letter - 'A';
-        if (bit >= 0 && bit < 26 && (added_mask & (1u << bit)) != 0) {
+        const int bit = current_drives[k].bit;
+        if (bit >= 0 && bit < 26 && (added_or_swapped_mask & (1u << bit)) != 0) {
             OnVolumeMounted(current_drives[k].root, current_drives[k].label, current_drives[k].is_optical);
         }
     }
@@ -576,12 +617,23 @@ void KioskUsbBridge::ScanVolumeRecursive(
     int max_depth,
     int& out_media_added,
     std::vector<UsbArchiveCandidate>& out_archives,
-    std::string& out_docs_dir
+    std::string& out_docs_dir,
+    int& entries_visited,
+    uint32_t start_ticks
 ) {
-    if (depth > max_depth) return;
+    static const int kMaxScanEntries = 500;
+    static const uint32_t kMaxScanBudgetMs = 250u;
+    if (depth > max_depth || entries_visited >= kMaxScanEntries) return;
+    if (static_cast<uint32_t>(SDL_GetTicks() - start_ticks) >= kMaxScanBudgetMs) return;
 
+    KioskHost::PingSystemdWatchdog();
     std::vector<DirEntryItem> entries = ListDirectoryEntries(dir);
     for (size_t i = 0; i < entries.size(); ++i) {
+        if (entries_visited >= kMaxScanEntries ||
+            static_cast<uint32_t>(SDL_GetTicks() - start_ticks) >= kMaxScanBudgetMs) {
+            break;
+        }
+        ++entries_visited;
         const std::string full_path = KioskHost::JoinPath(dir, entries[i].name);
         if (entries[i].is_dir) {
             if (depth == 0 && out_docs_dir.empty()) {
@@ -593,7 +645,8 @@ void KioskUsbBridge::ScanVolumeRecursive(
             if (depth < max_depth) {
                 ScanVolumeRecursive(full_path, mount_root, volume_label,
                                     depth + 1, max_depth,
-                                    out_media_added, out_archives, out_docs_dir);
+                                    out_media_added, out_archives, out_docs_dir,
+                                    entries_visited, start_ticks);
             }
             continue;
         }
@@ -668,8 +721,11 @@ bool KioskUsbBridge::OnVolumeMounted(const std::string& mount_path,
     int media_added = 0;
     std::vector<UsbArchiveCandidate> archives;
     std::string docs_dir;
-    // Scan top 3 directory levels (depths 0, 1, 2, 3)
-    ScanVolumeRecursive(norm_path, norm_path, label, 0, 3, media_added, archives, docs_dir);
+    int entries_visited = 0;
+    const uint32_t start_ticks = SDL_GetTicks();
+    // Scan top 3 directory levels (depths 0..3) with bounded entry & time budget
+    ScanVolumeRecursive(norm_path, norm_path, label, 0, 3, media_added, archives, docs_dir,
+                        entries_visited, start_ticks);
 
     UsbVolumeInfo vol;
     vol.mount_path = norm_path;
@@ -804,16 +860,17 @@ bool KioskUsbBridge::SafeUnmountDevice(const std::string& mount_path) {
     const std::string norm_path = NormalizeMountPath(mount_path);
     if (norm_path.empty()) return false;
 
-    // 1. Eject any active DOSBox-X handles & purge catalog rows
-    OnVolumeRemoved(norm_path);
+    // 1. Release any active DOSBox-X image handles before requesting OS dismount
+    EjectActiveDrivesUnderMount(norm_path);
 
 #if defined(__linux__)
     sync();
     if (umount2(norm_path.c_str(), 0) == 0) {
+        OnVolumeRemoved(norm_path);
         LOG_MSG("KIOSK USB: Cleanly unmounted '%s'", norm_path.c_str());
         return true;
     }
-    LOG_MSG("KIOSK USB: umount2('%s') returned errno=%d (device may already be unmounted or require udev)",
+    LOG_MSG("KIOSK USB: umount2('%s') returned errno=%d (keeping volume visible for retry)",
             norm_path.c_str(), errno);
     return false;
 #elif defined(_WIN32)
@@ -824,15 +881,32 @@ bool KioskUsbBridge::SafeUnmountDevice(const std::string& mount_path) {
         HANDLE hVol = CreateFileW(dev_path, GENERIC_READ | GENERIC_WRITE,
                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
                                   nullptr, OPEN_EXISTING, 0, nullptr);
-        if (hVol != INVALID_HANDLE_VALUE) {
-            DWORD bytes = 0;
-            FlushFileBuffers(hVol);
-            DeviceIoControl(hVol, FSCTL_LOCK_VOLUME, nullptr, 0, nullptr, 0, &bytes, nullptr);
-            DeviceIoControl(hVol, FSCTL_DISMOUNT_VOLUME, nullptr, 0, nullptr, 0, &bytes, nullptr);
-            DeviceIoControl(hVol, IOCTL_STORAGE_EJECT_MEDIA, nullptr, 0, nullptr, 0, &bytes, nullptr);
-            CloseHandle(hVol);
+        if (hVol == INVALID_HANDLE_VALUE) {
+            LOG_MSG("KIOSK USB: CreateFileW('%c:') failed (%lu); volume remains active for retry",
+                    static_cast<char>(drive_letter), static_cast<unsigned long>(GetLastError()));
+            return false;
+        }
+
+        DWORD bytes = 0;
+        const bool flushed = (FlushFileBuffers(hVol) != 0);
+        const bool locked = flushed && (DeviceIoControl(hVol, FSCTL_LOCK_VOLUME, nullptr, 0, nullptr, 0, &bytes, nullptr) != 0);
+        bool ejected = false;
+        if (locked) {
+            const bool dismounted = (DeviceIoControl(hVol, FSCTL_DISMOUNT_VOLUME, nullptr, 0, nullptr, 0, &bytes, nullptr) != 0);
+            if (dismounted) {
+                ejected = (DeviceIoControl(hVol, IOCTL_STORAGE_EJECT_MEDIA, nullptr, 0, nullptr, 0, &bytes, nullptr) != 0);
+            }
+        }
+        CloseHandle(hVol);
+
+        if (ejected) {
+            OnVolumeRemoved(norm_path);
+            LOG_MSG("KIOSK USB: Cleanly locked, dismounted, and ejected '%s'", norm_path.c_str());
             return true;
         }
+        LOG_MSG("KIOSK USB: Safe eject of '%s' rejected by OS (volume may be in use); keeping retryable",
+                norm_path.c_str());
+        return false;
     }
     return false;
 #else

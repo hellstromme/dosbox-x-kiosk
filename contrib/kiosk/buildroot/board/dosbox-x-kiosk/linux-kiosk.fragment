@@ -1,0 +1,4 @@
+# Built-in early-root filesystem drivers required by initramfs-overlayroot.sh
+CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_ZSTD=y
+CONFIG_OVERLAY_FS=y

@@ -84,7 +84,9 @@ private:
                              int max_depth,
                              int& out_media_added,
                              std::vector<UsbArchiveCandidate>& out_archives,
-                             std::string& out_docs_dir);
+                             std::string& out_docs_dir,
+                             int& entries_visited,
+                             uint32_t start_ticks);
     void EjectActiveDrivesUnderMount(const std::string& mount_path);
 
     mutable std::mutex m_mutex;
@@ -102,8 +104,9 @@ private:
     };
     std::vector<WatchEntry> m_watch_descriptors;
 
-    // Windows logical drive bitmask state
+    // Windows logical drive bitmask & per-letter volume serial state
     uint32_t m_last_drive_mask = 0;
+    uint32_t m_drive_serials[26];
 
     std::vector<UsbVolumeInfo> m_active_volumes;
     std::vector<UsbArchiveCandidate> m_discovered_archives;

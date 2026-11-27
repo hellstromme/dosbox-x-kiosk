@@ -1168,20 +1168,34 @@ int KioskDatabase::DeleteRemovableUsbMediaByPrefix(const std::string& mount_pref
         }
 
         if (!ids_to_delete.empty()) {
-            const bool in_tx = ExecuteSqlInternal("BEGIN IMMEDIATE;");
+            if (!ExecuteSqlInternal("BEGIN IMMEDIATE;")) {
+                return 0;
+            }
+            bool ok = true;
+            int pending_deleted = 0;
             const char* del_sql = "DELETE FROM media_pool WHERE id = ?;";
             sqlite3_stmt* del = nullptr;
-            if (sqlite3_prepare_v2(m_db, del_sql, -1, &del, nullptr) == SQLITE_OK) {
+            if (sqlite3_prepare_v2(m_db, del_sql, -1, &del, nullptr) != SQLITE_OK) {
+                ok = false;
+            } else {
                 for (size_t i = 0; i < ids_to_delete.size(); ++i) {
                     sqlite3_reset(del);
                     sqlite3_bind_text(del, 1, ids_to_delete[i].c_str(), -1, SQLITE_TRANSIENT);
                     if (sqlite3_step(del) == SQLITE_DONE) {
-                        ++deleted;
+                        ++pending_deleted;
+                    } else {
+                        ok = false;
+                        break;
                     }
                 }
                 sqlite3_finalize(del);
             }
-            if (in_tx) ExecuteSqlInternal("COMMIT;");
+            if (ok && ExecuteSqlInternal("COMMIT;")) {
+                deleted = pending_deleted;
+            } else {
+                ExecuteSqlInternal("ROLLBACK;");
+                deleted = 0;
+            }
         }
     }
     if (deleted > 0) {
@@ -1225,20 +1239,34 @@ int KioskDatabase::PurgeStaleRemovableUsbMedia() {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_db) return 0;
 
-        const bool in_tx = ExecuteSqlInternal("BEGIN IMMEDIATE;");
+        if (!ExecuteSqlInternal("BEGIN IMMEDIATE;")) {
+            return 0;
+        }
+        bool ok = true;
+        int pending_deleted = 0;
         const char* del_sql = "DELETE FROM media_pool WHERE id = ?;";
         sqlite3_stmt* del = nullptr;
-        if (sqlite3_prepare_v2(m_db, del_sql, -1, &del, nullptr) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(m_db, del_sql, -1, &del, nullptr) != SQLITE_OK) {
+            ok = false;
+        } else {
             for (size_t i = 0; i < stale_ids.size(); ++i) {
                 sqlite3_reset(del);
                 sqlite3_bind_text(del, 1, stale_ids[i].c_str(), -1, SQLITE_TRANSIENT);
                 if (sqlite3_step(del) == SQLITE_DONE) {
-                    ++deleted;
+                    ++pending_deleted;
+                } else {
+                    ok = false;
+                    break;
                 }
             }
             sqlite3_finalize(del);
         }
-        if (in_tx) ExecuteSqlInternal("COMMIT;");
+        if (ok && ExecuteSqlInternal("COMMIT;")) {
+            deleted = pending_deleted;
+        } else {
+            ExecuteSqlInternal("ROLLBACK;");
+            deleted = 0;
+        }
     }
     if (deleted > 0) {
         KioskUI::GetInstance().InvalidateCatalogCache();

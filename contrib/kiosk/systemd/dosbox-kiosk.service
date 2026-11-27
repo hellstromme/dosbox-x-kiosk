@@ -1,3 +1,8 @@
+# DOSBox-X Kiosk Appliance systemd Service Unit
+# Prerequisite: DOSBox-X built with --enable-sdl2 --enable-kiosk AND libsystemd
+# (HAVE_LIBSYSTEMD=1) for Type=notify and WatchdogSec=30.
+# If built without libsystemd, change Type=notify to Type=simple and remove WatchdogSec=30.
+
 [Unit]
 Description=DOSBox-X Kiosk Appliance Service
 After=systemd-user-sessions.service systemd-logind.service sound.target
@@ -13,15 +18,19 @@ StandardOutput=tty
 TTYPath=/dev/tty1
 TTYReset=yes
 TTYVHangup=yes
+RuntimeDirectory=dosbox-kiosk
+RuntimeDirectoryMode=0700
+StateDirectory=dosbox-kiosk
+StateDirectoryMode=0755
 Environment="SDL_VIDEODRIVER=kmsdrm"
 Environment="SDL_AUDIODRIVER=alsa"
 Environment="SDL_RENDER_VSYNC=1"
-Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="XDG_RUNTIME_DIR=/run/dosbox-kiosk"
 Environment="MESA_SHADER_CACHE_DIR=/var/lib/dosbox-kiosk/cache/mesa"
 Environment="DOSBOX_KIOSK_APPLIANCE=1"
-ExecStartPre=+/usr/bin/mkdir -p /run/user/1000/kiosk /run/media/kiosk /var/lib/dosbox-kiosk/cache/mesa
-ExecStartPre=+/usr/bin/chown -R kiosk:kiosk /run/user/1000 /var/lib/dosbox-kiosk/cache/mesa
-ExecStartPre=/usr/bin/rm -f /run/user/1000/kiosk/kiosk_dispatch.img
+ExecStartPre=+/usr/bin/mkdir -p /run/media/kiosk
+ExecStartPre=/usr/bin/mkdir -p /run/dosbox-kiosk/kiosk /var/lib/dosbox-kiosk/cache/mesa
+ExecStartPre=/usr/bin/rm -f /run/dosbox-kiosk/kiosk/kiosk_dispatch.img
 ExecStart=/usr/bin/dosbox-x -kiosk-mode -kiosk-db /var/lib/dosbox-kiosk/catalog.db -kiosk-conf /var/lib/dosbox-kiosk/config/kiosk_base.conf
 WatchdogSec=30
 Restart=always

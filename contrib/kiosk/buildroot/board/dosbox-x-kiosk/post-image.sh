@@ -26,7 +26,7 @@ mkdir -p "${INITRAMFS_DIR}/bin" "${INITRAMFS_DIR}/sbin" "${INITRAMFS_DIR}/proc" 
 cp -a "${TARGET_DIR}/bin/busybox" "${INITRAMFS_DIR}/bin/busybox"
 cp -a "${TARGET_DIR}/lib"/ld-* "${TARGET_DIR}/lib"/libc.so* "${INITRAMFS_DIR}/lib/" 2>/dev/null || true
 cp -a "${TARGET_DIR}/lib64"/ld-* "${INITRAMFS_DIR}/lib64/" 2>/dev/null || true
-for applet in sh mount mkdir sleep head blkid switch_root; do
+for applet in sh mount mkdir sleep head grep sed switch_root; do
     ln -sf busybox "${INITRAMFS_DIR}/bin/${applet}"
 done
 install -m 0755 "${BOARD_DIR}/initramfs-overlayroot.sh" "${INITRAMFS_DIR}/init"

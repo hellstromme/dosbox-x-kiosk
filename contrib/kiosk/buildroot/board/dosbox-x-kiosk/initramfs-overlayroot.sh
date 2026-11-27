@@ -9,16 +9,30 @@ mount -t devtmpfs devtmpfs /dev
 
 mkdir -p /mnt/lower /mnt/overlay /mnt/newroot
 
-# Wait briefly for NVMe/SATA/USB block devices to settle
+# Discover GPT partition named KIOSK_ROOT via /sys/class/block/*/uevent (no udev / blkid -t needed)
+find_kiosk_root() {
+    for uevent in /sys/class/block/*/uevent; do
+        [ -r "$uevent" ] || continue
+        if grep -qx 'PARTNAME=KIOSK_ROOT' "$uevent" 2>/dev/null; then
+            devname="$(sed -n 's/^DEVNAME=//p' "$uevent" | head -n 1)"
+            if [ -n "$devname" ] && [ -b "/dev/$devname" ]; then
+                printf '/dev/%s\n' "$devname"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
 ROOT_DEV=""
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    ROOT_DEV="$(blkid -t PARTLABEL=KIOSK_ROOT -o device 2>/dev/null | head -n 1 || true)"
+    ROOT_DEV="$(find_kiosk_root || true)"
     [ -n "$ROOT_DEV" ] && break
     sleep 0.2
 done
 
 if [ -z "$ROOT_DEV" ]; then
-    echo "KIOSK INIT: PARTLABEL=KIOSK_ROOT not found, dropping to emergency shell"
+    echo "KIOSK INIT: PARTNAME=KIOSK_ROOT not found in /sys/class/block/*/uevent, dropping to emergency shell"
     exec /bin/sh
 fi
 

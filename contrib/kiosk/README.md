@@ -59,9 +59,12 @@ sudo dd if=output/images/dosbox-x-kiosk-appliance.img of=/dev/sdX bs=4M status=p
 
 For full Linux distributions using `systemd`:
 
-1. Build DOSBox-X with `--enable-sdl2 --enable-kiosk` (automatically detects `libsystemd` via `pkg-config` and enables `HAVE_LIBSYSTEMD` `sd_notify("WATCHDOG=1")` heartbeats).
-2. Install the service unit and udev automount rules:
+1. Install `libsystemd-dev` (Debian/Ubuntu) or `systemd-libs` (Arch) and build DOSBox-X with `--enable-sdl2 --enable-kiosk` (required for `Type=notify` and `WatchdogSec=30` via `HAVE_LIBSYSTEMD`; if built without `libsystemd`, change `Type=notify` to `Type=simple` and remove `WatchdogSec=30` in the unit file).
+2. Provision the `kiosk` system account, base config, udev automount rules, and systemd unit:
    ```bash
+   sudo useradd -r -m -d /var/lib/dosbox-kiosk -s /usr/sbin/nologin kiosk || true
+   sudo install -d -o kiosk -g kiosk -m 0755 /var/lib/dosbox-kiosk /var/lib/dosbox-kiosk/config
+   sudo install -o kiosk -g kiosk -m 0644 contrib/kiosk/buildroot/board/dosbox-x-kiosk/rootfs-overlay/var/lib/dosbox-kiosk/config/kiosk_base.conf /var/lib/dosbox-kiosk/config/
    sudo install -m 0644 contrib/kiosk/systemd/dosbox-kiosk.service /etc/systemd/system/
    sudo install -m 0644 contrib/kiosk/buildroot/board/dosbox-x-kiosk/rootfs-overlay/etc/udev/rules.d/99-kiosk-automount.rules /etc/udev/rules.d/
    sudo install -m 0755 contrib/kiosk/buildroot/board/dosbox-x-kiosk/rootfs-overlay/usr/libexec/kiosk-usb-mount.sh /usr/libexec/
