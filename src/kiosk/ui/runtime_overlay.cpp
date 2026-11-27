@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cctype>
 #include <algorithm>
+#include <map>
 
 namespace {
 
@@ -289,9 +290,7 @@ void RuntimeOverlay::RefreshDriveStatuses() {
             // Find matching caddy record for friendly label/badge
             for (size_t c = 0; c < m_session_caddy.size(); ++c) {
                 if (PathsMatchNormalized(m_session_caddy[c].media.file_path, st.active_file_path)) {
-                    st.active_label = !m_session_caddy[c].media.label_title.empty()
-                                          ? m_session_caddy[c].media.label_title
-                                          : m_session_caddy[c].media.volume_label;
+                    st.active_label = DiskCaddyView::FormatMediaDisplayName(m_session_caddy[c].media);
                     st.media_type_badge = DiskCaddyView::HumanReadableMediaTypeBadge(
                         m_session_caddy[c].media.media_type
                     );
@@ -707,7 +706,8 @@ void RuntimeOverlay::RenderCompactListView() {
             ImGui::TextUnformatted(DiskCaddyView::HumanReadableMediaTypeBadge(entry.media.media_type).c_str());
 
             ImGui::TableSetColumnIndex(3);
-            ImGui::TextUnformatted(entry.media.label_title.c_str());
+            const std::string disp_title = DiskCaddyView::FormatMediaDisplayName(entry.media);
+            ImGui::TextUnformatted(disp_title.c_str());
 
             ImGui::TableSetColumnIndex(4);
             ImGui::TextUnformatted(entry.media.volume_label.empty() ? "-" : entry.media.volume_label.c_str());
@@ -747,37 +747,65 @@ void RuntimeOverlay::RenderGlobalMediaPoolDrawer() {
     if (m_global_pool_cache.empty()) {
         ImGui::TextDisabled("No media registered in Global Media Pool.");
     } else {
+        std::map<std::string, std::vector<size_t> > grouped;
+        std::vector<size_t> ungrouped;
         for (size_t i = 0; i < m_global_pool_cache.size(); ++i) {
-            const MediaPoolRecord& m = m_global_pool_cache[i];
-            const bool is_cd = IsOpticalMediaType(m.media_type);
-
-            if (m.is_removable_usb) {
-                ImGui::TextColored(ImVec4(0.40f, 0.90f, 0.95f, 1.0f), "[USB]");
-                ImGui::SameLine();
-            }
-            ImGui::Text("%s  (%s)  [%s]",
-                        m.label_title.c_str(),
-                        DiskCaddyView::HumanReadableMediaTypeBadge(m.media_type).c_str(),
-                        m.volume_label.empty() ? BasenameFromPath(m.file_path).c_str() : m.volume_label.c_str());
-
-            ImGui::SameLine();
-            if (!is_cd) {
-                std::string btn_a = "Insert A:##pool_a_" + std::to_string(i);
-                if (ImGui::SmallButton(btn_a.c_str())) {
-                    PerformHotSwap("A", m.file_path, m.is_write_protected);
-                }
-                ImGui::SameLine();
-                std::string btn_b = "Insert B:##pool_b_" + std::to_string(i);
-                if (ImGui::SmallButton(btn_b.c_str())) {
-                    PerformHotSwap("B", m.file_path, m.is_write_protected);
-                }
+            if (m_global_pool_cache[i].media_group.empty()) {
+                ungrouped.push_back(i);
             } else {
-                std::string btn_d = "Insert D: (CD)##pool_d_" + std::to_string(i);
-                if (ImGui::SmallButton(btn_d.c_str())) {
-                    PerformHotSwap("D", m.file_path, true);
-                }
+                grouped[m_global_pool_cache[i].media_group].push_back(i);
             }
         }
+
+        auto render_pool_group = [&](const std::string& grp_name, const std::vector<size_t>& indices) {
+            if (indices.empty()) return;
+            char hdr[192];
+            snprintf(hdr, sizeof(hdr), "%s (%u)###ovl_pool_%s",
+                          grp_name.c_str(),
+                          static_cast<unsigned int>(indices.size()),
+                          grp_name.c_str());
+            if (!ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen)) {
+                return;
+            }
+            for (size_t k = 0; k < indices.size(); ++k) {
+                const size_t i = indices[k];
+                const MediaPoolRecord& m = m_global_pool_cache[i];
+                const bool is_cd = IsOpticalMediaType(m.media_type);
+
+                if (m.is_removable_usb) {
+                    ImGui::TextColored(ImVec4(0.40f, 0.90f, 0.95f, 1.0f), "[USB]");
+                    ImGui::SameLine();
+                }
+                const std::string desc = !m.label_subtitle.empty()
+                                             ? m.label_subtitle
+                                             : DiskCaddyView::HumanReadableMediaTypeBadge(m.media_type);
+                ImGui::Text("  %s  —  %s", m.label_title.c_str(), desc.c_str());
+
+                ImGui::SameLine();
+                if (!is_cd) {
+                    std::string btn_a = "Insert A:##pool_a_" + std::to_string(i);
+                    if (ImGui::SmallButton(btn_a.c_str())) {
+                        PerformHotSwap("A", m.file_path, m.is_write_protected);
+                    }
+                    ImGui::SameLine();
+                    std::string btn_b = "Insert B:##pool_b_" + std::to_string(i);
+                    if (ImGui::SmallButton(btn_b.c_str())) {
+                        PerformHotSwap("B", m.file_path, m.is_write_protected);
+                    }
+                } else {
+                    std::string btn_d = "Insert D: (CD)##pool_d_" + std::to_string(i);
+                    if (ImGui::SmallButton(btn_d.c_str())) {
+                        PerformHotSwap("D", m.file_path, true);
+                    }
+                }
+            }
+        };
+
+        for (std::map<std::string, std::vector<size_t> >::const_iterator it = grouped.begin();
+             it != grouped.end(); ++it) {
+            render_pool_group(it->first, it->second);
+        }
+        render_pool_group("Ungrouped", ungrouped);
     }
 
     ImGui::EndChild();

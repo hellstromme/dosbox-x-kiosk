@@ -6,6 +6,7 @@
 #include "input_router.h"
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -43,6 +44,17 @@ public:
     int GetSelectedMachineIndex() const { return m_selected_machine_idx; }
 
     // Pure data helpers (also used by unit tests)
+    enum class FilePickerTarget {
+        IMPORT_ARCHIVE = 0,
+        MEDIA_POOL = 1
+    };
+
+    enum class MediaAddStatus {
+        ADDED = 0,
+        ALREADY_EXISTS,
+        INVALID_OR_MISSING
+    };
+
     static std::vector<CatalogItemRecord> FilterAndSortCatalogItems(
         const std::vector<CatalogItemRecord>& all_items,
         const std::string& item_type,
@@ -50,6 +62,16 @@ public:
     );
     static bool IsMediaCompatibleWithDrive(const std::string& media_type, const std::string& target_drive);
     static int ComputeNextSlotOrder(const std::vector<CaddyBindingRecord>& bindings, const std::string& target_drive);
+    static bool MatchesFilePickerFilter(const std::string& filename, FilePickerTarget target);
+    static MediaAddStatus AddMediaFileToPool(const std::string& file_path, std::string& out_label, const std::string& media_group = "");
+    static int AddMultipleMediaFilesToPool(const std::vector<std::string>& paths, int& out_already_exists, int& out_failed, const std::string& media_group = "");
+
+    void SetLastMediaPickerDir(const std::string& dir) { m_last_media_picker_dir = dir; }
+    std::string GetLastMediaPickerDir() const { return m_last_media_picker_dir; }
+    std::string GetCurrentPickerDir() const { return m_picker_current_dir; }
+    void OpenFilePickerForTest(const std::string& initial_dir, FilePickerTarget target) {
+        OpenFilePicker(initial_dir, target);
+    }
 
     void ResetTransientModals();
     void WaitForPendingImport();
@@ -79,7 +101,12 @@ private:
     void RenderDeleteConfirmModal();
     void RenderImportArchiveModal();
     void RenderFilePickerModal();
-    void OpenFilePicker(const std::string& initial_dir = "");
+    void RenderEditMediaModal();
+    void OpenEditMediaModal(const MediaPoolRecord& rec);
+    void RenderRenameGroupModal();
+    void RenderGroupPickerCombo(const char* combo_id, char* target_buf, size_t buf_size, const std::string& folder_suggestion);
+    void OpenFilePicker(const std::string& initial_dir = "",
+                        FilePickerTarget target = FilePickerTarget::IMPORT_ARCHIVE);
     void RefreshFilePickerEntries();
 
     int m_selected_game_idx = 0;
@@ -94,7 +121,23 @@ private:
 
     // Media Pool tab state
     CaddyViewMode m_media_view_mode = CaddyViewMode::SKEUOMORPHIC;
-    char m_add_media_path_buf[512] = {0};
+    char m_add_media_path_buf[1024] = {0};
+    char m_media_search_buf[128] = {0};
+    std::set<std::string> m_media_pool_selected_ids;
+    char m_bulk_group_buf[128] = {0};
+
+    // Rename / Merge Group modal state
+    bool m_show_rename_group_modal = false;
+    std::string m_rename_group_old_name;
+    char m_rename_group_new_buf[128] = {0};
+
+    // Edit Media Details modal state
+    bool m_show_edit_media_modal = false;
+    MediaPoolRecord m_edit_media_rec;
+    char m_edit_media_group_buf[128] = {0};
+    char m_edit_media_title_buf[128] = {0};
+    char m_edit_media_subtitle_buf[256] = {0};
+    bool m_edit_media_wp = false;
 
     // Session Caddy modal state
     bool m_show_caddy_modal = false;
@@ -139,9 +182,15 @@ private:
         uint64_t size_bytes = 0;
     };
     bool m_show_file_picker = false;
-    bool m_picker_filter_archives = true;
+    bool m_picker_filter_ext = true;
+    FilePickerTarget m_picker_target = FilePickerTarget::IMPORT_ARCHIVE;
     std::string m_picker_current_dir;
+    std::string m_last_media_picker_dir;
+    std::string m_last_import_picker_dir;
     int m_picker_selected_idx = -1;
+    std::set<std::string> m_picker_multi_selected;
+    std::string m_picker_status_msg;
+    char m_picker_group_buf[128] = {0};
     std::vector<FilePickerEntry> m_picker_entries;
 };
 

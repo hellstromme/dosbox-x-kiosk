@@ -52,6 +52,8 @@ public:
     bool InsertMedia(const MediaPoolRecord& media);
     bool UpdateMedia(const MediaPoolRecord& media);
     bool DeleteMedia(const std::string& id);
+    bool RenameMediaGroup(const std::string& old_group, const std::string& new_group);
+    bool AssignMediaGroupBatch(const std::vector<std::string>& media_ids, const std::string& new_group);
     std::vector<MediaPoolRecord> GetRemovableUsbMedia();
 
     // 5. Session Caddy Bindings

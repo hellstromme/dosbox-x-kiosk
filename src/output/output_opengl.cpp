@@ -1147,6 +1147,8 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 
         CheckManagement();
         if (sdl_opengl.program_object) {
+            glUseProgram(sdl_opengl.program_object);
+            glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
             glUniform1i(sdl_opengl.ruby.frame_count, sdl_opengl.actual_frame_count++);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         } else
@@ -1186,6 +1188,60 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 	SDL_GL_SwapBuffers();
 
         if (!menu.hidecycles && !sdl.desktop.fullscreen) frames++;
+    }
+}
+
+void OUTPUT_OPENGL_RedrawScreen()
+{
+    if (sdl.desktop.type != SCREEN_OPENGL || !sdl_opengl.inited) return;
+
+    OPENGL_RestoreContext();
+    if (sdl_opengl.clear_countdown > 0) {
+        sdl_opengl.clear_countdown--;
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+
+    if (sdl.surface != NULL) {
+        if (sdl_opengl.use_shader) {
+            glViewport((sdl.surface->w - sdl.clip.w) / 2, (sdl.surface->h - sdl.clip.h) / 2, sdl.clip.w, sdl.clip.h);
+        } else {
+            glViewport(0, 0, sdl.surface->w, sdl.surface->h);
+        }
+    }
+
+    if (sdl_opengl.pixel_buffer_object && glBindBufferARB != NULL) {
+        glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, 0);
+    }
+    glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
+
+    if (sdl_opengl.program_object) {
+#if defined(GL_ARRAY_BUFFER_ARB)
+        if (glBindBufferARB != NULL) {
+            glBindBufferARB(GL_ARRAY_BUFFER_ARB, 0);
+        }
+#elif defined(GL_ARRAY_BUFFER)
+        if (glBindBufferARB != NULL) {
+            glBindBufferARB(GL_ARRAY_BUFFER, 0);
+        }
+#endif
+        glUseProgram(sdl_opengl.program_object);
+        GLint pos_loc = glGetAttribLocation(sdl_opengl.program_object, "a_position");
+        if (pos_loc >= 0) {
+            glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 0, sdl_opengl.vertex_data);
+            glEnableVertexAttribArray(pos_loc);
+        }
+        if (sdl_opengl.ruby.frame_count != (GLint)-1) {
+            glUniform1i(sdl_opengl.ruby.frame_count, sdl_opengl.actual_frame_count);
+        }
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    } else if (sdl_opengl.displaylist) {
+        glCallList(sdl_opengl.displaylist);
     }
 }
 

@@ -437,6 +437,45 @@ bool DiskCaddyView::InspectMediaFile(const std::string& file_path, InspectedMedi
     return true;
 }
 
+std::string DiskCaddyView::DeriveDefaultMediaGroup(const std::string& file_path) {
+    if (file_path.empty()) return "";
+    size_t last_sep = file_path.find_last_of("/\\");
+    if (last_sep == std::string::npos || last_sep == 0) return "";
+    std::string parent = file_path.substr(0, last_sep);
+    while (parent.size() > 1 && (parent.back() == '/' || parent.back() == '\\')) {
+        parent.pop_back();
+    }
+    // Skip bare drive root like "C:"
+    if (parent.size() <= 2 && parent.size() >= 2 && parent[1] == ':') return "";
+
+    size_t prev_sep = parent.find_last_of("/\\");
+    std::string folder = (prev_sep == std::string::npos) ? parent : parent.substr(prev_sep + 1);
+    if (folder.empty()) return "";
+
+    // Ignore generic host/staging directory names so standalone images stay cleanly Ungrouped
+    std::string low = folder;
+    for (size_t i = 0; i < low.size(); ++i) {
+        low[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(low[i])));
+    }
+    if (low == "media_pool" || low == "downloads" || low == "desktop" ||
+        low == "temp" || low == "tmp" || low == "documents") {
+        return "";
+    }
+    return folder;
+}
+
+std::string DiskCaddyView::FormatMediaDisplayName(const MediaPoolRecord& media) {
+    const std::string title = !media.label_title.empty()
+                                  ? media.label_title
+                                  : (!media.volume_label.empty()
+                                         ? media.volume_label
+                                         : ExtractFilenameStem(media.file_path));
+    if (!media.media_group.empty()) {
+        return "[" + media.media_group + "] " + title;
+    }
+    return title;
+}
+
 void DiskCaddyView::DrawStickerTypography(
     ImDrawList* draw_list,
     float lx,
@@ -461,12 +500,18 @@ void DiskCaddyView::DrawStickerTypography(
     const float stripe_h = std::max(10.0f, lh * 0.20f);
     draw_list->AddRectFilled(ImVec2(lx, ly), ImVec2(lx + lw, ly + stripe_h), stripe_col, 3.0f);
 
-    // Header badge text inside stripe: Target Drive & Slot
-    char header_buf[48];
-    std::snprintf(header_buf, sizeof(header_buf), "%s: DISK #%d",
-                  params.target_drive.empty() ? "A" : params.target_drive.c_str(),
-                  params.slot_order);
-    draw_list->AddText(ImVec2(lx + 5.0f, ly + 1.0f), IM_COL32(255, 250, 240, 255), header_buf);
+    // Header badge text inside stripe: Media Group (if set) or Target Drive & Slot
+    std::string stripe_text;
+    if (!params.media.media_group.empty()) {
+        stripe_text = TruncateWithEllipsis(params.media.media_group, 18);
+    } else {
+        char header_buf[48];
+        std::snprintf(header_buf, sizeof(header_buf), "%s: DISK #%d",
+                      params.target_drive.empty() ? "A" : params.target_drive.c_str(),
+                      params.slot_order);
+        stripe_text = header_buf;
+    }
+    draw_list->AddText(ImVec2(lx + 5.0f, ly + 1.0f), IM_COL32(255, 250, 240, 255), stripe_text.c_str());
 
     // Optional ruled lines for DOT_MATRIX / HANDWRITTEN styles
     if (params.media.label_font_style != "PRINTED_OEM") {

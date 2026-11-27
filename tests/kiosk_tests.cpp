@@ -3933,4 +3933,252 @@ TEST_F(KioskDatabaseFixture, Phase7SteamSubdirDosExecutableSkipsWin32WrapperAndH
     std::remove(zip_path.c_str());
 }
 
+TEST(KioskFilePickerTest, MatchesImportAndMediaPoolExtensions) {
+    // Import archive filter (.exe / .zip)
+    EXPECT_TRUE(ViewCarousel::MatchesFilePickerFilter("setup_doom.exe", ViewCarousel::FilePickerTarget::IMPORT_ARCHIVE));
+    EXPECT_TRUE(ViewCarousel::MatchesFilePickerFilter("GAME.ZIP", ViewCarousel::FilePickerTarget::IMPORT_ARCHIVE));
+    EXPECT_FALSE(ViewCarousel::MatchesFilePickerFilter("disk1.img", ViewCarousel::FilePickerTarget::IMPORT_ARCHIVE));
+    EXPECT_FALSE(ViewCarousel::MatchesFilePickerFilter("readme.txt", ViewCarousel::FilePickerTarget::IMPORT_ARCHIVE));
+
+    // Media pool filter (.img, .ima, .iso, .cue, .bin, .vfd, .flp)
+    EXPECT_TRUE(ViewCarousel::MatchesFilePickerFilter("dos622_disk1.img", ViewCarousel::FilePickerTarget::MEDIA_POOL));
+    EXPECT_TRUE(ViewCarousel::MatchesFilePickerFilter("BOOTDISK.IMA", ViewCarousel::FilePickerTarget::MEDIA_POOL));
+    EXPECT_TRUE(ViewCarousel::MatchesFilePickerFilter("myst.iso", ViewCarousel::FilePickerTarget::MEDIA_POOL));
+    EXPECT_TRUE(ViewCarousel::MatchesFilePickerFilter("quake.CUE", ViewCarousel::FilePickerTarget::MEDIA_POOL));
+    EXPECT_TRUE(ViewCarousel::MatchesFilePickerFilter("quake.bin", ViewCarousel::FilePickerTarget::MEDIA_POOL));
+    EXPECT_TRUE(ViewCarousel::MatchesFilePickerFilter("floppy.vfd", ViewCarousel::FilePickerTarget::MEDIA_POOL));
+    EXPECT_TRUE(ViewCarousel::MatchesFilePickerFilter("floppy.flp", ViewCarousel::FilePickerTarget::MEDIA_POOL));
+    EXPECT_FALSE(ViewCarousel::MatchesFilePickerFilter("setup_doom.exe", ViewCarousel::FilePickerTarget::MEDIA_POOL));
+    EXPECT_FALSE(ViewCarousel::MatchesFilePickerFilter("archive.zip", ViewCarousel::FilePickerTarget::MEDIA_POOL));
+    EXPECT_FALSE(ViewCarousel::MatchesFilePickerFilter("notes.txt", ViewCarousel::FilePickerTarget::MEDIA_POOL));
+}
+
+TEST(KioskFilePickerTest, MediaPoolBatchAddAndLastDirectoryPersistence) {
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(":memory:"));
+
+    std::string temp_dir = "/tmp";
+#if defined(_WIN32)
+    if (const char* td = std::getenv("TEMP")) {
+        temp_dir = td;
+        while (temp_dir.size() > 3 && (temp_dir.back() == '\\' || temp_dir.back() == '/')) {
+            temp_dir.pop_back();
+        }
+    }
+    const std::string sep = "\\";
+#else
+    const std::string sep = "/";
+#endif
+
+    // Create two synthetic 1.44MB floppy images in temp_dir
+    const std::string img1 = temp_dir + sep + "kiosk_batch_disk1.img";
+    const std::string img2 = temp_dir + sep + "kiosk_batch_disk2.img";
+    const std::string missing = temp_dir + sep + "kiosk_batch_missing_999.img";
+    {
+        std::vector<uint8_t> zeros(1474560u, 0);
+        std::ofstream f1(img1.c_str(), std::ios::binary | std::ios::trunc);
+        f1.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
+        std::ofstream f2(img2.c_str(), std::ios::binary | std::ios::trunc);
+        f2.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
+    }
+
+    // Batch add both images + one missing file in one call
+    std::vector<std::string> batch;
+    batch.push_back(img1);
+    batch.push_back(img2);
+    batch.push_back(missing);
+    int already = 0;
+    int failed = 0;
+    const int added = ViewCarousel::AddMultipleMediaFilesToPool(batch, already, failed);
+    EXPECT_EQ(added, 2);
+    EXPECT_EQ(already, 0);
+    EXPECT_EQ(failed, 1);
+    EXPECT_EQ(KioskDatabase::GetInstance().GetAllMedia().size(), 2u);
+
+    // Re-adding the same two images should report them as already existing (zero duplicates)
+    int already2 = 0;
+    int failed2 = 0;
+    std::vector<std::string> batch2;
+    batch2.push_back(img1);
+    batch2.push_back(img2);
+    EXPECT_EQ(ViewCarousel::AddMultipleMediaFilesToPool(batch2, already2, failed2), 0);
+    EXPECT_EQ(already2, 2);
+    EXPECT_EQ(failed2, 0);
+
+    // Verify picker remembers last browsed directory when reopened with empty initial_dir
+    ViewCarousel& vc = ViewCarousel::GetInstance();
+    vc.OpenFilePickerForTest(temp_dir, ViewCarousel::FilePickerTarget::MEDIA_POOL);
+    EXPECT_EQ(vc.GetLastMediaPickerDir(), temp_dir);
+
+    vc.OpenFilePickerForTest("", ViewCarousel::FilePickerTarget::MEDIA_POOL);
+    EXPECT_EQ(vc.GetCurrentPickerDir(), temp_dir);
+    vc.ResetTransientModals();
+
+    std::remove(img1.c_str());
+    std::remove(img2.c_str());
+    KioskDatabase::GetInstance().Close();
+}
+
+TEST(KioskWizardTest, SelectingGuestOSAutoSwitchesToRealHddBoot) {
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(":memory:"));
+
+    ViewWizard& wiz = ViewWizard::GetInstance();
+    wiz.Reset();
+    ASSERT_TRUE(wiz.SelectArchetype(KioskArchetypes::DX2_486));
+    ASSERT_EQ(wiz.GetDraftMachine().boot_mode, "INTEGRATED_DOS");
+
+    std::string err;
+    ASSERT_TRUE(wiz.SelectOSDistribution("MSDOS_622", err)) << err;
+    EXPECT_EQ(wiz.GetDraftMachine().boot_mode, "REAL_HDD_BOOT");
+    EXPECT_FALSE(wiz.GetDraftMachine().primary_hdd_chs.empty());
+    EXPECT_TRUE(wiz.GetCreateBlankHddOnDisk());
+
+    // Verify Windows 3.1 (WIN310) is also seeded and compatible with 486DX2
+    ASSERT_TRUE(wiz.SelectOSDistribution("WIN310", err)) << err;
+    EXPECT_EQ(wiz.GetDraftMachine().os_id, "WIN310");
+    EXPECT_EQ(wiz.GetDraftMachine().boot_mode, "REAL_HDD_BOOT");
+
+    KioskDatabase::GetInstance().Close();
+}
+
+TEST(KioskRebootTest, InSessionRebootRespectsEjectedInstallerFloppyAndMarksOsInstalled) {
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(":memory:"));
+
+    std::string temp_dir = "/tmp/";
+#if defined(_WIN32)
+    if (const char* td = std::getenv("TEMP")) {
+        temp_dir = td;
+        if (!temp_dir.empty() && temp_dir.back() != '\\' && temp_dir.back() != '/') temp_dir += '\\';
+    }
+#endif
+    const std::string hdd_path = temp_dir + "kiosk_test_reboot_hdd.img";
+    {
+        std::vector<uint8_t> mbr(512, 0);
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        std::ofstream ofs(hdd_path.c_str(), std::ios::binary | std::ios::trunc);
+        ofs.write(reinterpret_cast<const char*>(mbr.data()), 512);
+    }
+
+    MediaPoolRecord disk1;
+    disk1.id = "med-reboot-d1";
+    disk1.file_path = "dos622_disk1.img";
+    disk1.media_type = "FLOPPY_35_1440K";
+    disk1.label_title = "MS-DOS 6.22 Disk 1";
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMedia(disk1));
+
+    MachineRecord mach;
+    mach.id = "mach-reboot-test";
+    mach.display_name = "DOS Install Reboot Rig";
+    mach.archetype_id = KioskArchetypes::DX2_486;
+    mach.archetype_tier = 4;
+    mach.os_id = "MSDOS_622";
+    mach.os_installed = false;
+    mach.boot_mode = "REAL_HDD_BOOT";
+    mach.primary_hdd_path = hdd_path;
+    mach.primary_hdd_chs = "507,16,63";
+    std::vector<CaddyBindingRecord> bindings;
+    CaddyBindingRecord b;
+    b.media_id = disk1.id;
+    b.target_drive = "A";
+    b.slot_order = 1;
+    bindings.push_back(b);
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMachineWithBindings(mach, bindings));
+
+    KioskManager& mgr = KioskManager::GetInstance();
+    mgr.Initialize("", "");
+    ASSERT_TRUE(mgr.RequestLaunchMachine(mach.id));
+    std::string init_conf;
+    ASSERT_TRUE(mgr.SynthesizeAndPrepareLaunch(init_conf));
+    EXPECT_NE(init_conf.find("BOOT -l a"), std::string::npos);
+
+    // 1. Mid-install reboot with Disk 1 still in Drive A: -> keeps booting A:
+    std::string mid_reboot;
+    ASSERT_TRUE(mgr.BuildInSessionRebootAutoexec(mid_reboot, disk1.file_path, "", "", ""));
+    EXPECT_NE(mid_reboot.find("IMGMOUNT 0"), std::string::npos);
+    EXPECT_NE(mid_reboot.find("BOOT -l a"), std::string::npos);
+    MachineRecord mid_state;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMachine(mach.id, mid_state));
+    EXPECT_FALSE(mid_state.os_installed);
+
+    // 2. Post-install reboot after ejecting Drive A: -> omits IMGMOUNT 0, boots C:, and marks os_installed=true
+    std::string post_reboot;
+    ASSERT_TRUE(mgr.BuildInSessionRebootAutoexec(post_reboot, "", "", "", ""));
+    EXPECT_EQ(post_reboot.find("IMGMOUNT 0"), std::string::npos);
+    EXPECT_EQ(post_reboot.find("BOOT -l a"), std::string::npos);
+    EXPECT_NE(post_reboot.find("BOOT -l c"), std::string::npos);
+
+    MachineRecord post_state;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMachine(mach.id, post_state));
+    EXPECT_TRUE(post_state.os_installed);
+
+    mgr.Shutdown();
+    KioskDatabase::GetInstance().Close();
+    std::remove(hdd_path.c_str());
+}
+
+TEST(KioskMediaGroupTest, DerivesGroupPersistsAndFormatsDisplayName) {
+    EXPECT_EQ(DiskCaddyView::DeriveDefaultMediaGroup("C:\\Retro\\MS-DOS 6.22\\Disk1.img"), "MS-DOS 6.22");
+    EXPECT_EQ(DiskCaddyView::DeriveDefaultMediaGroup("/roms/Windows 3.1/Disk2.ima"), "Windows 3.1");
+    EXPECT_EQ(DiskCaddyView::DeriveDefaultMediaGroup("C:\\Users\\test\\Downloads\\Disk1.img"), "");
+    EXPECT_EQ(DiskCaddyView::DeriveDefaultMediaGroup("Disk1.img"), "");
+
+    ASSERT_TRUE(KioskDatabase::GetInstance().Open(":memory:"));
+
+    MediaPoolRecord m;
+    m.id = "med-grp-dos1";
+    m.file_path = "C:\\Retro\\MS-DOS 6.22\\Disk1.img";
+    m.media_type = "FLOPPY_35_1440K";
+    m.label_title = "Disk1";
+    m.label_subtitle = "Bootable Setup Disk 1 of 3";
+    m.media_group = "MS-DOS 6.22";
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMedia(m));
+
+    MediaPoolRecord loaded;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMedia(m.id, loaded));
+    EXPECT_EQ(loaded.media_group, "MS-DOS 6.22");
+    EXPECT_EQ(loaded.label_subtitle, "Bootable Setup Disk 1 of 3");
+    EXPECT_EQ(DiskCaddyView::FormatMediaDisplayName(loaded), "[MS-DOS 6.22] Disk1");
+
+    loaded.media_group = "MS-DOS 6.22 OEM";
+    loaded.label_title = "Disk 1 - Setup";
+    ASSERT_TRUE(KioskDatabase::GetInstance().UpdateMedia(loaded));
+
+    MediaPoolRecord updated;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMedia(m.id, updated));
+    EXPECT_EQ(updated.media_group, "MS-DOS 6.22 OEM");
+    EXPECT_EQ(DiskCaddyView::FormatMediaDisplayName(updated), "[MS-DOS 6.22 OEM] Disk 1 - Setup");
+
+    // Add second disk in same group + third ungrouped disk, then test RenameMediaGroup & AssignMediaGroupBatch
+    MediaPoolRecord m2 = m;
+    m2.id = "med-grp-dos2";
+    m2.file_path = "C:\\Retro\\MS-DOS 6.22\\Disk2.img";
+    m2.label_title = "Disk2";
+    m2.media_group = "MS-DOS 6.22 OEM";
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMedia(m2));
+
+    MediaPoolRecord m3 = m;
+    m3.id = "med-grp-wp1";
+    m3.file_path = "C:\\Retro\\WordPerfect51\\Disk1.img";
+    m3.label_title = "Disk1";
+    m3.media_group.clear();
+    ASSERT_TRUE(KioskDatabase::GetInstance().InsertMedia(m3));
+
+    ASSERT_TRUE(KioskDatabase::GetInstance().RenameMediaGroup("MS-DOS 6.22 OEM", "MS-DOS 6.22"));
+    MediaPoolRecord r1, r2, r3;
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMedia(m.id, r1));
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMedia(m2.id, r2));
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMedia(m3.id, r3));
+    EXPECT_EQ(r1.media_group, "MS-DOS 6.22");
+    EXPECT_EQ(r2.media_group, "MS-DOS 6.22");
+    EXPECT_EQ(r3.media_group, "");
+
+    std::vector<std::string> batch_ids;
+    batch_ids.push_back(m3.id);
+    ASSERT_TRUE(KioskDatabase::GetInstance().AssignMediaGroupBatch(batch_ids, "WordPerfect51"));
+    ASSERT_TRUE(KioskDatabase::GetInstance().GetMedia(m3.id, r3));
+    EXPECT_EQ(r3.media_group, "WordPerfect51");
+
+    KioskDatabase::GetInstance().Close();
+}
+
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

@@ -230,8 +230,12 @@ bool ViewWizard::SelectOSDistribution(const std::string& os_id, std::string& out
         return false;
     }
     m_draft.os_id = os.id;
+    m_draft.boot_mode = "REAL_HDD_BOOT";
     if (os.recommended_hdd_mb > 0) {
         m_hdd_size_mb = os.recommended_hdd_mb;
+    }
+    if (m_create_blank_hdd_file) {
+        m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
     }
     m_last_error.clear();
     out_error.clear();
@@ -705,10 +709,16 @@ void ViewWizard::RenderStep2IdentityBoot() {
     ImGui::PopStyleColor();
 
     ImGui::Spacing();
-    ImGui::TextUnformatted(is_integrated ? "Optional Host C: Directory Path:" : "Primary Hard Disk Image Path (hdd_c.img):");
-    ImGui::SetNextItemWidth((std::min)(480.0f, ImGui::GetContentRegionAvail().x));
-    if (ImGui::InputTextWithHint("##WizHddPath", "Leave blank for automatic default path...", m_hdd_path_buf, sizeof(m_hdd_path_buf))) {
-        m_draft.primary_hdd_path = m_hdd_path_buf;
+    if (is_integrated) {
+        ImGui::TextUnformatted("Optional Host C: Directory Path:");
+        ImGui::SetNextItemWidth((std::min)(480.0f, ImGui::GetContentRegionAvail().x));
+        if (ImGui::InputTextWithHint("##WizHddPath", "Leave blank for automatic default path...", m_hdd_path_buf, sizeof(m_hdd_path_buf))) {
+            m_draft.primary_hdd_path = m_hdd_path_buf;
+        }
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
+        ImGui::TextWrapped("Next step (3. OS & Storage) lets you create a new blank hard disk image (.img) with custom capacity or attach an existing HDD image.");
+        ImGui::PopStyleColor();
     }
 }
 
@@ -720,71 +730,124 @@ void ViewWizard::RenderStep3OsStorage() {
     ImGui::Text("Select Target Operating System (Hardware Tier %d Compatibility Enforced):", m_draft.archetype_tier);
     ImGui::Spacing();
 
-    ImGui::BeginChild("##WizardOsList", ImVec2(-1.0f, 175.0f), true);
+    const float avail_w = ImGui::GetContentRegionAvail().x;
+    const int os_cols = (avail_w >= 680.0f) ? 2 : 1;
+    const float os_list_h = (os_cols == 2) ? 156.0f : 185.0f;
+
+    ImGui::BeginChild("##WizardOsList", ImVec2(-1.0f, os_list_h), true);
     {
-        const bool none_selected = m_draft.os_id.empty();
-        if (ImGui::RadioButton("None / DOSBox-X Built-in DOS", none_selected)) {
-            m_draft.os_id.clear();
-        }
-
-        for (size_t i = 0; i < os_list.size(); ++i) {
-            const OSDistributionRecord& os = os_list[i];
-            std::string reason;
-            const bool compat = ArchetypeManager::GetInstance().ValidateMachineCompatibility(m_draft, os, reason);
-            const bool selected = (m_draft.os_id == os.id);
-
-            ImGui::BeginDisabled(!compat);
-            char label[192];
-            std::snprintf(label, sizeof(label), "%s  [%s | %s | Rec: %d MB]",
-                          os.display_name.c_str(),
-                          os.os_family.c_str(),
-                          os.filesystem_type.c_str(),
-                          os.recommended_hdd_mb);
-            if (ImGui::RadioButton(label, selected)) {
-                std::string err;
-                SelectOSDistribution(os.id, err);
+        if (ImGui::BeginTable("##WizardOsGrid", os_cols, ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextColumn();
+            const bool none_selected = m_draft.os_id.empty();
+            if (ImGui::RadioButton("None / DOSBox-X Built-in DOS", none_selected)) {
+                m_draft.os_id.clear();
             }
-            ImGui::EndDisabled();
 
-            if (!compat) {
-                ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.42f, 0.35f, 1.0f));
-                ImGui::Text("(Requires Tier %d+)", os.min_archetype_tier);
-                ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                    ImGui::SetTooltip("%s", reason.c_str());
+            for (size_t i = 0; i < os_list.size(); ++i) {
+                ImGui::TableNextColumn();
+                const OSDistributionRecord& os = os_list[i];
+                std::string reason;
+                const bool compat = ArchetypeManager::GetInstance().ValidateMachineCompatibility(m_draft, os, reason);
+                const bool selected = (m_draft.os_id == os.id);
+
+                ImGui::BeginDisabled(!compat);
+                char label[192];
+                std::snprintf(label, sizeof(label), "%s [%s | %d MB]##os_%u",
+                              os.display_name.c_str(),
+                              os.filesystem_type.c_str(),
+                              os.recommended_hdd_mb,
+                              static_cast<unsigned int>(i));
+                if (ImGui::RadioButton(label, selected)) {
+                    std::string err;
+                    SelectOSDistribution(os.id, err);
+                }
+                ImGui::EndDisabled();
+
+                if (!compat) {
+                    ImGui::SameLine();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.42f, 0.35f, 1.0f));
+                    ImGui::Text("(Tier %d+)", os.min_archetype_tier);
+                    ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        ImGui::SetTooltip("%s", reason.c_str());
+                    }
                 }
             }
+            ImGui::EndTable();
         }
     }
     ImGui::EndChild();
 
     ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::Text("Hard Disk Image (Drive C:):");
 
-    if (m_draft.boot_mode == "REAL_HDD_BOOT") {
+    if (m_draft.boot_mode != "REAL_HDD_BOOT") {
+        ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
+        ImGui::TextWrapped("Currently set to Integrated DOS (host folder C:). Select an OS above or click below to create a virtual hard disk image (.img).");
+        ImGui::PopStyleColor();
+        if (ImGui::Button("Create Virtual Hard Disk Image (Switch to Real HDD Boot)")) {
+            SetBootMode("REAL_HDD_BOOT");
+            SetCreateBlankHddOnDisk(true);
+        }
+    } else {
         if (ImGui::RadioButton("Create New Blank HDD Image", m_create_blank_hdd_file)) {
             SetCreateBlankHddOnDisk(true);
         }
         ImGui::SameLine(0.0f, 16.0f);
-        if (ImGui::RadioButton("Import Existing HDD Image", !m_create_blank_hdd_file)) {
+        if (ImGui::RadioButton("Use Existing HDD Image", !m_create_blank_hdd_file)) {
             SetCreateBlankHddOnDisk(false);
         }
 
         if (m_create_blank_hdd_file) {
-            ImGui::Text("Hard Disk Capacity (MB):");
+            ImGui::Text("Presets:");
+            static const int kPresets[6] = {20, 120, 250, 500, 1024, 2048};
+            static const char* kPresetLabels[6] = {"20 MB", "120 MB", "250 MB", "500 MB", "1 GB", "2 GB"};
+            for (int p = 0; p < 6; ++p) {
+                ImGui::SameLine();
+                const bool active = (m_hdd_size_mb == kPresets[p]);
+                if (active) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, pal.accent);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.08f, 0.08f, 0.08f, 1.0f));
+                }
+                if (ImGui::SmallButton(kPresetLabels[p])) {
+                    SetHddSizeMb(kPresets[p]);
+                }
+                if (active) {
+                    ImGui::PopStyleColor(2);
+                }
+            }
+
+            ImGui::Text("Capacity:");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(220.0f);
-            if (ImGui::SliderInt("##WizHddSize", &m_hdd_size_mb, 20, 2048, "%d MB")) {
+            if (ImGui::SliderInt("##WizHddSize", &m_hdd_size_mb, 10, 4096, "%d MB")) {
                 m_draft.primary_hdd_chs = ComputeHddChsGeometry(m_hdd_size_mb);
             }
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
             ImGui::Text("CHS: %s", ComputeHddChsGeometry(m_hdd_size_mb).c_str());
             ImGui::PopStyleColor();
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
-            ImGui::TextWrapped("Existing HDD image uses DOSBox-X auto-detect by default; enter an explicit C,H,S override below only if your image lacks detectable geometry.");
+
+            ImGui::Text("Image File Path:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth((std::min)(420.0f, ImGui::GetContentRegionAvail().x));
+            if (ImGui::InputTextWithHint("##WizNewHddPath", "Auto-create in Kiosk machines folder (or enter custom .img path)...", m_hdd_path_buf, sizeof(m_hdd_path_buf))) {
+                m_draft.primary_hdd_path = m_hdd_path_buf;
+            }
+
+            ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
+            ImGui::TextWrapped("A new %d MB blank HDD image (CHS %s) will be created automatically when you finish.",
+                               m_hdd_size_mb, ComputeHddChsGeometry(m_hdd_size_mb).c_str());
             ImGui::PopStyleColor();
+        } else {
+            ImGui::Text("Existing HDD Image Path:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth((std::min)(420.0f, ImGui::GetContentRegionAvail().x));
+            if (ImGui::InputTextWithHint("##WizExistingHddPath", "Path to existing hdd_c.img...", m_hdd_path_buf, sizeof(m_hdd_path_buf))) {
+                m_draft.primary_hdd_path = m_hdd_path_buf;
+            }
             ImGui::SetNextItemWidth(220.0f);
             if (ImGui::InputTextWithHint("Optional CHS Override", "e.g. 1015,16,63 (blank = auto)", m_custom_chs_buf, sizeof(m_custom_chs_buf))) {
                 SetCustomHddChsOverride(m_custom_chs_buf);
@@ -800,8 +863,8 @@ void ViewWizard::RenderStep3OsStorage() {
         std::string cur_floppy = m_installer_floppy_media_id.empty() ? "(None)" : m_installer_floppy_media_id;
         std::string cur_cd = m_installer_cd_media_id.empty() ? "(None)" : m_installer_cd_media_id;
         for (size_t i = 0; i < pool.size(); ++i) {
-            if (pool[i].id == m_installer_floppy_media_id) cur_floppy = pool[i].label_title;
-            if (pool[i].id == m_installer_cd_media_id) cur_cd = pool[i].label_title;
+            if (pool[i].id == m_installer_floppy_media_id) cur_floppy = DiskCaddyView::FormatMediaDisplayName(pool[i]);
+            if (pool[i].id == m_installer_cd_media_id) cur_cd = DiskCaddyView::FormatMediaDisplayName(pool[i]);
         }
         if (ImGui::BeginCombo("Drive A: Floppy", cur_floppy.c_str())) {
             if (ImGui::Selectable("(None)##flp_none", m_installer_floppy_media_id.empty())) {
@@ -810,7 +873,8 @@ void ViewWizard::RenderStep3OsStorage() {
             for (size_t i = 0; i < pool.size(); ++i) {
                 if (pool[i].media_type.find("FLOPPY") != std::string::npos) {
                     ImGui::PushID(static_cast<int>(i));
-                    if (ImGui::Selectable(pool[i].label_title.c_str(), m_installer_floppy_media_id == pool[i].id)) {
+                    const std::string disp = DiskCaddyView::FormatMediaDisplayName(pool[i]);
+                    if (ImGui::Selectable(disp.c_str(), m_installer_floppy_media_id == pool[i].id)) {
                         m_installer_floppy_media_id = pool[i].id;
                     }
                     ImGui::PopID();
@@ -826,7 +890,8 @@ void ViewWizard::RenderStep3OsStorage() {
             for (size_t i = 0; i < pool.size(); ++i) {
                 if (pool[i].media_type == "CDROM_ISO" || pool[i].media_type == "CDROM_CUE") {
                     ImGui::PushID(static_cast<int>(i));
-                    if (ImGui::Selectable(pool[i].label_title.c_str(), m_installer_cd_media_id == pool[i].id)) {
+                    const std::string disp = DiskCaddyView::FormatMediaDisplayName(pool[i]);
+                    if (ImGui::Selectable(disp.c_str(), m_installer_cd_media_id == pool[i].id)) {
                         m_installer_cd_media_id = pool[i].id;
                     }
                     ImGui::PopID();
@@ -848,14 +913,28 @@ void ViewWizard::RenderStep4ReviewCreate() {
     ImGui::Text("Boot Mode:  %s", m_draft.boot_mode.c_str());
     ImGui::Text("Target OS:  %s", m_draft.os_id.empty() ? "DOSBox-X Integrated DOS" : m_draft.os_id.c_str());
     if (m_draft.boot_mode == "REAL_HDD_BOOT") {
-        ImGui::Text("HDD Image:  %s (CHS: %s)", m_draft.primary_hdd_path.c_str(), m_draft.primary_hdd_chs.c_str());
+        if (m_create_blank_hdd_file) {
+            const std::string target_desc = m_draft.primary_hdd_path.empty()
+                                                ? "(Auto-generated in Kiosk machines folder)"
+                                                : m_draft.primary_hdd_path;
+            ImGui::Text("HDD Image:  [NEW %d MB Blank] %s (CHS: %s)",
+                        m_hdd_size_mb, target_desc.c_str(), m_draft.primary_hdd_chs.c_str());
+        } else {
+            ImGui::Text("HDD Image:  [Existing] %s (CHS: %s)",
+                        m_draft.primary_hdd_path.c_str(),
+                        m_draft.primary_hdd_chs.empty() ? "Auto-detect" : m_draft.primary_hdd_chs.c_str());
+        }
     }
     ImGui::EndChild();
     ImGui::PopStyleColor();
 
     ImGui::Spacing();
     if (ImGui::CollapsingHeader("Synthesized DOSBox-X Config Preview")) {
-        const std::string preview = ConfigSynthesizer::GetInstance().SynthesizeConfig(m_draft);
+        MachineRecord preview_draft = m_draft;
+        if (preview_draft.boot_mode == "REAL_HDD_BOOT" && m_create_blank_hdd_file && preview_draft.primary_hdd_path.empty()) {
+            preview_draft.primary_hdd_path = "<auto_generated_hdd_c.img>";
+        }
+        const std::string preview = ConfigSynthesizer::GetInstance().SynthesizeConfig(preview_draft);
         ImGui::BeginChild("##WizConfPreview", ImVec2(-1.0f, 125.0f), true);
         ImGui::TextUnformatted(preview.c_str());
         ImGui::EndChild();

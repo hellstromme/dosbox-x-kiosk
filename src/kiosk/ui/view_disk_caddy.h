@@ -54,6 +54,8 @@ public:
     static bool ExtractIso9660VolumeLabelFromFile(const std::string& file_path, std::string& out_label);
     static bool DetectCueSheetRedbookAudio(const std::string& cue_path, std::string& out_first_bin_path);
     static std::string HumanReadableMediaTypeBadge(const std::string& media_type);
+    static std::string DeriveDefaultMediaGroup(const std::string& file_path);
+    static std::string FormatMediaDisplayName(const MediaPoolRecord& media);
 
     // 3. ImGui Procedural Skeuomorphic Card Renderer
     // Returns true if the card was clicked/activated by the user in the current frame.

@@ -782,6 +782,81 @@ void KioskManager::AbortSessionToShell() {
     OnGuestShutdown(KioskShutdownReason::USER_OVERLAY_ABORT);
 }
 
+bool KioskManager::BuildInSessionRebootAutoexec(
+    std::string& out_autoexec_body,
+    const std::string& live_drive_a,
+    const std::string& live_drive_b,
+    const std::string& live_drive_d,
+    const std::string& live_drive_e
+) {
+    out_autoexec_body.clear();
+    LaunchContext ctx;
+    std::string dispatch_path;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ctx = m_launch_ctx;
+        dispatch_path = m_active_dispatch_image_path;
+    }
+
+    if (!ctx.is_real_hdd_boot || ctx.machine_id.empty()) {
+        return false;
+    }
+
+    MachineRecord machine;
+    if (!KioskDatabase::GetInstance().IsOpen() ||
+        !KioskDatabase::GetInstance().GetMachine(ctx.machine_id, machine)) {
+        return false;
+    }
+
+    std::vector<CaddyBindingRecord> live_caddy;
+    auto push_live = [&](const char* drv, const std::string& path) {
+        if (path.empty()) return;
+        if (std::string(drv) == "B" && !dispatch_path.empty() && path == dispatch_path) return;
+        CaddyBindingRecord b;
+        b.machine_id = machine.id;
+        b.target_drive = drv;
+        b.slot_order = 1;
+        b.resolved_file_path = path;
+        live_caddy.push_back(b);
+    };
+    push_live("A", live_drive_a);
+    push_live("B", live_drive_b);
+    push_live("D", live_drive_d);
+    push_live("E", live_drive_e);
+
+    // Mirror real PC BIOS boot order:
+    // - If a floppy is still inserted in Drive A:, boot from A: (e.g. mid-install FDISK reboot).
+    // - If Drive A: is ejected and OS is not yet marked installed but CD D: is present, boot D:.
+    // - Otherwise (all installer media ejected), boot from primary HDD C:.
+    const bool boot_installer = !live_drive_a.empty() || (!machine.os_installed && !live_drive_d.empty());
+
+    if (!boot_installer && !machine.os_installed && !machine.primary_hdd_path.empty()) {
+        std::ifstream hdd(machine.primary_hdd_path.c_str(), std::ios::binary);
+        if (hdd.is_open()) {
+            unsigned char mbr[512] = {0};
+            hdd.read(reinterpret_cast<char*>(mbr), 512);
+            if (hdd.gcount() == 512 && mbr[510] == 0x55 && mbr[511] == 0xAA) {
+                machine.os_installed = true;
+                if (KioskDatabase::GetInstance().UpdateMachine(machine)) {
+                    LOG_MSG("KIOSK: Detected bootable MBR on '%s' after installer media ejection; marked '%s' as os_installed=true.",
+                            machine.primary_hdd_path.c_str(), machine.display_name.c_str());
+                }
+            }
+        }
+    }
+
+    std::string full_autoexec = ConfigSynthesizer::GetInstance().SynthesizeAutoexec(
+        machine, nullptr, live_caddy, dispatch_path, boot_installer
+    );
+    const std::string header = "[autoexec]\n";
+    if (full_autoexec.compare(0, header.size(), header) == 0) {
+        out_autoexec_body = full_autoexec.substr(header.size());
+    } else {
+        out_autoexec_body = full_autoexec;
+    }
+    return true;
+}
+
 void KioskManager::OnGuestShutdown(KioskShutdownReason reason) {
     if (m_state.load() == KioskState::STATE_SHELL_INTERACTIVE &&
         m_last_shutdown_reason.load() == reason) {

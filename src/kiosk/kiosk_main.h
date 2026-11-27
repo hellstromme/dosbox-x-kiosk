@@ -64,6 +64,16 @@ public:
     void AbortSessionToShell();
     void OnGuestShutdown(KioskShutdownReason reason);
 
+    // Re-synthesizes [autoexec] body for an in-session guest reboot (Ctrl+Alt+Del / INT 19h)
+    // using live non-ejected drive paths so ejected installer media is not re-mounted/re-booted.
+    bool BuildInSessionRebootAutoexec(
+        std::string& out_autoexec_body,
+        const std::string& live_drive_a,
+        const std::string& live_drive_b,
+        const std::string& live_drive_d,
+        const std::string& live_drive_e
+    );
+
     static bool RelaunchIntoInteractiveShell(
         const char* argv0,
         const std::string& db_path = "",

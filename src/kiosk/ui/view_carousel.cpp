@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <sstream>
 
 #if defined(_WIN32)
@@ -147,6 +148,8 @@ void ViewCarousel::ResetTransientModals() {
     m_show_delete_modal = false;
     m_show_import_modal = false;
     m_show_file_picker = false;
+    m_show_edit_media_modal = false;
+    m_show_rename_group_modal = false;
 }
 
 std::vector<CatalogItemRecord> ViewCarousel::FilterAndSortCatalogItems(
@@ -213,12 +216,14 @@ bool ViewCarousel::HandleAction(KioskHubTab active_tab, KioskInputAction action)
         }
         return false;
     }
-    if (m_show_context_modal || m_show_caddy_modal || m_show_delete_modal || m_show_import_modal) {
+    if (m_show_context_modal || m_show_caddy_modal || m_show_delete_modal || m_show_import_modal || m_show_edit_media_modal || m_show_rename_group_modal) {
         if (action == KioskInputAction::ACTION_BACK) {
             m_show_context_modal = false;
             m_show_caddy_modal = false;
             m_show_delete_modal = false;
             m_show_import_modal = false;
+            m_show_edit_media_modal = false;
+            m_show_rename_group_modal = false;
             return true;
         }
         return false;
@@ -980,33 +985,34 @@ void ViewCarousel::RenderMediaPoolTab() {
     ImGui::AlignTextToFramePadding();
     ImGui::Text("Add Image:");
     ImGui::SameLine();
-    const float input_w = (std::min)(360.0f, (std::max)(160.0f, ImGui::GetContentRegionAvail().x - 240.0f));
+    const float input_w = (std::min)(340.0f, (std::max)(140.0f, ImGui::GetContentRegionAvail().x - 320.0f));
     ImGui::SetNextItemWidth(input_w);
     ImGui::InputTextWithHint("##AddMediaPath", "Path to .img, .ima, .iso, or .cue file...", m_add_media_path_buf, sizeof(m_add_media_path_buf));
     ImGui::SameLine();
+    if (ImGui::Button("Browse & Add...##MediaPoolBrowse")) {
+        OpenFilePicker(m_add_media_path_buf, FilePickerTarget::MEDIA_POOL);
+    }
+    if (ImGui::GetItemRectMax().x + 8.0f + 110.0f <= mp_right) {
+        ImGui::SameLine(0.0f, 8.0f);
+    }
     if (ImGui::Button("Inspect & Add")) {
         std::string path(m_add_media_path_buf);
         if (!path.empty()) {
-            InspectedMediaInfo info;
-            if (!DiskCaddyView::InspectMediaFile(path, info)) {
-                ui.ShowToast("Could not inspect media file (missing or unsupported): " + path);
-            } else {
-                MediaPoolRecord rec;
-                rec.id = GenerateSimpleMediaUuid(path);
-                rec.file_path = path;
-                rec.media_type = info.media_type;
-                rec.physical_style = info.physical_style;
-                rec.volume_label = info.volume_label;
-                rec.label_title = info.label_title.empty() ? path : info.label_title;
-                rec.label_subtitle = info.label_subtitle;
-                rec.has_redbook_audio = info.has_redbook_audio;
-                if (KioskDatabase::GetInstance().InsertMedia(rec)) {
-                    m_add_media_path_buf[0] = '\0';
-                    ui.InvalidateCatalogCache();
-                    ui.ShowToast("Added '" + rec.label_title + "' to Global Media Pool");
-                } else {
-                    ui.ShowToast("Media already exists or could not be saved");
+            std::string label;
+            MediaAddStatus st = AddMediaFileToPool(path, label);
+            if (st == MediaAddStatus::ADDED) {
+                size_t slash = path.find_last_of("\\/");
+                if (slash != std::string::npos) {
+                    std::string parent = (slash == 2 && path[1] == ':') ? path.substr(0, 3) : path.substr(0, slash);
+                    if (!parent.empty()) m_last_media_picker_dir = parent;
                 }
+                m_add_media_path_buf[0] = '\0';
+                ui.InvalidateCatalogCache();
+                ui.ShowToast("Added '" + label + "' to Global Media Pool");
+            } else if (st == MediaAddStatus::ALREADY_EXISTS) {
+                ui.ShowToast("Media already exists in Global Media Pool");
+            } else {
+                ui.ShowToast("Could not inspect media file (missing or unsupported): " + path);
             }
         }
     }
@@ -1020,10 +1026,28 @@ void ViewCarousel::RenderMediaPoolTab() {
     }
     ImGui::SameLine(0.0f, 8.0f);
     if (ImGui::Button("Import GOG / Steam##MediaPool")) {
+        m_show_file_picker = false;
         m_show_import_modal = true;
         m_import_item_type = "GAME";
         m_import_status_msg.clear();
     }
+
+    ImGui::Spacing();
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Filter Pool:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::InputTextWithHint("##MediaPoolFilter", "Filter by set/group, label, description...", m_media_search_buf, sizeof(m_media_search_buf));
+    if (m_media_search_buf[0] != '\0') {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear##MediaFilterClear")) {
+            m_media_search_buf[0] = '\0';
+        }
+    }
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
+    ImGui::TextUnformatted("Tip: Click any disk card to edit its Set/Group, Label, or Description.");
+    ImGui::PopStyleColor();
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1031,59 +1055,185 @@ void ViewCarousel::RenderMediaPoolTab() {
 
     if (media.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
-        ImGui::TextWrapped("Global Media Pool is empty. Add floppy (.img/.ima) or CD-ROM (.iso/.cue) images above to bind them to machines or swap them live with F12+D.");
+        ImGui::TextWrapped("Global Media Pool is empty. Click 'Browse & Add...' above to select one or more floppy (.img/.ima) or CD-ROM (.iso/.cue) images and assign them to a named Set/Group.");
         ImGui::PopStyleColor();
         RenderImportArchiveModal();
+        RenderEditMediaModal();
+        if (m_picker_target == FilePickerTarget::MEDIA_POOL) {
+            RenderFilePickerModal();
+        }
         return;
     }
 
+    // Filter media and group by media_group ("Ungrouped" sorted last)
+    const std::string mq = ToLowerCopy(m_media_search_buf);
+    std::map<std::string, std::vector<const MediaPoolRecord*> > grouped;
+    std::vector<const MediaPoolRecord*> ungrouped;
+    std::vector<const MediaPoolRecord*> filtered_flat;
+    for (size_t i = 0; i < media.size(); ++i) {
+        const MediaPoolRecord& rec = media[i];
+        if (!mq.empty()) {
+            const bool match =
+                ToLowerCopy(rec.media_group).find(mq) != std::string::npos ||
+                ToLowerCopy(rec.label_title).find(mq) != std::string::npos ||
+                ToLowerCopy(rec.label_subtitle).find(mq) != std::string::npos ||
+                ToLowerCopy(rec.file_path).find(mq) != std::string::npos;
+            if (!match) continue;
+        }
+        filtered_flat.push_back(&rec);
+        if (rec.media_group.empty()) {
+            ungrouped.push_back(&rec);
+        } else {
+            grouped[rec.media_group].push_back(&rec);
+        }
+    }
+
     ImGui::BeginChild("##MediaPoolScroll", ImVec2(-1.0f, -1.0f), false);
-    if (m_media_view_mode == CaddyViewMode::SKEUOMORPHIC) {
+    if (filtered_flat.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
+        ImGui::TextUnformatted("No media images match the current filter.");
+        ImGui::PopStyleColor();
+    } else if (m_media_view_mode == CaddyViewMode::SKEUOMORPHIC) {
         const float avail_w = ImGui::GetContentRegionAvail().x;
         const int cols = (std::max)(1, static_cast<int>(avail_w / 184.0f));
-        for (size_t i = 0; i < media.size(); ++i) {
-            if (i % static_cast<size_t>(cols) != 0) {
-                ImGui::SameLine(0.0f, 14.0f);
+
+        auto render_group_cards = [&](const std::string& grp_title, const std::string& raw_group_key, const std::vector<const MediaPoolRecord*>& items) {
+            if (items.empty()) return;
+            char hdr[192];
+            std::snprintf(hdr, sizeof(hdr), "%s (%u image%s)###mp_grp_%s",
+                          grp_title.c_str(),
+                          static_cast<unsigned int>(items.size()),
+                          items.size() == 1 ? "" : "s",
+                          grp_title.c_str());
+            if (ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen)) {
+                char ren_btn[96];
+                std::snprintf(ren_btn, sizeof(ren_btn), "Rename / Merge Group...##ren_%s", grp_title.c_str());
+                if (ImGui::SmallButton(ren_btn)) {
+                    m_rename_group_old_name = raw_group_key;
+                    std::snprintf(m_rename_group_new_buf, sizeof(m_rename_group_new_buf), "%s", raw_group_key.c_str());
+                    m_show_rename_group_modal = true;
+                }
+                ImGui::Spacing();
+                for (size_t i = 0; i < items.size(); ++i) {
+                    if (i % static_cast<size_t>(cols) != 0) {
+                        ImGui::SameLine(0.0f, 14.0f);
+                    }
+                    const MediaPoolRecord& rec = *items[i];
+                    DiskCardRenderParams params;
+                    params.media = rec;
+                    params.target_drive = (rec.media_type == "CDROM_ISO" || rec.media_type == "CDROM_CUE") ? "D" : "A";
+                    params.slot_order = static_cast<int>(i) + 1;
+                    params.is_mounted_active = false;
+                    params.is_selected_focused = false;
+                    if (DiskCaddyView::GetInstance().RenderMediaCard(params)) {
+                        OpenEditMediaModal(rec);
+                    }
+                }
+                ImGui::Spacing();
             }
-            DiskCardRenderParams params;
-            params.media = media[i];
-            params.target_drive = (media[i].media_type == "CDROM_ISO" || media[i].media_type == "CDROM_CUE") ? "D" : "A";
-            params.slot_order = static_cast<int>(i) + 1;
-            params.is_mounted_active = false;
-            params.is_selected_focused = false;
-            if (DiskCaddyView::GetInstance().RenderMediaCard(params)) {
-                MediaPoolRecord toggled = media[i];
-                toggled.is_write_protected = !toggled.is_write_protected;
-                if (KioskDatabase::GetInstance().UpdateMedia(toggled)) {
+        };
+
+        for (std::map<std::string, std::vector<const MediaPoolRecord*> >::const_iterator it = grouped.begin();
+             it != grouped.end(); ++it) {
+            render_group_cards(it->first, it->first, it->second);
+        }
+        render_group_cards("Ungrouped", "", ungrouped);
+    } else {
+        // Bulk-select & assign group toolbar for List view
+        if (ImGui::SmallButton("Select All##mp_sel_all")) {
+            for (size_t i = 0; i < filtered_flat.size(); ++i) {
+                m_media_pool_selected_ids.insert(filtered_flat[i]->id);
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear Sel##mp_sel_clr")) {
+            m_media_pool_selected_ids.clear();
+        }
+        if (!m_media_pool_selected_ids.empty()) {
+            // Suggest folder name from the first selected media record
+            std::string bulk_folder_hint;
+            for (size_t i = 0; i < filtered_flat.size(); ++i) {
+                if (m_media_pool_selected_ids.find(filtered_flat[i]->id) != m_media_pool_selected_ids.end()) {
+                    bulk_folder_hint = DiskCaddyView::DeriveDefaultMediaGroup(filtered_flat[i]->file_path);
+                    if (!bulk_folder_hint.empty()) break;
+                }
+            }
+            ImGui::SameLine(0.0f, 12.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
+            ImGui::Text("Selected (%u) -> Group:", static_cast<unsigned int>(m_media_pool_selected_ids.size()));
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(160.0f);
+            ImGui::InputTextWithHint("##BulkGroupInput", "New or existing group...", m_bulk_group_buf, sizeof(m_bulk_group_buf));
+            ImGui::SameLine();
+            RenderGroupPickerCombo("##BulkGroupPick", m_bulk_group_buf, sizeof(m_bulk_group_buf), bulk_folder_hint);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Assign Group##mp_bulk_apply")) {
+                std::vector<std::string> ids(m_media_pool_selected_ids.begin(), m_media_pool_selected_ids.end());
+                const std::string target_grp(m_bulk_group_buf);
+                if (KioskDatabase::GetInstance().AssignMediaGroupBatch(ids, target_grp)) {
                     ui.InvalidateCatalogCache();
-                    ui.ShowToast(toggled.is_write_protected
-                                     ? ("Write-protected '" + toggled.label_title + "'")
-                                     : ("Write-enabled '" + toggled.label_title + "'"));
+                    char tbuf[160];
+                    std::snprintf(tbuf, sizeof(tbuf), "Assigned %u image%s to '%s'",
+                                  static_cast<unsigned int>(ids.size()),
+                                  ids.size() == 1 ? "" : "s",
+                                  target_grp.empty() ? "Ungrouped" : target_grp.c_str());
+                    ui.ShowToast(tbuf);
+                    m_media_pool_selected_ids.clear();
                 }
             }
         }
-    } else {
-        if (ImGui::BeginTable("##MediaPoolTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
-            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 130.0f);
-            ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::Spacing();
+
+        if (ImGui::BeginTable("##MediaPoolTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+            ImGui::TableSetupColumn("Sel", ImGuiTableColumnFlags_WidthFixed, 34.0f);
+            ImGui::TableSetupColumn("Set / Group", ImGuiTableColumnFlags_WidthFixed, 155.0f);
+            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+            ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthStretch, 1.1f);
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 125.0f);
             ImGui::TableHeadersRow();
 
-            for (size_t i = 0; i < media.size(); ++i) {
-                const MediaPoolRecord& rec = media[i];
+            for (size_t i = 0; i < filtered_flat.size(); ++i) {
+                const MediaPoolRecord& rec = *filtered_flat[i];
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                ImGui::TextUnformatted(rec.label_title.c_str());
+                bool is_checked = (m_media_pool_selected_ids.find(rec.id) != m_media_pool_selected_ids.end());
+                char chk_id[48];
+                std::snprintf(chk_id, sizeof(chk_id), "##mp_chk_%u", static_cast<unsigned int>(i));
+                if (ImGui::Checkbox(chk_id, &is_checked)) {
+                    if (is_checked) m_media_pool_selected_ids.insert(rec.id);
+                    else m_media_pool_selected_ids.erase(rec.id);
+                }
+
                 ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(DiskCaddyView::HumanReadableMediaTypeBadge(rec.media_type).c_str());
+                if (rec.media_group.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
+                    ImGui::TextUnformatted("Ungrouped");
+                    ImGui::PopStyleColor();
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
+                    ImGui::TextUnformatted(rec.media_group.c_str());
+                    ImGui::PopStyleColor();
+                }
                 ImGui::TableSetColumnIndex(2);
-                ImGui::TextUnformatted(rec.file_path.c_str());
+                ImGui::TextUnformatted(rec.label_title.c_str());
                 ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(rec.label_subtitle.c_str());
+                ImGui::TableSetColumnIndex(4);
+                ImGui::TextUnformatted(DiskCaddyView::HumanReadableMediaTypeBadge(rec.media_type).c_str());
+                ImGui::TableSetColumnIndex(5);
+                char edit_id[48];
+                std::snprintf(edit_id, sizeof(edit_id), "Edit##mp_ed_%u", static_cast<unsigned int>(i));
+                if (ImGui::SmallButton(edit_id)) {
+                    OpenEditMediaModal(rec);
+                }
+                ImGui::SameLine();
                 char del_id[48];
                 std::snprintf(del_id, sizeof(del_id), "Remove##mp_%u", static_cast<unsigned int>(i));
                 if (ImGui::SmallButton(del_id)) {
                     if (KioskDatabase::GetInstance().DeleteMedia(rec.id)) {
+                        m_media_pool_selected_ids.erase(rec.id);
                         ui.InvalidateCatalogCache();
                         ui.ShowToast("Removed media from Global Pool");
                     }
@@ -1094,6 +1244,11 @@ void ViewCarousel::RenderMediaPoolTab() {
     }
     ImGui::EndChild();
     RenderImportArchiveModal();
+    RenderEditMediaModal();
+    RenderRenameGroupModal();
+    if (m_picker_target == FilePickerTarget::MEDIA_POOL) {
+        RenderFilePickerModal();
+    }
 }
 
 void ViewCarousel::RenderContextActionsModal() {
@@ -1305,10 +1460,17 @@ void ViewCarousel::RenderCaddyManagerModal() {
         ImGui::BeginChild("##BoundCaddyList", ImVec2(-1.0f, 170.0f), true);
         for (size_t i = 0; i < m_caddy_modal_bindings.size(); ++i) {
             const CaddyBindingRecord& b = m_caddy_modal_bindings[i];
+            std::string display_name = b.resolved_label.empty() ? b.resolved_file_path : b.resolved_label;
+            for (size_t p = 0; p < pool.size(); ++p) {
+                if (pool[p].id == b.media_id) {
+                    display_name = DiskCaddyView::FormatMediaDisplayName(pool[p]);
+                    break;
+                }
+            }
             ImGui::Text("[%s: Slot %d] %s (%s)",
                         b.target_drive.c_str(),
                         b.slot_order,
-                        b.resolved_label.empty() ? b.resolved_file_path.c_str() : b.resolved_label.c_str(),
+                        display_name.c_str(),
                         b.resolved_media_type.c_str());
             ImGui::SameLine();
             char rm_btn[32];
@@ -1357,13 +1519,28 @@ void ViewCarousel::RenderCaddyManagerModal() {
                 m_caddy_modal_selected_media = 0;
             }
             const MediaPoolRecord* chosen = compatible[static_cast<size_t>(m_caddy_modal_selected_media)];
-            const float combo_w = (std::min)(280.0f, (std::max)(120.0f, ImGui::GetContentRegionAvail().x - 120.0f));
+            const std::string chosen_display = DiskCaddyView::FormatMediaDisplayName(*chosen);
+            // Count compatible disks in the same media_group (for 1-click "Attach Set")
+            std::vector<const MediaPoolRecord*> same_group;
+            if (!chosen->media_group.empty()) {
+                for (size_t i = 0; i < compatible.size(); ++i) {
+                    if (compatible[i]->media_group == chosen->media_group) {
+                        same_group.push_back(compatible[i]);
+                    }
+                }
+            }
+            const float right_btns_w = (same_group.size() > 1) ? 215.0f : 110.0f;
+            const float combo_w = (std::min)(300.0f, (std::max)(120.0f, ImGui::GetContentRegionAvail().x - right_btns_w));
             ImGui::SetNextItemWidth(combo_w);
-            if (ImGui::BeginCombo("Media", chosen->label_title.c_str())) {
+            if (ImGui::BeginCombo("Media", chosen_display.c_str())) {
                 for (size_t i = 0; i < compatible.size(); ++i) {
                     ImGui::PushID(static_cast<int>(i));
                     const bool is_sel = (static_cast<int>(i) == m_caddy_modal_selected_media);
-                    if (ImGui::Selectable(compatible[i]->label_title.c_str(), is_sel)) {
+                    std::string item_lbl = DiskCaddyView::FormatMediaDisplayName(*compatible[i]);
+                    if (!compatible[i]->label_subtitle.empty()) {
+                        item_lbl += "  (" + compatible[i]->label_subtitle + ")";
+                    }
+                    if (ImGui::Selectable(item_lbl.c_str(), is_sel)) {
                         m_caddy_modal_selected_media = static_cast<int>(i);
                     }
                     ImGui::PopID();
@@ -1388,6 +1565,48 @@ void ViewCarousel::RenderCaddyManagerModal() {
                                                      ? KioskDatabase::GetInstance().GetCaddyBindingsForItem(m_caddy_modal_target_id)
                                                      : KioskDatabase::GetInstance().GetCaddyBindingsForMachine(m_caddy_modal_target_id);
                         KioskUI::GetInstance().ShowToast("Attached disk to Drive " + nb.target_drive + ":");
+                    }
+                }
+            }
+            if (same_group.size() > 1) {
+                ImGui::SameLine();
+                char set_btn[48];
+                std::snprintf(set_btn, sizeof(set_btn), "Attach Set (%u)",
+                              static_cast<unsigned int>(same_group.size()));
+                if (ImGui::Button(set_btn)) {
+                    int attached = 0;
+                    for (size_t g = 0; g < same_group.size(); ++g) {
+                        bool already_bound = false;
+                        for (size_t b = 0; b < m_caddy_modal_bindings.size(); ++b) {
+                            if (m_caddy_modal_bindings[b].media_id == same_group[g]->id &&
+                                m_caddy_modal_bindings[b].target_drive == active_drive) {
+                                already_bound = true;
+                                break;
+                            }
+                        }
+                        if (already_bound) continue;
+                        CaddyBindingRecord nb;
+                        if (m_caddy_modal_is_item) nb.catalog_item_id = m_caddy_modal_target_id;
+                        else nb.machine_id = m_caddy_modal_target_id;
+                        nb.media_id = same_group[g]->id;
+                        nb.target_drive = active_drive;
+                        nb.slot_order = ComputeNextSlotOrder(m_caddy_modal_bindings, active_drive);
+                        if (KioskDatabase::GetInstance().AddCaddyBinding(nb)) {
+                            m_caddy_modal_bindings.push_back(nb);
+                            ++attached;
+                        }
+                    }
+                    m_caddy_modal_bindings = m_caddy_modal_is_item
+                                                 ? KioskDatabase::GetInstance().GetCaddyBindingsForItem(m_caddy_modal_target_id)
+                                                 : KioskDatabase::GetInstance().GetCaddyBindingsForMachine(m_caddy_modal_target_id);
+                    if (attached > 0) {
+                        char tbuf[128];
+                        std::snprintf(tbuf, sizeof(tbuf), "Attached %d disk%s from '%s' to Drive %s:",
+                                      attached, attached == 1 ? "" : "s",
+                                      chosen->media_group.c_str(), active_drive.c_str());
+                        KioskUI::GetInstance().ShowToast(tbuf);
+                    } else {
+                        KioskUI::GetInstance().ShowToast("All disks in '" + chosen->media_group + "' are already attached.");
                     }
                 }
             }
@@ -1483,7 +1702,7 @@ void ViewCarousel::RenderImportArchiveModal() {
         ImGui::InputTextWithHint("##ImportSourcePath", "e.g. setup_game.exe or steam_game.zip", m_import_path_buf, sizeof(m_import_path_buf));
         ImGui::SameLine();
         if (ImGui::Button("Browse...##ImportBrowse", ImVec2(browse_w, 0.0f))) {
-            OpenFilePicker(m_import_path_buf);
+            OpenFilePicker(m_import_path_buf, FilePickerTarget::IMPORT_ARCHIVE);
         }
         ImGui::Spacing();
 
@@ -1634,7 +1853,9 @@ void ViewCarousel::RenderImportArchiveModal() {
         }
         if (importing_now || result_pending) ImGui::EndDisabled();
 
-        RenderFilePickerModal();
+        if (m_picker_target == FilePickerTarget::IMPORT_ARCHIVE) {
+            RenderFilePickerModal();
+        }
         ImGui::EndPopup();
     }
 }
@@ -1753,6 +1974,18 @@ bool PickerMatchesImportExt(const std::string& filename) {
     return false;
 }
 
+bool PickerMatchesMediaExt(const std::string& filename) {
+    std::string low = ToLowerCopy(filename);
+    if (low.size() >= 4) {
+        std::string ext = low.substr(low.size() - 4);
+        if (ext == ".img" || ext == ".ima" || ext == ".iso" ||
+            ext == ".cue" || ext == ".bin" || ext == ".vfd" || ext == ".flp") {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string PickerFormatSize(uint64_t bytes) {
     char buf[32];
     if (bytes >= 1024ULL * 1024ULL) {
@@ -1765,9 +1998,86 @@ std::string PickerFormatSize(uint64_t bytes) {
     return std::string(buf);
 }
 
+std::string NormalizePathKey(const std::string& p) {
+    std::string out = PickerNormalizeDir(p);
+#if defined(_WIN32)
+    out = ToLowerCopy(out);
+#endif
+    return out;
+}
+
 } // anonymous namespace
 
-void ViewCarousel::OpenFilePicker(const std::string& initial_dir) {
+ViewCarousel::MediaAddStatus ViewCarousel::AddMediaFileToPool(
+    const std::string& file_path,
+    std::string& out_label,
+    const std::string& media_group
+) {
+    out_label.clear();
+    if (file_path.empty()) return MediaAddStatus::INVALID_OR_MISSING;
+
+    InspectedMediaInfo info;
+    if (!DiskCaddyView::InspectMediaFile(file_path, info)) {
+        return MediaAddStatus::INVALID_OR_MISSING;
+    }
+
+    MediaPoolRecord rec;
+    rec.id = GenerateSimpleMediaUuid(file_path);
+    rec.file_path = file_path;
+    rec.media_type = info.media_type;
+    rec.physical_style = info.physical_style;
+    rec.volume_label = info.volume_label;
+    rec.label_title = info.label_title.empty() ? file_path : info.label_title;
+    rec.label_subtitle = info.label_subtitle;
+    rec.media_group = !media_group.empty() ? media_group : DiskCaddyView::DeriveDefaultMediaGroup(file_path);
+    rec.has_redbook_audio = info.has_redbook_audio;
+    out_label = DiskCaddyView::FormatMediaDisplayName(rec);
+
+    if (!KioskDatabase::GetInstance().InsertMedia(rec)) {
+        return MediaAddStatus::ALREADY_EXISTS;
+    }
+    return MediaAddStatus::ADDED;
+}
+
+int ViewCarousel::AddMultipleMediaFilesToPool(
+    const std::vector<std::string>& paths,
+    int& out_already_exists,
+    int& out_failed,
+    const std::string& media_group
+) {
+    out_already_exists = 0;
+    out_failed = 0;
+    int added = 0;
+    for (size_t i = 0; i < paths.size(); ++i) {
+        std::string label;
+        MediaAddStatus st = AddMediaFileToPool(paths[i], label, media_group);
+        if (st == MediaAddStatus::ADDED) {
+            ++added;
+        } else if (st == MediaAddStatus::ALREADY_EXISTS) {
+            ++out_already_exists;
+        } else {
+            ++out_failed;
+        }
+    }
+    if (added > 0) {
+        KioskUI::GetInstance().InvalidateCatalogCache();
+    }
+    return added;
+}
+
+bool ViewCarousel::MatchesFilePickerFilter(const std::string& filename, FilePickerTarget target) {
+    if (target == FilePickerTarget::MEDIA_POOL) {
+        return PickerMatchesMediaExt(filename);
+    }
+    return PickerMatchesImportExt(filename);
+}
+
+void ViewCarousel::OpenFilePicker(const std::string& initial_dir, FilePickerTarget target) {
+    m_picker_target = target;
+    m_picker_filter_ext = true;
+    m_picker_multi_selected.clear();
+    m_picker_status_msg.clear();
+
     std::string start_dir;
     if (!initial_dir.empty()) {
         std::string norm = PickerNormalizeDir(initial_dir);
@@ -1778,6 +2088,14 @@ void ViewCarousel::OpenFilePicker(const std::string& initial_dir) {
             if (!parent.empty() && PickerIsDirectory(parent)) {
                 start_dir = parent;
             }
+        }
+    }
+    if (start_dir.empty()) {
+        const std::string& remembered = (target == FilePickerTarget::MEDIA_POOL)
+                                            ? m_last_media_picker_dir
+                                            : m_last_import_picker_dir;
+        if (!remembered.empty() && PickerIsDirectory(remembered)) {
+            start_dir = remembered;
         }
     }
     if (start_dir.empty()) {
@@ -1792,6 +2110,19 @@ void ViewCarousel::OpenFilePicker(const std::string& initial_dir) {
 void ViewCarousel::RefreshFilePickerEntries() {
     m_picker_entries.clear();
     m_picker_selected_idx = -1;
+    m_picker_multi_selected.clear();
+
+    if (!m_picker_current_dir.empty()) {
+        if (m_picker_target == FilePickerTarget::MEDIA_POOL) {
+            m_last_media_picker_dir = m_picker_current_dir;
+            std::string derived = DiskCaddyView::DeriveDefaultMediaGroup(PickerJoin(m_picker_current_dir, "disk.img"));
+            std::snprintf(m_picker_group_buf, sizeof(m_picker_group_buf), "%s", derived.c_str());
+        } else {
+            m_last_import_picker_dir = m_picker_current_dir;
+        }
+    } else if (m_picker_target == FilePickerTarget::MEDIA_POOL) {
+        m_picker_group_buf[0] = '\0';
+    }
 
 #if defined(_WIN32)
     if (m_picker_current_dir.empty()) {
@@ -1820,7 +2151,7 @@ void ViewCarousel::RefreshFilePickerEntries() {
             std::string name = PickerWideToUtf8(ffd.cFileName);
             if (name == "." || name == "..") continue;
             bool is_dir = ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
-            if (!is_dir && m_picker_filter_archives && !PickerMatchesImportExt(name)) {
+            if (!is_dir && m_picker_filter_ext && !MatchesFilePickerFilter(name, m_picker_target)) {
                 continue;
             }
             FilePickerEntry e;
@@ -1853,7 +2184,7 @@ void ViewCarousel::RefreshFilePickerEntries() {
                 is_dir = S_ISDIR(st.st_mode);
                 sz = is_dir ? 0ULL : static_cast<uint64_t>(st.st_size);
             }
-            if (!is_dir && m_picker_filter_archives && !PickerMatchesImportExt(name)) {
+            if (!is_dir && m_picker_filter_ext && !MatchesFilePickerFilter(name, m_picker_target)) {
                 continue;
             }
             FilePickerEntry e;
@@ -1875,28 +2206,77 @@ void ViewCarousel::RefreshFilePickerEntries() {
 }
 
 void ViewCarousel::RenderFilePickerModal() {
-    static const char* kPickerPopupId = "Select Archive or Folder###KioskFilePickerModal";
-    if (m_show_file_picker && !ImGui::IsPopupOpen(kPickerPopupId)) {
-        ImGui::OpenPopup(kPickerPopupId);
+    const bool is_media_mode = (m_picker_target == FilePickerTarget::MEDIA_POOL);
+    const char* popup_id = is_media_mode
+                               ? "Add Disk Images to Media Pool###KioskFilePickerModal"
+                               : "Select Archive or Folder###KioskFilePickerModal";
+    if (m_show_file_picker && !ImGui::IsPopupOpen(popup_id)) {
+        ImGui::OpenPopup(popup_id);
     }
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     if (vp) {
-        const float mw = (std::min)(620.0f, (std::max)(360.0f, vp->WorkSize.x - 24.0f));
-        const float mh = (std::min)(440.0f, (std::max)(300.0f, vp->WorkSize.y - 24.0f));
+        const float mw = (std::min)(680.0f, (std::max)(380.0f, vp->WorkSize.x - 24.0f));
+        const float mh = (std::min)(470.0f, (std::max)(310.0f, vp->WorkSize.y - 24.0f));
         ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(mw, mh), ImGuiCond_Always);
     }
 
+    auto apply_picked_path = [&](const std::string& picked, bool is_folder) {
+        if (picked.size() >= sizeof(m_import_path_buf)) {
+            m_import_status_msg = is_folder
+                                      ? "Selected folder path exceeds maximum supported length."
+                                      : "Selected path exceeds maximum supported length.";
+        } else {
+            std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", picked.c_str());
+            m_import_status_msg.clear();
+        }
+    };
+
+    auto add_media_batch = [&](const std::vector<std::string>& paths) {
+        if (paths.empty()) return;
+        int already = 0;
+        int failed = 0;
+        const std::string grp(m_picker_group_buf);
+        const int added = AddMultipleMediaFilesToPool(paths, already, failed, grp);
+        char msg[192];
+        if (added > 0 && already == 0 && failed == 0) {
+            std::snprintf(msg, sizeof(msg), "Added %d disk image%s to Media Pool.",
+                          added, added == 1 ? "" : "s");
+        } else if (added > 0) {
+            std::snprintf(msg, sizeof(msg), "Added %d image%s (%d already in pool, %d unsupported).",
+                          added, added == 1 ? "" : "s", already, failed);
+        } else if (already > 0 && failed == 0) {
+            std::snprintf(msg, sizeof(msg), "%d selected image%s already in Media Pool.",
+                          already, already == 1 ? "" : "s");
+        } else {
+            std::snprintf(msg, sizeof(msg), "Could not add selected file%s (unsupported or unreadable).",
+                          paths.size() == 1 ? "" : "s");
+        }
+        m_picker_status_msg = msg;
+        KioskUI::GetInstance().ShowToast(msg);
+        m_picker_multi_selected.clear();
+    };
+
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
-    if (ImGui::BeginPopupModal(kPickerPopupId, &m_show_file_picker, flags)) {
+    if (ImGui::BeginPopupModal(popup_id, &m_show_file_picker, flags)) {
         if (!m_show_file_picker) {
             ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
             return;
         }
 
-        const KioskThemePalette& pal = KioskUI::GetInstance().GetThemePalette();
+        KioskUI& ui = KioskUI::GetInstance();
+        const KioskThemePalette& pal = ui.GetThemePalette();
+
+        // Build lookup set of paths already in Global Media Pool (zero SQLite queries — uses cache)
+        std::set<std::string> existing_pool_paths;
+        if (is_media_mode) {
+            const std::vector<MediaPoolRecord>& pool = ui.GetCachedMedia();
+            for (size_t i = 0; i < pool.size(); ++i) {
+                existing_pool_paths.insert(NormalizePathKey(pool[i].file_path));
+            }
+        }
 
         // Top navigation bar
         if (ImGui::Button("Up (..)")) {
@@ -1926,21 +2306,51 @@ void ViewCarousel::RenderFilePickerModal() {
             RefreshFilePickerEntries();
         }
         ImGui::SameLine();
-        if (ImGui::Checkbox(".exe / .zip only", &m_picker_filter_archives)) {
+        const char* filter_label = is_media_mode ? "Disk images only" : ".exe / .zip only";
+        if (ImGui::Checkbox(filter_label, &m_picker_filter_ext)) {
             RefreshFilePickerEntries();
         }
 
         ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
         ImGui::TextWrapped("Location: %s", m_picker_current_dir.empty() ? "(Drives)" : m_picker_current_dir.c_str());
         ImGui::PopStyleColor();
+        if (is_media_mode) {
+            const std::string cur_folder_hint =
+                m_picker_current_dir.empty()
+                    ? ""
+                    : DiskCaddyView::DeriveDefaultMediaGroup(PickerJoin(m_picker_current_dir, "disk.img"));
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("Set / Group:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(220.0f);
+            ImGui::InputTextWithHint("##PickerMediaGroup", "e.g. MS-DOS 6.22, WordPerfect51...", m_picker_group_buf, sizeof(m_picker_group_buf));
+            ImGui::SameLine();
+            RenderGroupPickerCombo("##PickerGroupPick", m_picker_group_buf, sizeof(m_picker_group_buf), cur_folder_hint);
+        }
         ImGui::Separator();
 
+        // Count addable (not-yet-in-pool) files in the current directory for media mode
+        std::vector<std::string> addable_files_in_dir;
+        if (is_media_mode) {
+            for (size_t i = 0; i < m_picker_entries.size(); ++i) {
+                if (!m_picker_entries[i].is_dir &&
+                    existing_pool_paths.find(NormalizePathKey(m_picker_entries[i].full_path)) == existing_pool_paths.end()) {
+                    addable_files_in_dir.push_back(m_picker_entries[i].full_path);
+                }
+            }
+        }
+
         // Scrollable directory / file listing
-        const float list_h = (std::max)(120.0f, ImGui::GetContentRegionAvail().y - 46.0f);
-        if (ImGui::BeginTable("##KioskFilePickerTable", 3,
+        const float footer_reserve = m_picker_status_msg.empty() ? 48.0f : 72.0f;
+        const float list_h = (std::max)(120.0f, ImGui::GetContentRegionAvail().y - footer_reserve);
+        const int col_count = is_media_mode ? 4 : 3;
+        if (ImGui::BeginTable("##KioskFilePickerTable", col_count,
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH,
                               ImVec2(-1.0f, list_h))) {
             ImGui::TableSetupScrollFreeze(0, 1);
+            if (is_media_mode) {
+                ImGui::TableSetupColumn("Sel", ImGuiTableColumnFlags_WidthFixed, 34.0f);
+            }
             ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 64.0f);
             ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 84.0f);
@@ -1951,33 +2361,75 @@ void ViewCarousel::RenderFilePickerModal() {
 
             for (size_t i = 0; i < m_picker_entries.size(); ++i) {
                 const FilePickerEntry& entry = m_picker_entries[i];
+                const bool in_pool = is_media_mode && !entry.is_dir &&
+                                     (existing_pool_paths.find(NormalizePathKey(entry.full_path)) != existing_pool_paths.end());
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
+                int col = 0;
+
+                if (is_media_mode) {
+                    ImGui::TableSetColumnIndex(col++);
+                    if (!entry.is_dir) {
+                        const bool checked = (m_picker_multi_selected.find(entry.full_path) != m_picker_multi_selected.end());
+                        ImGui::PushStyleColor(ImGuiCol_Text, checked ? pal.accent : pal.text_muted);
+                        ImGui::TextUnformatted(checked ? "[x]" : "[ ]");
+                        ImGui::PopStyleColor();
+                    }
+                }
+
+                ImGui::TableSetColumnIndex(col++);
 
                 const char* badge = "[FILE]";
                 if (entry.is_dir) {
                     badge = "[DIR]";
                 } else {
                     std::string low = ToLowerCopy(entry.name);
-                    if (low.size() >= 4 && low.substr(low.size() - 4) == ".zip") badge = "[ZIP]";
-                    else if (low.size() >= 4 && low.substr(low.size() - 4) == ".exe") badge = "[EXE]";
+                    if (low.size() >= 4) {
+                        std::string ext = low.substr(low.size() - 4);
+                        if (ext == ".zip")      badge = "[ZIP]";
+                        else if (ext == ".exe") badge = "[EXE]";
+                        else if (ext == ".iso") badge = "[ISO]";
+                        else if (ext == ".cue") badge = "[CUE]";
+                        else if (ext == ".bin") badge = "[BIN]";
+                        else if (ext == ".img") badge = "[IMG]";
+                        else if (ext == ".ima") badge = "[IMA]";
+                        else if (ext == ".vfd") badge = "[VFD]";
+                        else if (ext == ".flp") badge = "[FLP]";
+                    }
                 }
 
-                const bool is_sel = (static_cast<int>(i) == m_picker_selected_idx);
+                const bool is_sel = is_media_mode
+                                        ? ((!entry.is_dir && m_picker_multi_selected.find(entry.full_path) != m_picker_multi_selected.end()) ||
+                                           (entry.is_dir && static_cast<int>(i) == m_picker_selected_idx))
+                                        : (static_cast<int>(i) == m_picker_selected_idx);
                 ImGui::PushID(static_cast<int>(i));
                 if (ImGui::Selectable(badge, is_sel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
                     m_picker_selected_idx = static_cast<int>(i);
                     if (ImGui::IsMouseDoubleClicked(0)) {
-                        if (entry.is_dir) navigate_idx = static_cast<int>(i);
-                        else pick_file_idx = static_cast<int>(i);
+                        if (entry.is_dir) {
+                            navigate_idx = static_cast<int>(i);
+                        } else {
+                            pick_file_idx = static_cast<int>(i);
+                        }
+                    } else if (is_media_mode && !entry.is_dir) {
+                        if (m_picker_multi_selected.find(entry.full_path) != m_picker_multi_selected.end()) {
+                            m_picker_multi_selected.erase(entry.full_path);
+                        } else {
+                            m_picker_multi_selected.insert(entry.full_path);
+                        }
                     }
                 }
                 ImGui::PopID();
 
-                ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(entry.name.c_str());
+                ImGui::TableSetColumnIndex(col++);
+                if (in_pool) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
+                    ImGui::Text("%s  [IN POOL]", entry.name.c_str());
+                    ImGui::PopStyleColor();
+                } else {
+                    ImGui::TextUnformatted(entry.name.c_str());
+                }
 
-                ImGui::TableSetColumnIndex(2);
+                ImGui::TableSetColumnIndex(col++);
                 if (!entry.is_dir) {
                     std::string sz_str = PickerFormatSize(entry.size_bytes);
                     ImGui::TextUnformatted(sz_str.c_str());
@@ -1991,16 +2443,22 @@ void ViewCarousel::RenderFilePickerModal() {
                 m_picker_current_dir = m_picker_entries[static_cast<size_t>(navigate_idx)].full_path;
                 RefreshFilePickerEntries();
             } else if (pick_file_idx >= 0) {
-                const std::string& picked = m_picker_entries[static_cast<size_t>(pick_file_idx)].full_path;
-                if (picked.size() >= sizeof(m_import_path_buf)) {
-                    m_import_status_msg = "Selected path exceeds maximum supported length.";
+                const std::string picked = m_picker_entries[static_cast<size_t>(pick_file_idx)].full_path;
+                if (is_media_mode) {
+                    std::vector<std::string> single(1, picked);
+                    add_media_batch(single);
                 } else {
-                    std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", picked.c_str());
-                    m_import_status_msg.clear();
+                    apply_picked_path(picked, false);
+                    m_show_file_picker = false;
+                    ImGui::CloseCurrentPopup();
                 }
-                m_show_file_picker = false;
-                ImGui::CloseCurrentPopup();
             }
+        }
+
+        if (!m_picker_status_msg.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
+            ImGui::TextUnformatted(m_picker_status_msg.c_str());
+            ImGui::PopStyleColor();
         }
 
         ImGui::Separator();
@@ -2010,43 +2468,321 @@ void ViewCarousel::RenderFilePickerModal() {
                               m_picker_selected_idx < static_cast<int>(m_picker_entries.size()));
         const bool sel_is_dir = has_sel && m_picker_entries[static_cast<size_t>(m_picker_selected_idx)].is_dir;
 
-        if (!has_sel) ImGui::BeginDisabled();
-        if (ImGui::Button(sel_is_dir ? "Open Folder" : "Select File", ImVec2(120.0f, 30.0f))) {
-            const FilePickerEntry& chosen = m_picker_entries[static_cast<size_t>(m_picker_selected_idx)];
-            if (chosen.is_dir) {
-                m_picker_current_dir = chosen.full_path;
-                RefreshFilePickerEntries();
-            } else {
-                if (chosen.full_path.size() >= sizeof(m_import_path_buf)) {
-                    m_import_status_msg = "Selected path exceeds maximum supported length.";
-                } else {
-                    std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", chosen.full_path.c_str());
-                    m_import_status_msg.clear();
+        if (is_media_mode) {
+            if (sel_is_dir && m_picker_multi_selected.empty()) {
+                if (ImGui::Button("Open Folder", ImVec2(120.0f, 30.0f))) {
+                    m_picker_current_dir = m_picker_entries[static_cast<size_t>(m_picker_selected_idx)].full_path;
+                    RefreshFilePickerEntries();
                 }
+            } else {
+                const int sel_count = static_cast<int>(m_picker_multi_selected.size());
+                char add_btn[48];
+                if (sel_count > 0) {
+                    std::snprintf(add_btn, sizeof(add_btn), "Add Selected (%d)", sel_count);
+                } else {
+                    std::snprintf(add_btn, sizeof(add_btn), "Add Selected");
+                }
+                if (sel_count == 0) ImGui::BeginDisabled();
+                if (ImGui::Button(add_btn, ImVec2(145.0f, 30.0f))) {
+                    std::vector<std::string> batch(m_picker_multi_selected.begin(), m_picker_multi_selected.end());
+                    add_media_batch(batch);
+                }
+                if (sel_count == 0) ImGui::EndDisabled();
+            }
+
+            ImGui::SameLine();
+            const bool can_select_all = !addable_files_in_dir.empty();
+            if (!can_select_all && m_picker_multi_selected.empty()) ImGui::BeginDisabled();
+            if (m_picker_multi_selected.size() == addable_files_in_dir.size() && !m_picker_multi_selected.empty()) {
+                if (ImGui::Button("Clear Sel", ImVec2(95.0f, 30.0f))) {
+                    m_picker_multi_selected.clear();
+                }
+            } else {
+                if (ImGui::Button("Select All", ImVec2(95.0f, 30.0f))) {
+                    m_picker_multi_selected.clear();
+                    for (size_t i = 0; i < addable_files_in_dir.size(); ++i) {
+                        m_picker_multi_selected.insert(addable_files_in_dir[i]);
+                    }
+                }
+            }
+            if (!can_select_all && m_picker_multi_selected.empty()) ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            char add_all_btn[64];
+            std::snprintf(add_all_btn, sizeof(add_all_btn), "Add All in Folder (%u)",
+                          static_cast<unsigned int>(addable_files_in_dir.size()));
+            if (addable_files_in_dir.empty()) ImGui::BeginDisabled();
+            if (ImGui::Button(add_all_btn, ImVec2(180.0f, 30.0f))) {
+                add_media_batch(addable_files_in_dir);
+            }
+            if (addable_files_in_dir.empty()) ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            if (ImGui::Button("Done", ImVec2(85.0f, 30.0f))) {
+                m_show_file_picker = false;
+                ImGui::CloseCurrentPopup();
+            }
+        } else {
+            if (!has_sel) ImGui::BeginDisabled();
+            if (ImGui::Button(sel_is_dir ? "Open Folder" : "Select File", ImVec2(120.0f, 30.0f))) {
+                const FilePickerEntry& chosen = m_picker_entries[static_cast<size_t>(m_picker_selected_idx)];
+                if (chosen.is_dir) {
+                    m_picker_current_dir = chosen.full_path;
+                    RefreshFilePickerEntries();
+                } else {
+                    apply_picked_path(chosen.full_path, false);
+                    m_show_file_picker = false;
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            if (!has_sel) ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            const bool can_use_folder = !m_picker_current_dir.empty();
+            if (!can_use_folder) ImGui::BeginDisabled();
+            if (ImGui::Button("Use This Folder", ImVec2(135.0f, 30.0f))) {
+                apply_picked_path(m_picker_current_dir, true);
+                m_show_file_picker = false;
+                ImGui::CloseCurrentPopup();
+            }
+            if (!can_use_folder) ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(95.0f, 30.0f))) {
                 m_show_file_picker = false;
                 ImGui::CloseCurrentPopup();
             }
         }
-        if (!has_sel) ImGui::EndDisabled();
 
+        ImGui::EndPopup();
+    }
+}
+
+void ViewCarousel::OpenEditMediaModal(const MediaPoolRecord& rec) {
+    m_edit_media_rec = rec;
+    std::snprintf(m_edit_media_group_buf, sizeof(m_edit_media_group_buf), "%s", rec.media_group.c_str());
+    std::snprintf(m_edit_media_title_buf, sizeof(m_edit_media_title_buf), "%s", rec.label_title.c_str());
+    std::snprintf(m_edit_media_subtitle_buf, sizeof(m_edit_media_subtitle_buf), "%s", rec.label_subtitle.c_str());
+    m_edit_media_wp = rec.is_write_protected;
+    m_show_edit_media_modal = true;
+}
+
+void ViewCarousel::RenderEditMediaModal() {
+    static const char* kEditPopupId = "Edit Media Details###KioskEditMediaModal";
+    if (m_show_edit_media_modal && !ImGui::IsPopupOpen(kEditPopupId)) {
+        ImGui::OpenPopup(kEditPopupId);
+    }
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    if (vp) {
+        const float mw = (std::min)(520.0f, (std::max)(320.0f, vp->WorkSize.x - 24.0f));
+        const float mh = (std::min)(305.0f, (std::max)(240.0f, vp->WorkSize.y - 24.0f));
+        ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(mw, mh), ImGuiCond_Always);
+    }
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
+    if (ImGui::BeginPopupModal(kEditPopupId, &m_show_edit_media_modal, flags)) {
+        if (!m_show_edit_media_modal) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+
+        KioskUI& ui = KioskUI::GetInstance();
+        const KioskThemePalette& pal = ui.GetThemePalette();
+
+        ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
+        ImGui::TextWrapped("File: %s", m_edit_media_rec.file_path.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::Text("Set / Group Name:");
+        const std::string file_folder_hint = DiskCaddyView::DeriveDefaultMediaGroup(m_edit_media_rec.file_path);
+        ImGui::SetNextItemWidth((std::max)(160.0f, ImGui::GetContentRegionAvail().x - 118.0f));
+        ImGui::InputTextWithHint("##EditMediaGroup", "e.g. MS-DOS 6.22, WordPerfect51...", m_edit_media_group_buf, sizeof(m_edit_media_group_buf));
         ImGui::SameLine();
-        const bool can_use_folder = !m_picker_current_dir.empty();
-        if (!can_use_folder) ImGui::BeginDisabled();
-        if (ImGui::Button("Use This Folder", ImVec2(135.0f, 30.0f))) {
-            if (m_picker_current_dir.size() >= sizeof(m_import_path_buf)) {
-                m_import_status_msg = "Selected folder path exceeds maximum supported length.";
-            } else {
-                std::snprintf(m_import_path_buf, sizeof(m_import_path_buf), "%s", m_picker_current_dir.c_str());
-                m_import_status_msg.clear();
+        RenderGroupPickerCombo("##EditGroupPick", m_edit_media_group_buf, sizeof(m_edit_media_group_buf), file_folder_hint);
+
+        ImGui::Text("Disk Label / Title:");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##EditMediaTitle", "e.g. Disk 1 - Setup", m_edit_media_title_buf, sizeof(m_edit_media_title_buf));
+
+        ImGui::Text("Description / Subtitle:");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##EditMediaSubtitle", "e.g. Bootable Installer Disk 1 of 3", m_edit_media_subtitle_buf, sizeof(m_edit_media_subtitle_buf));
+
+        ImGui::Checkbox("Write-Protected (Read-Only)", &m_edit_media_wp);
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (ImGui::Button("Save Changes", ImVec2(130.0f, 30.0f))) {
+            MediaPoolRecord updated = m_edit_media_rec;
+            updated.media_group = m_edit_media_group_buf;
+            if (m_edit_media_title_buf[0] != '\0') {
+                updated.label_title = m_edit_media_title_buf;
             }
-            m_show_file_picker = false;
+            updated.label_subtitle = m_edit_media_subtitle_buf;
+            updated.is_write_protected = m_edit_media_wp;
+            if (KioskDatabase::GetInstance().UpdateMedia(updated)) {
+                ui.InvalidateCatalogCache();
+                ui.ShowToast("Updated '" + DiskCaddyView::FormatMediaDisplayName(updated) + "'");
+            }
+            m_show_edit_media_modal = false;
             ImGui::CloseCurrentPopup();
         }
-        if (!can_use_folder) ImGui::EndDisabled();
-
+        ImGui::SameLine();
+        if (ImGui::Button("Remove from Pool", ImVec2(145.0f, 30.0f))) {
+            if (KioskDatabase::GetInstance().DeleteMedia(m_edit_media_rec.id)) {
+                ui.InvalidateCatalogCache();
+                ui.ShowToast("Removed '" + m_edit_media_rec.label_title + "' from Media Pool");
+            }
+            m_show_edit_media_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(95.0f, 30.0f))) {
-            m_show_file_picker = false;
+            m_show_edit_media_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void ViewCarousel::RenderGroupPickerCombo(
+    const char* combo_id,
+    char* target_buf,
+    size_t buf_size,
+    const std::string& folder_suggestion
+) {
+    if (!target_buf || buf_size == 0) return;
+
+    KioskUI& ui = KioskUI::GetInstance();
+    const std::vector<MediaPoolRecord>& media = ui.GetCachedMedia();
+    const std::vector<OSDistributionRecord>& os_dists = ui.GetCachedOSDistributions();
+
+    std::set<std::string> existing_groups;
+    for (size_t i = 0; i < media.size(); ++i) {
+        if (!media[i].media_group.empty()) {
+            existing_groups.insert(media[i].media_group);
+        }
+    }
+
+    ImGui::SetNextItemWidth(110.0f);
+    if (ImGui::BeginCombo(combo_id, "Pick...")) {
+        // 1. Containing folder suggestion (e.g. "WordPerfect51")
+        if (!folder_suggestion.empty()) {
+            ImGui::BeginDisabled();
+            ImGui::Selectable("-- Folder Name --", false);
+            ImGui::EndDisabled();
+            std::string folder_lbl = "Folder: " + folder_suggestion + "##grp_folder";
+            if (ImGui::Selectable(folder_lbl.c_str(), std::string(target_buf) == folder_suggestion)) {
+                std::snprintf(target_buf, buf_size, "%s", folder_suggestion.c_str());
+            }
+            ImGui::Separator();
+        }
+
+        // 2. Existing groups in Global Media Pool + Ungrouped
+        ImGui::BeginDisabled();
+        ImGui::Selectable("-- Existing Groups --", false);
+        ImGui::EndDisabled();
+        for (std::set<std::string>::const_iterator it = existing_groups.begin();
+             it != existing_groups.end(); ++it) {
+            std::string item_id = *it + "##grp_exist_" + *it;
+            if (ImGui::Selectable(item_id.c_str(), std::string(target_buf) == *it)) {
+                std::snprintf(target_buf, buf_size, "%s", it->c_str());
+            }
+        }
+        if (ImGui::Selectable("(Ungrouped)##grp_none", target_buf[0] == '\0')) {
+            target_buf[0] = '\0';
+        }
+
+        // 3. Seeded OS Presets
+        if (!os_dists.empty()) {
+            ImGui::Separator();
+            ImGui::BeginDisabled();
+            ImGui::Selectable("-- OS Presets --", false);
+            ImGui::EndDisabled();
+            for (size_t i = 0; i < os_dists.size(); ++i) {
+                const std::string& os_name = os_dists[i].display_name;
+                std::string item_id = os_name + "##grp_os_" + os_dists[i].id;
+                if (ImGui::Selectable(item_id.c_str(), std::string(target_buf) == os_name)) {
+                    std::snprintf(target_buf, buf_size, "%s", os_name.c_str());
+                }
+            }
+        }
+        ImGui::EndCombo();
+    }
+}
+
+void ViewCarousel::RenderRenameGroupModal() {
+    static const char* kRenamePopupId = "Rename / Merge Media Group###KioskRenameGroupModal";
+    if (m_show_rename_group_modal && !ImGui::IsPopupOpen(kRenamePopupId)) {
+        ImGui::OpenPopup(kRenamePopupId);
+    }
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    if (vp) {
+        const float mw = (std::min)(500.0f, (std::max)(320.0f, vp->WorkSize.x - 24.0f));
+        const float mh = (std::min)(215.0f, (std::max)(180.0f, vp->WorkSize.y - 24.0f));
+        ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(mw, mh), ImGuiCond_Always);
+    }
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
+    if (ImGui::BeginPopupModal(kRenamePopupId, &m_show_rename_group_modal, flags)) {
+        if (!m_show_rename_group_modal) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+
+        KioskUI& ui = KioskUI::GetInstance();
+        const KioskThemePalette& pal = ui.GetThemePalette();
+
+        // Derive a folder hint from the first media item in the group being renamed
+        std::string folder_hint;
+        const std::vector<MediaPoolRecord>& pool = ui.GetCachedMedia();
+        for (size_t i = 0; i < pool.size(); ++i) {
+            if (pool[i].media_group == m_rename_group_old_name) {
+                folder_hint = DiskCaddyView::DeriveDefaultMediaGroup(pool[i].file_path);
+                if (!folder_hint.empty()) break;
+            }
+        }
+
+        ImGui::Text("Current Group: %s",
+                    m_rename_group_old_name.empty() ? "Ungrouped" : m_rename_group_old_name.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, pal.text_muted);
+        ImGui::TextWrapped("Enter a new name or pick an existing group to merge all disks into it. Leave blank for Ungrouped.");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+
+        ImGui::Text("New Group Name:");
+        ImGui::SetNextItemWidth((std::max)(160.0f, ImGui::GetContentRegionAvail().x - 118.0f));
+        ImGui::InputTextWithHint("##RenameGroupNew", "New or existing group name...", m_rename_group_new_buf, sizeof(m_rename_group_new_buf));
+        ImGui::SameLine();
+        RenderGroupPickerCombo("##RenameGroupPick", m_rename_group_new_buf, sizeof(m_rename_group_new_buf), folder_hint);
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (ImGui::Button("Apply to Group", ImVec2(140.0f, 30.0f))) {
+            const std::string new_name(m_rename_group_new_buf);
+            if (KioskDatabase::GetInstance().RenameMediaGroup(m_rename_group_old_name, new_name)) {
+                ui.InvalidateCatalogCache();
+                ui.ShowToast("Updated group to '" + (new_name.empty() ? std::string("Ungrouped") : new_name) + "'");
+            }
+            m_show_rename_group_modal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(95.0f, 30.0f))) {
+            m_show_rename_group_modal = false;
             ImGui::CloseCurrentPopup();
         }
 

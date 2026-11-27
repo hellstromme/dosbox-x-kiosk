@@ -132,6 +132,7 @@ struct MediaPoolRecord {
     bool has_redbook_audio = false;
     bool is_write_protected = false;
     bool is_removable_usb = false;
+    std::string media_group;
     std::string created_at;
 };
 

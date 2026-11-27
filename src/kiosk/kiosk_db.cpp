@@ -240,6 +240,7 @@ bool KioskDatabase::InitializeSchema() {
         "    volume_label TEXT,\n"
         "    label_title TEXT NOT NULL,\n"
         "    label_subtitle TEXT,\n"
+        "    media_group TEXT DEFAULT '',\n"
         "    label_font_style TEXT NOT NULL DEFAULT 'DOT_MATRIX' CHECK (label_font_style IN ('DOT_MATRIX', 'HANDWRITTEN', 'PRINTED_OEM')),\n"
         "    has_redbook_audio BOOLEAN NOT NULL DEFAULT 0,\n"
         "    is_write_protected BOOLEAN NOT NULL DEFAULT 0,\n"
@@ -334,7 +335,16 @@ bool KioskDatabase::InitializeSchema() {
         "CREATE INDEX IF NOT EXISTS idx_caddy_machine ON caddy_bindings(machine_id, target_drive, slot_order);\n"
         "CREATE INDEX IF NOT EXISTS idx_media_usb ON media_pool(is_removable_usb);\n";
 
-    return ExecuteSqlInternal(schema_sql);
+    if (!ExecuteSqlInternal(schema_sql)) {
+        return false;
+    }
+
+    // Safe idempotent migration for pre-existing databases lacking media_group
+    char* mig_err = nullptr;
+    if (sqlite3_exec(m_db, "ALTER TABLE media_pool ADD COLUMN media_group TEXT DEFAULT '';", nullptr, nullptr, &mig_err) != SQLITE_OK) {
+        if (mig_err) sqlite3_free(mig_err);
+    }
+    return true;
 }
 
 bool KioskDatabase::SeedDefaultData() {
@@ -352,23 +362,20 @@ bool KioskDatabase::SeedDefaultData() {
         sqlite3_finalize(check_stmt);
     }
 
-    // 2. Seed default os_distributions if empty
-    check_stmt = nullptr;
-    if (sqlite3_prepare_v2(m_db, "SELECT COUNT(*) FROM os_distributions;", -1, &check_stmt, nullptr) == SQLITE_OK) {
-        if (sqlite3_step(check_stmt) == SQLITE_ROW && sqlite3_column_int(check_stmt, 0) == 0) {
-            const char* seed_os_sql =
-                "INSERT INTO os_distributions (id, display_name, os_family, min_archetype_tier, recommended_hdd_mb, filesystem_type, install_strategy) VALUES\n"
-                "('PC_DOS_110', 'IBM Personal Computer DOS 1.10', 'MSDOS', 1, 10, 'FAT12', 'FLOPPY_SEQUENCE'),\n"
-                "('MSDOS_330',  'Microsoft MS-DOS 3.30',           'MSDOS', 1, 20, 'FAT12', 'FLOPPY_SEQUENCE'),\n"
-                "('MSDOS_500',  'Microsoft MS-DOS 5.00',           'MSDOS', 2, 40, 'FAT16', 'FLOPPY_SEQUENCE'),\n"
-                "('MSDOS_622',  'Microsoft MS-DOS 6.22',           'MSDOS', 3, 250, 'FAT16', 'FLOPPY_SEQUENCE'),\n"
-                "('FREEDOS_13',  'FreeDOS 1.3',                     'FREEDOS', 3, 500, 'FAT16', 'BOOTABLE_CD'),\n"
-                "('WIN311_FWG', 'Windows for Workgroups 3.11',     'WIN3X', 3, 250, 'FAT16', 'FLOPPY_SEQUENCE'),\n"
-                "('WIN95_OSR2', 'Microsoft Windows 95 OSR 2.5',    'WIN9X', 4, 1024, 'FAT32', 'WIN9X_CAB_PRECOPY'),\n"
-                "('WIN98_SE',   'Microsoft Windows 98 Second Edition', 'WIN9X', 5, 2048, 'FAT32', 'WIN9X_CAB_PRECOPY');\n";
-            ExecuteSqlInternal(seed_os_sql);
-        }
-        sqlite3_finalize(check_stmt);
+    // 2. Seed default os_distributions (INSERT OR IGNORE so existing DBs receive newly added distros)
+    {
+        const char* seed_os_sql =
+            "INSERT OR IGNORE INTO os_distributions (id, display_name, os_family, min_archetype_tier, recommended_hdd_mb, filesystem_type, install_strategy) VALUES\n"
+            "('PC_DOS_110', 'IBM Personal Computer DOS 1.10', 'MSDOS', 1, 10, 'FAT12', 'FLOPPY_SEQUENCE'),\n"
+            "('MSDOS_330',  'Microsoft MS-DOS 3.30',           'MSDOS', 1, 20, 'FAT12', 'FLOPPY_SEQUENCE'),\n"
+            "('MSDOS_500',  'Microsoft MS-DOS 5.00',           'MSDOS', 2, 40, 'FAT16', 'FLOPPY_SEQUENCE'),\n"
+            "('MSDOS_622',  'Microsoft MS-DOS 6.22',           'MSDOS', 3, 250, 'FAT16', 'FLOPPY_SEQUENCE'),\n"
+            "('FREEDOS_13', 'FreeDOS 1.3',                     'FREEDOS', 3, 500, 'FAT16', 'BOOTABLE_CD'),\n"
+            "('WIN310',     'Microsoft Windows 3.1',           'WIN3X', 3, 250, 'FAT16', 'FLOPPY_SEQUENCE'),\n"
+            "('WIN311_FWG', 'Windows for Workgroups 3.11',     'WIN3X', 3, 250, 'FAT16', 'FLOPPY_SEQUENCE'),\n"
+            "('WIN95_OSR2', 'Microsoft Windows 95 OSR 2.5',    'WIN9X', 4, 1024, 'FAT32', 'WIN9X_CAB_PRECOPY'),\n"
+            "('WIN98_SE',   'Microsoft Windows 98 Second Edition', 'WIN9X', 5, 2048, 'FAT32', 'WIN9X_CAB_PRECOPY');\n";
+        ExecuteSqlInternal(seed_os_sql);
     }
 
     // 3. Seed starter software_signatures for known DOS utilities / extenders (idempotent)
@@ -655,6 +662,7 @@ bool KioskDatabase::DeleteMachine(const std::string& id) {
     return false;
 }
 
+
 // ----------------------------------------------------------------------------
 // 3. Carousel Catalog Items (Games & Applications)
 // ----------------------------------------------------------------------------
@@ -922,6 +930,7 @@ bool KioskDatabase::DeleteCatalogItem(const std::string& id) {
     return false;
 }
 
+
 bool KioskDatabase::IncrementPlayCount(const std::string& id) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_db || id.empty()) return false;
@@ -937,6 +946,7 @@ bool KioskDatabase::IncrementPlayCount(const std::string& id) {
     return false;
 }
 
+
 // ----------------------------------------------------------------------------
 // 4. Global Media Pool
 // ----------------------------------------------------------------------------
@@ -948,8 +958,8 @@ std::vector<MediaPoolRecord> KioskDatabase::GetAllMedia() {
 
     const char* sql = "SELECT id, file_path, file_sha1, media_type, physical_style, "
                       "volume_label, label_title, label_subtitle, label_font_style, "
-                      "has_redbook_audio, is_write_protected, is_removable_usb, created_at "
-                      "FROM media_pool ORDER BY label_title ASC;";
+                      "has_redbook_audio, is_write_protected, is_removable_usb, created_at, media_group "
+                      "FROM media_pool ORDER BY COALESCE(media_group, '') ASC, label_title ASC;";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return list;
 
@@ -968,6 +978,7 @@ std::vector<MediaPoolRecord> KioskDatabase::GetAllMedia() {
         m.is_write_protected = sqlite3_column_int(stmt, 10) != 0;
         m.is_removable_usb = sqlite3_column_int(stmt, 11) != 0;
         m.created_at = ColumnTextSafe(stmt, 12);
+        m.media_group = ColumnTextSafe(stmt, 13);
         list.push_back(m);
     }
     sqlite3_finalize(stmt);
@@ -980,7 +991,7 @@ bool KioskDatabase::GetMedia(const std::string& id, MediaPoolRecord& out_media) 
 
     const char* sql = "SELECT id, file_path, file_sha1, media_type, physical_style, "
                       "volume_label, label_title, label_subtitle, label_font_style, "
-                      "has_redbook_audio, is_write_protected, is_removable_usb, created_at "
+                      "has_redbook_audio, is_write_protected, is_removable_usb, created_at, media_group "
                       "FROM media_pool WHERE id = ?;";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
@@ -1001,6 +1012,7 @@ bool KioskDatabase::GetMedia(const std::string& id, MediaPoolRecord& out_media) 
         out_media.is_write_protected = sqlite3_column_int(stmt, 10) != 0;
         out_media.is_removable_usb = sqlite3_column_int(stmt, 11) != 0;
         out_media.created_at = ColumnTextSafe(stmt, 12);
+        out_media.media_group = ColumnTextSafe(stmt, 13);
         found = true;
     }
     sqlite3_finalize(stmt);
@@ -1013,7 +1025,7 @@ bool KioskDatabase::GetMediaByPath(const std::string& file_path, MediaPoolRecord
 
     const char* sql = "SELECT id, file_path, file_sha1, media_type, physical_style, "
                       "volume_label, label_title, label_subtitle, label_font_style, "
-                      "has_redbook_audio, is_write_protected, is_removable_usb, created_at "
+                      "has_redbook_audio, is_write_protected, is_removable_usb, created_at, media_group "
                       "FROM media_pool WHERE file_path = ?;";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
@@ -1034,6 +1046,7 @@ bool KioskDatabase::GetMediaByPath(const std::string& file_path, MediaPoolRecord
         out_media.is_write_protected = sqlite3_column_int(stmt, 10) != 0;
         out_media.is_removable_usb = sqlite3_column_int(stmt, 11) != 0;
         out_media.created_at = ColumnTextSafe(stmt, 12);
+        out_media.media_group = ColumnTextSafe(stmt, 13);
         found = true;
     }
     sqlite3_finalize(stmt);
@@ -1046,7 +1059,7 @@ bool KioskDatabase::InsertMedia(const MediaPoolRecord& media) {
 
     const char* sql = "INSERT INTO media_pool (id, file_path, file_sha1, media_type, physical_style, "
                       "volume_label, label_title, label_subtitle, label_font_style, has_redbook_audio, "
-                      "is_write_protected, is_removable_usb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+                      "is_write_protected, is_removable_usb, media_group) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
 
@@ -1062,6 +1075,7 @@ bool KioskDatabase::InsertMedia(const MediaPoolRecord& media) {
     sqlite3_bind_int(stmt, 10, media.has_redbook_audio ? 1 : 0);
     sqlite3_bind_int(stmt, 11, media.is_write_protected ? 1 : 0);
     sqlite3_bind_int(stmt, 12, media.is_removable_usb ? 1 : 0);
+    sqlite3_bind_text(stmt, 13, media.media_group.c_str(), -1, SQLITE_TRANSIENT);
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -1076,7 +1090,7 @@ bool KioskDatabase::UpdateMedia(const MediaPoolRecord& media) {
     const char* sql = "UPDATE media_pool SET file_path = ?, file_sha1 = ?, media_type = ?, "
                       "physical_style = ?, volume_label = ?, label_title = ?, label_subtitle = ?, "
                       "label_font_style = ?, has_redbook_audio = ?, is_write_protected = ?, "
-                      "is_removable_usb = ? WHERE id = ?;";
+                      "is_removable_usb = ?, media_group = ? WHERE id = ?;";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
 
@@ -1091,7 +1105,8 @@ bool KioskDatabase::UpdateMedia(const MediaPoolRecord& media) {
     sqlite3_bind_int(stmt, 9, media.has_redbook_audio ? 1 : 0);
     sqlite3_bind_int(stmt, 10, media.is_write_protected ? 1 : 0);
     sqlite3_bind_int(stmt, 11, media.is_removable_usb ? 1 : 0);
-    sqlite3_bind_text(stmt, 12, media.id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 12, media.media_group.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 13, media.id.c_str(), -1, SQLITE_TRANSIENT);
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -1111,6 +1126,59 @@ bool KioskDatabase::DeleteMedia(const std::string& id) {
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    return false;
+}
+
+
+bool KioskDatabase::RenameMediaGroup(const std::string& old_group, const std::string& new_group) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_db) return false;
+
+    const char* sql = "UPDATE media_pool SET media_group = ? WHERE COALESCE(media_group, '') = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+
+    sqlite3_bind_text(stmt, 1, new_group.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, old_group.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_DONE) {
+        KioskUI::GetInstance().InvalidateCatalogCache();
+        return true;
+    }
+    return false;
+}
+
+bool KioskDatabase::AssignMediaGroupBatch(const std::vector<std::string>& media_ids, const std::string& new_group) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_db || media_ids.empty()) return false;
+
+    if (!ExecuteSqlInternal("BEGIN TRANSACTION;")) return false;
+    const char* sql = "UPDATE media_pool SET media_group = ? WHERE id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        ExecuteSqlInternal("ROLLBACK;");
+        return false;
+    }
+
+    bool all_ok = true;
+    for (size_t i = 0; i < media_ids.size(); ++i) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_text(stmt, 1, new_group.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, media_ids[i].c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            all_ok = false;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    if (all_ok && ExecuteSqlInternal("COMMIT;")) {
+        KioskUI::GetInstance().InvalidateCatalogCache();
+        return true;
+    }
+    ExecuteSqlInternal("ROLLBACK;");
     return false;
 }
 

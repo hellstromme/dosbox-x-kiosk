@@ -3313,21 +3313,7 @@ bool GFX_StartUpdate(uint8_t* &pixels,Bitu &pitch)
 void GFX_OpenGLRedrawScreen(void) {
 #if C_OPENGL
     if (OpenGL_using()) {
-        if (sdl_opengl.clear_countdown > 0) {
-            sdl_opengl.clear_countdown--;
-            glClearColor (0.0f, 0.0f, 0.0f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
-        }
-
-        if (sdl_opengl.pixel_buffer_object) {
-            glUnmapBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT);
-            glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
-            glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, 0);
-            glCallList(sdl_opengl.displaylist);
-        } else {
-            glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
-            glCallList(sdl_opengl.displaylist);
-        }
+        OUTPUT_OPENGL_RedrawScreen();
     }
 #endif
 }
@@ -6008,6 +5994,10 @@ static void Kiosk_RunRuntimeOverlayLoop(void) {
         sdl_opengl.clear_countdown = 3;
     }
 #endif
+    sdl.must_redraw_all = true;
+    if (sdl.draw.callback) {
+        sdl.draw.callback(GFX_CallBackRedraw);
+    }
 
     if (was_mouse_locked) {
         SDL_SetRelativeMouseMode(SDL_TRUE);
@@ -10828,6 +10818,25 @@ fresh_boot:
         }
         else if (reboot_machine) {
             LOG_MSG("Rebooting the system\n");
+
+#if defined(C_KIOSK)
+            if (KioskManager::GetInstance().IsKioskModeActive()) {
+                const std::string live_a = DriveManager::GetKioskActiveDiskPath(0);
+                const std::string live_b = DriveManager::GetKioskActiveDiskPath(1);
+                const std::string live_d = DriveManager::GetKioskActiveDiskPath(3);
+                const std::string live_e = DriveManager::GetKioskActiveDiskPath(4);
+                std::string reboot_autoexec;
+                if (KioskManager::GetInstance().BuildInSessionRebootAutoexec(
+                        reboot_autoexec, live_a, live_b, live_d, live_e)) {
+                    Section_line* autoexec_sec = static_cast<Section_line*>(control->GetSection("autoexec"));
+                    if (autoexec_sec != NULL) {
+                        autoexec_sec->data = reboot_autoexec;
+                        LOG_MSG("KIOSK: Updated in-session reboot [autoexec] from live drive state (A='%s', D='%s').",
+                                live_a.c_str(), live_d.c_str());
+                    }
+                }
+            }
+#endif
 
             boothax = BOOTHAX_NONE;
             guest_msdos_LoL = 0;
