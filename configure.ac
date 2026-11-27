@@ -665,6 +665,8 @@ case "$host" in
        fi
        ;;
 esac
+elif test "x$enable_kiosk" = "xyes"; then
+    AC_MSG_ERROR([--enable-kiosk requires OpenGL (C_OPENGL); do not pass --disable-opengl.])
 fi
 
 dnl ==========================================

@@ -4355,6 +4355,16 @@ TEST(KioskPhase8Test, UsbBridgeMountScanThreeLevelsAndRemovePurge) {
     EXPECT_NE(synth_with_cd_e.find("IMGMOUNT E \"C:\\Media\\disc2.iso\""), std::string::npos);
     EXPECT_EQ(synth_with_cd_e.find("MOUNT E \"" + docs + "\""), std::string::npos);
 
+    // Verify AUTOEXEC USB path safety rejects control chars, quotes, and '%' batch expansion
+    EXPECT_TRUE(ConfigSynthesizer::IsSafeAutoexecMountPath("/run/media/kiosk/My USB Drive/DOCUMENTS"));
+    EXPECT_TRUE(ConfigSynthesizer::IsSafeAutoexecMountPath("E:\\My Files\\DOCUMENTS"));
+    EXPECT_FALSE(ConfigSynthesizer::IsSafeAutoexecMountPath(""));
+    EXPECT_FALSE(ConfigSynthesizer::IsSafeAutoexecMountPath("/run/media/kiosk/USB\nDIR/DOCUMENTS"));
+    EXPECT_FALSE(ConfigSynthesizer::IsSafeAutoexecMountPath("/run/media/kiosk/USB\rDIR/DOCUMENTS"));
+    EXPECT_FALSE(ConfigSynthesizer::IsSafeAutoexecMountPath("/run/media/kiosk/USB\"DIR/DOCUMENTS"));
+    EXPECT_FALSE(ConfigSynthesizer::IsSafeAutoexecMountPath("/run/media/kiosk/USB%1/DOCUMENTS"));
+    EXPECT_FALSE(ConfigSynthesizer::IsSafeAutoexecMountPath(std::string("/run/media/kiosk/USB") + static_cast<char>(0x1A) + "/DOCUMENTS"));
+
     // 3. Remove simulated USB volume and verify DB purge preserves permanent media
     ASSERT_TRUE(bridge.OnVolumeRemoved(usb_root));
     EXPECT_TRUE(bridge.GetActiveVolumes().empty());

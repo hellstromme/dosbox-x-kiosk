@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct UsbVolumeInfo {
@@ -84,16 +85,27 @@ private:
                              int max_depth,
                              int& out_media_added,
                              std::vector<UsbArchiveCandidate>& out_archives,
-                             std::string& out_docs_dir,
-                             int& entries_visited,
-                             uint32_t start_ticks);
+                             std::string& out_docs_dir);
     void EjectActiveDrivesUnderMount(const std::string& mount_path);
+    void DispatchAsyncPoll(bool rescan_existing);
+    void DrainPendingMainThreadActions();
+    void JoinScanThread();
 
     mutable std::mutex m_mutex;
     std::atomic<bool> m_initialized;
     std::atomic<uint64_t> m_change_revision;
     std::atomic<bool> m_os_polling_enabled;
+    std::atomic<bool> m_scan_running;
+    std::atomic<bool> m_scan_cancel;
+    std::thread m_scan_thread;
+    std::thread::id m_main_thread_id;
     uint32_t m_last_poll_ticks = 0;
+
+    // Pending main-thread UI/emulation actions queued by the background worker
+    bool m_pending_cache_invalidation = false;
+    std::string m_pending_toast_msg;
+    float m_pending_toast_sec = 0.0f;
+    std::vector<std::string> m_pending_eject_mounts;
 
     // Linux inotify state
     int m_inotify_fd = -1;

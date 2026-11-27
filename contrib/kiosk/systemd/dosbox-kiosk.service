@@ -1,7 +1,8 @@
 # DOSBox-X Kiosk Appliance systemd Service Unit
-# Prerequisite: DOSBox-X built with --enable-sdl2 --enable-kiosk AND libsystemd
-# (HAVE_LIBSYSTEMD=1) for Type=notify and WatchdogSec=30.
-# If built without libsystemd, change Type=notify to Type=simple and remove WatchdogSec=30.
+# Default uses Type=simple so the unit starts cleanly whether or not libsystemd
+# (HAVE_LIBSYSTEMD=1) was linked at build time.
+# If built with libsystemd-dev (HAVE_LIBSYSTEMD=1), you may switch Type=simple
+# to Type=notify and uncomment WatchdogSec=30 below for sd_notify supervision.
 
 [Unit]
 Description=DOSBox-X Kiosk Appliance Service
@@ -9,7 +10,9 @@ After=systemd-user-sessions.service systemd-logind.service sound.target
 Conflicts=getty@tty1.service
 
 [Service]
-Type=notify
+Type=simple
+# Type=notify
+# WatchdogSec=30
 User=kiosk
 Group=kiosk
 SupplementaryGroups=video audio input render disk optical storage
@@ -32,7 +35,6 @@ ExecStartPre=+/usr/bin/mkdir -p /run/media/kiosk
 ExecStartPre=/usr/bin/mkdir -p /run/dosbox-kiosk/kiosk /var/lib/dosbox-kiosk/cache/mesa
 ExecStartPre=/usr/bin/rm -f /run/dosbox-kiosk/kiosk/kiosk_dispatch.img
 ExecStart=/usr/bin/dosbox-x -kiosk-mode -kiosk-db /var/lib/dosbox-kiosk/catalog.db -kiosk-conf /var/lib/dosbox-kiosk/config/kiosk_base.conf
-WatchdogSec=30
 Restart=always
 RestartSec=500ms
 

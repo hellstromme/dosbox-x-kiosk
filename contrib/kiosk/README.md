@@ -59,10 +59,11 @@ sudo dd if=output/images/dosbox-x-kiosk-appliance.img of=/dev/sdX bs=4M status=p
 
 For full Linux distributions using `systemd`:
 
-1. Install `libsystemd-dev` (Debian/Ubuntu) or `systemd-libs` (Arch) and build DOSBox-X with `--enable-sdl2 --enable-kiosk` (required for `Type=notify` and `WatchdogSec=30` via `HAVE_LIBSYSTEMD`; if built without `libsystemd`, change `Type=notify` to `Type=simple` and remove `WatchdogSec=30` in the unit file).
-2. Provision the `kiosk` system account, base config, udev automount rules, and systemd unit:
+1. Build DOSBox-X with `--enable-sdl2 --enable-kiosk`. Optionally install `libsystemd-dev` (Debian/Ubuntu) or `systemd-libs` (Arch) before configuring to enable `HAVE_LIBSYSTEMD=1` (`sd_notify` readiness + watchdog heartbeats), then uncomment `Type=notify` and `WatchdogSec=30` in `dosbox-kiosk.service`.
+2. Provision the `kiosk` system group/account, base config, udev automount rules, and systemd unit:
    ```bash
-   sudo useradd -r -m -d /var/lib/dosbox-kiosk -s /usr/sbin/nologin kiosk || true
+   getent group kiosk >/dev/null || sudo groupadd -r kiosk
+   id -u kiosk >/dev/null 2>&1 || sudo useradd -r -g kiosk -m -d /var/lib/dosbox-kiosk -s /usr/sbin/nologin kiosk
    sudo install -d -o kiosk -g kiosk -m 0755 /var/lib/dosbox-kiosk /var/lib/dosbox-kiosk/config
    sudo install -o kiosk -g kiosk -m 0644 contrib/kiosk/buildroot/board/dosbox-x-kiosk/rootfs-overlay/var/lib/dosbox-kiosk/config/kiosk_base.conf /var/lib/dosbox-kiosk/config/
    sudo install -m 0644 contrib/kiosk/systemd/dosbox-kiosk.service /etc/systemd/system/

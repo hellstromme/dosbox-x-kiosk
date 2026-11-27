@@ -18,6 +18,18 @@ ConfigSynthesizer& ConfigSynthesizer::GetInstance() {
     return instance;
 }
 
+bool ConfigSynthesizer::IsSafeAutoexecMountPath(const std::string& path) {
+    if (path.empty()) return false;
+    for (size_t i = 0; i < path.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(path[i]);
+        // Reject control chars (including \r, \n, 0x1A DOS EOF), quotes, and '%' (expanded by BatchFile::ReadLine)
+        if (ch < 0x20u || ch == '"' || ch == '%') {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::string ConfigSynthesizer::GetDefaultBaseConfig() const {
     const std::string mapper_path = KioskHost::GetDefaultMapperPath();
     return
@@ -220,12 +232,7 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
             ss << " -t iso\n";
         } else if (KioskManager::GetInstance().GetConfig().auto_mount_usb_docs) {
             const std::string usb_docs = KioskUsbBridge::GetInstance().GetPreferredUsbDocumentsDir();
-            const bool safe_autoexec_path =
-                !usb_docs.empty() &&
-                usb_docs.find('\n') == std::string::npos &&
-                usb_docs.find('\r') == std::string::npos &&
-                usb_docs.find('"') == std::string::npos;
-            if (safe_autoexec_path) {
+            if (IsSafeAutoexecMountPath(usb_docs)) {
                 ss << "# Auto-mount removable USB DOCUMENTS folder as E:\n"
                    << "MOUNT E \"" << usb_docs << "\"\n";
             }

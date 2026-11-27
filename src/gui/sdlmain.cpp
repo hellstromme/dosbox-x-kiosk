@@ -1667,6 +1667,11 @@ void PauseDOSBoxLoop(Bitu /*unused*/) {
             break;
         }
 
+#if defined(C_KIOSK)
+        if (KioskManager::GetInstance().IsKioskModeActive()) {
+            KioskHost::PingSystemdWatchdog();
+        }
+#endif
 #if C_EMSCRIPTEN
         emscripten_sleep(0);
         SDL_PollEvent(&event);
@@ -1677,7 +1682,6 @@ void PauseDOSBoxLoop(Bitu /*unused*/) {
         SDL_PollEvent(&event);
 #elif defined(C_KIOSK) && defined(C_SDL2)
         if (KioskManager::GetInstance().IsKioskModeActive()) {
-            KioskHost::PingSystemdWatchdog();
             if (!SDL_WaitEventTimeout(&event, 1000)) {
                 continue;
             }

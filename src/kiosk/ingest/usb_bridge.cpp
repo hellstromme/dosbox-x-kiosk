@@ -148,9 +148,14 @@ std::vector<DirEntryItem> ListDirectoryEntries(const std::string& dir_path, bool
 #else
     DIR* d = opendir(dir_path.c_str());
     if (!d) return entries;
-    if (out_ok) *out_ok = true;
-    struct dirent* ent = nullptr;
-    while ((ent = readdir(d)) != nullptr) {
+    bool read_error = false;
+    for (;;) {
+        errno = 0;
+        struct dirent* ent = readdir(d);
+        if (!ent) {
+            if (errno != 0) read_error = true;
+            break;
+        }
         if (std::strcmp(ent->d_name, ".") == 0 || std::strcmp(ent->d_name, "..") == 0) {
             continue;
         }
@@ -167,6 +172,7 @@ std::vector<DirEntryItem> ListDirectoryEntries(const std::string& dir_path, bool
         }
     }
     closedir(d);
+    if (out_ok) *out_ok = !read_error;
 #endif
     return entries;
 }
@@ -190,6 +196,9 @@ KioskUsbBridge::KioskUsbBridge()
     : m_initialized(false),
       m_change_revision(0),
       m_os_polling_enabled(true),
+      m_scan_running(false),
+      m_scan_cancel(false),
+      m_main_thread_id(std::this_thread::get_id()),
       m_last_poll_ticks(0),
       m_inotify_fd(-1),
       m_last_drive_mask(0) {
@@ -290,10 +299,15 @@ bool KioskUsbBridge::Initialize(const std::string& watch_root, bool enable_os_po
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        m_main_thread_id = std::this_thread::get_id();
         m_os_polling_enabled = enable_os_polling;
         m_last_poll_ticks = 0;
         m_last_drive_mask = 0;
         std::memset(m_drive_serials, 0, sizeof(m_drive_serials));
+        m_pending_cache_invalidation = false;
+        m_pending_toast_msg.clear();
+        m_pending_toast_sec = 0.0f;
+        m_pending_eject_mounts.clear();
         m_watch_roots.clear();
         m_watch_descriptors.clear();
         m_active_volumes.clear();
@@ -333,7 +347,17 @@ bool KioskUsbBridge::Initialize(const std::string& watch_root, bool enable_os_po
     return true;
 }
 
+void KioskUsbBridge::JoinScanThread() {
+    m_scan_cancel.store(true);
+    if (m_scan_thread.joinable()) {
+        m_scan_thread.join();
+    }
+    m_scan_running.store(false);
+    m_scan_cancel.store(false);
+}
+
 void KioskUsbBridge::Shutdown() {
+    JoinScanThread();
     std::lock_guard<std::mutex> lock(m_mutex);
 #if defined(__linux__)
     if (m_inotify_fd >= 0) {
@@ -350,8 +374,72 @@ void KioskUsbBridge::Shutdown() {
     m_initialized.store(false);
 }
 
+void KioskUsbBridge::DispatchAsyncPoll(bool rescan_existing) {
+    if (!m_initialized.load() || m_scan_running.load()) {
+        return;
+    }
+    if (m_scan_thread.joinable()) {
+        m_scan_thread.join();
+    }
+    m_scan_cancel.store(false);
+    m_scan_running.store(true);
+    m_scan_thread = std::thread([this, rescan_existing]() {
+        if (m_os_polling_enabled.load() && !m_scan_cancel.load()) {
+#if defined(_WIN32)
+            PollWindowsLogicalDrives();
+#elif defined(__linux__)
+            if (rescan_existing) {
+                RefreshLinuxWatchRoots();
+                ScanExistingLinuxMounts();
+            } else {
+                PollLinuxInotify();
+            }
+#endif
+        }
+        if (rescan_existing && !m_scan_cancel.load()) {
+            const std::vector<UsbVolumeInfo> active = GetActiveVolumes();
+            for (size_t i = 0; i < active.size() && !m_scan_cancel.load(); ++i) {
+                OnVolumeMounted(active[i].mount_path, active[i].volume_label, active[i].is_optical, true);
+            }
+        }
+        m_scan_running.store(false);
+    });
+}
+
+void KioskUsbBridge::DrainPendingMainThreadActions() {
+    bool do_invalidate = false;
+    std::string toast_msg;
+    float toast_sec = 0.0f;
+    std::vector<std::string> eject_mounts;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        do_invalidate = m_pending_cache_invalidation;
+        m_pending_cache_invalidation = false;
+        toast_msg.swap(m_pending_toast_msg);
+        toast_sec = m_pending_toast_sec;
+        m_pending_toast_sec = 0.0f;
+        eject_mounts.swap(m_pending_eject_mounts);
+    }
+
+    for (size_t i = 0; i < eject_mounts.size(); ++i) {
+        EjectActiveDrivesUnderMount(eject_mounts[i]);
+    }
+    if (do_invalidate) {
+        KioskUI::GetInstance().InvalidateCatalogCache();
+    }
+    if (!toast_msg.empty()) {
+        KioskUI::GetInstance().ShowToast(toast_msg, toast_sec);
+    }
+}
+
 void KioskUsbBridge::PollEventsNonBlocking() {
-    if (!m_initialized.load() || !m_os_polling_enabled.load()) {
+    if (!m_initialized.load()) {
+        return;
+    }
+
+    DrainPendingMainThreadActions();
+
+    if (!m_os_polling_enabled.load()) {
         return;
     }
 
@@ -364,30 +452,14 @@ void KioskUsbBridge::PollEventsNonBlocking() {
         m_last_poll_ticks = now_ticks;
     }
 
-#if defined(_WIN32)
-    PollWindowsLogicalDrives();
-#elif defined(__linux__)
-    PollLinuxInotify();
-#endif
+    DispatchAsyncPoll(false);
 }
 
 void KioskUsbBridge::RescanNow() {
     if (!m_initialized.load()) {
         return;
     }
-    if (m_os_polling_enabled.load()) {
-#if defined(_WIN32)
-        PollWindowsLogicalDrives();
-#elif defined(__linux__)
-        RefreshLinuxWatchRoots();
-        ScanExistingLinuxMounts();
-#endif
-    }
-    // Re-scan all currently active volumes so newly copied files or late-mounted dirs are picked up
-    const std::vector<UsbVolumeInfo> active = GetActiveVolumes();
-    for (size_t i = 0; i < active.size(); ++i) {
-        OnVolumeMounted(active[i].mount_path, active[i].volume_label, active[i].is_optical, true);
-    }
+    DispatchAsyncPoll(true);
 }
 
 void KioskUsbBridge::RefreshLinuxWatchRoots() {
@@ -428,9 +500,15 @@ void KioskUsbBridge::ScanExistingLinuxMounts() {
     std::vector<std::string> seen_mounts;
     std::vector<std::string> failed_roots;
     for (size_t i = 0; i < roots.size(); ++i) {
-        if (!DirectoryExists(roots[i])) continue;
         struct stat parent_st;
-        const bool have_parent_st = (stat(roots[i].c_str(), &parent_st) == 0);
+        if (stat(roots[i].c_str(), &parent_st) != 0) {
+            if (errno != ENOENT && errno != ENOTDIR) {
+                failed_roots.push_back(roots[i]);
+            }
+            continue;
+        }
+        if (!S_ISDIR(parent_st.st_mode)) continue;
+        const bool have_parent_st = true;
         bool list_ok = false;
         std::vector<DirEntryItem> subdirs = ListDirectoryEntries(roots[i], &list_ok);
         if (!list_ok) {
@@ -617,23 +695,13 @@ void KioskUsbBridge::ScanVolumeRecursive(
     int max_depth,
     int& out_media_added,
     std::vector<UsbArchiveCandidate>& out_archives,
-    std::string& out_docs_dir,
-    int& entries_visited,
-    uint32_t start_ticks
+    std::string& out_docs_dir
 ) {
-    static const int kMaxScanEntries = 500;
-    static const uint32_t kMaxScanBudgetMs = 250u;
-    if (depth > max_depth || entries_visited >= kMaxScanEntries) return;
-    if (static_cast<uint32_t>(SDL_GetTicks() - start_ticks) >= kMaxScanBudgetMs) return;
+    if (depth > max_depth || m_scan_cancel.load()) return;
 
-    KioskHost::PingSystemdWatchdog();
     std::vector<DirEntryItem> entries = ListDirectoryEntries(dir);
     for (size_t i = 0; i < entries.size(); ++i) {
-        if (entries_visited >= kMaxScanEntries ||
-            static_cast<uint32_t>(SDL_GetTicks() - start_ticks) >= kMaxScanBudgetMs) {
-            break;
-        }
-        ++entries_visited;
+        if (m_scan_cancel.load()) break;
         const std::string full_path = KioskHost::JoinPath(dir, entries[i].name);
         if (entries[i].is_dir) {
             if (depth == 0 && out_docs_dir.empty()) {
@@ -645,8 +713,7 @@ void KioskUsbBridge::ScanVolumeRecursive(
             if (depth < max_depth) {
                 ScanVolumeRecursive(full_path, mount_root, volume_label,
                                     depth + 1, max_depth,
-                                    out_media_added, out_archives, out_docs_dir,
-                                    entries_visited, start_ticks);
+                                    out_media_added, out_archives, out_docs_dir);
             }
             continue;
         }
@@ -721,11 +788,8 @@ bool KioskUsbBridge::OnVolumeMounted(const std::string& mount_path,
     int media_added = 0;
     std::vector<UsbArchiveCandidate> archives;
     std::string docs_dir;
-    int entries_visited = 0;
-    const uint32_t start_ticks = SDL_GetTicks();
-    // Scan top 3 directory levels (depths 0..3) with bounded entry & time budget
-    ScanVolumeRecursive(norm_path, norm_path, label, 0, 3, media_added, archives, docs_dir,
-                        entries_visited, start_ticks);
+    // Scan top 3 directory levels (depths 0..3); live hotplug invokes this on the worker thread
+    ScanVolumeRecursive(norm_path, norm_path, label, 0, 3, media_added, archives, docs_dir);
 
     UsbVolumeInfo vol;
     vol.mount_path = norm_path;
@@ -763,21 +827,40 @@ bool KioskUsbBridge::OnVolumeMounted(const std::string& mount_path,
     }
     m_change_revision.fetch_add(1);
 
-    if (media_added > 0) {
-        KioskUI::GetInstance().InvalidateCatalogCache();
-    }
-
+    const bool on_main_thread = (std::this_thread::get_id() == m_main_thread_id);
+    std::string toast_msg;
+    float toast_sec = 0.0f;
     if (!already_tracked) {
         if (!archives.empty()) {
             std::ostringstream msg;
             msg << "Found " << archives.size() << " importable game archive"
                 << (archives.size() == 1 ? "" : "s") << " on USB (" << label << ") — open Media Pool to Import.";
-            KioskUI::GetInstance().ShowToast(msg.str(), 5.0f);
+            toast_msg = msg.str();
+            toast_sec = 5.0f;
         } else if (media_added > 0) {
             std::ostringstream msg;
             msg << "USB Drive '" << label << "' connected (" << media_added
                 << " disk image" << (media_added == 1 ? "" : "s") << " added to Media Pool).";
-            KioskUI::GetInstance().ShowToast(msg.str(), 4.0f);
+            toast_msg = msg.str();
+            toast_sec = 4.0f;
+        }
+    }
+
+    if (on_main_thread) {
+        if (media_added > 0) {
+            KioskUI::GetInstance().InvalidateCatalogCache();
+        }
+        if (!toast_msg.empty()) {
+            KioskUI::GetInstance().ShowToast(toast_msg, toast_sec);
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (media_added > 0) {
+            m_pending_cache_invalidation = true;
+        }
+        if (!toast_msg.empty()) {
+            m_pending_toast_msg = toast_msg;
+            m_pending_toast_sec = toast_sec;
         }
     }
 
@@ -836,8 +919,14 @@ bool KioskUsbBridge::OnVolumeRemoved(const std::string& mount_path) {
         }
     }
 
+    const bool on_main_thread = (std::this_thread::get_id() == m_main_thread_id);
     // Safely release any active DOSBox-X image handles before purging DB records
-    EjectActiveDrivesUnderMount(norm_path);
+    if (on_main_thread) {
+        EjectActiveDrivesUnderMount(norm_path);
+    } else {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_pending_eject_mounts.push_back(norm_path);
+    }
 
     int deleted_rows = 0;
     if (KioskDatabase::GetInstance().IsOpen()) {
@@ -846,9 +935,17 @@ bool KioskUsbBridge::OnVolumeRemoved(const std::string& mount_path) {
 
     if (was_tracked || deleted_rows > 0) {
         m_change_revision.fetch_add(1);
-        KioskUI::GetInstance().InvalidateCatalogCache();
         const std::string label = removed_label.empty() ? DeriveVolumeLabelFromPath(norm_path) : removed_label;
-        KioskUI::GetInstance().ShowToast("Removable drive '" + label + "' disconnected.", 3.5f);
+        const std::string msg = "Removable drive '" + label + "' disconnected.";
+        if (on_main_thread) {
+            KioskUI::GetInstance().InvalidateCatalogCache();
+            KioskUI::GetInstance().ShowToast(msg, 3.5f);
+        } else {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_pending_cache_invalidation = true;
+            m_pending_toast_msg = msg;
+            m_pending_toast_sec = 3.5f;
+        }
         LOG_MSG("KIOSK USB: Removed '%s' (%d media_pool entries purged)", norm_path.c_str(), deleted_rows);
         return true;
     }

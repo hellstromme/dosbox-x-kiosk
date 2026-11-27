@@ -4,6 +4,7 @@
 #include "../kiosk_types.h"
 #include "view_carousel.h"
 #include "imgui.h"
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -81,7 +82,7 @@ private:
 
     bool m_context_initialized = false;
     bool m_backend_initialized = false;
-    bool m_cache_loaded = false;
+    std::atomic<bool> m_cache_loaded{false};
     SDL_Window* m_window = nullptr;
 
     KioskHubTab m_active_tab = KioskHubTab::GAMES;
