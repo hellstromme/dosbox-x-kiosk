@@ -166,7 +166,7 @@ std::vector<DirEntryItem> ListDirectoryEntries(const std::string& dir_path, bool
         item.name = ent->d_name;
         const std::string full = KioskHost::JoinPath(dir_path, item.name);
         struct stat st;
-        if (lstat(full.c_str(), &st) == 0 && !S_ISLNK(st.st_mode)) {
+        if (lstat(full.c_str(), &st) == 0 && (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode))) {
             item.is_dir = S_ISDIR(st.st_mode);
             entries.push_back(item);
         }
@@ -198,6 +198,7 @@ KioskUsbBridge::KioskUsbBridge()
       m_os_polling_enabled(true),
       m_scan_running(false),
       m_scan_cancel(false),
+      m_pending_forced_rescan(false),
       m_main_thread_id(std::this_thread::get_id()),
       m_last_poll_ticks(0),
       m_inotify_fd(-1),
@@ -349,6 +350,7 @@ bool KioskUsbBridge::Initialize(const std::string& watch_root, bool enable_os_po
 
 void KioskUsbBridge::JoinScanThread() {
     m_scan_cancel.store(true);
+    m_pending_forced_rescan.store(false);
     if (m_scan_thread.joinable()) {
         m_scan_thread.join();
     }
@@ -375,7 +377,13 @@ void KioskUsbBridge::Shutdown() {
 }
 
 void KioskUsbBridge::DispatchAsyncPoll(bool rescan_existing) {
-    if (!m_initialized.load() || m_scan_running.load()) {
+    if (!m_initialized.load()) {
+        return;
+    }
+    if (m_scan_running.load()) {
+        if (rescan_existing) {
+            m_pending_forced_rescan.store(true);
+        }
         return;
     }
     if (m_scan_thread.joinable()) {
@@ -384,24 +392,28 @@ void KioskUsbBridge::DispatchAsyncPoll(bool rescan_existing) {
     m_scan_cancel.store(false);
     m_scan_running.store(true);
     m_scan_thread = std::thread([this, rescan_existing]() {
-        if (m_os_polling_enabled.load() && !m_scan_cancel.load()) {
+        bool current_rescan = rescan_existing;
+        do {
+            if (m_os_polling_enabled.load() && !m_scan_cancel.load()) {
 #if defined(_WIN32)
-            PollWindowsLogicalDrives();
+                PollWindowsLogicalDrives();
 #elif defined(__linux__)
-            if (rescan_existing) {
-                RefreshLinuxWatchRoots();
-                ScanExistingLinuxMounts();
-            } else {
-                PollLinuxInotify();
-            }
+                if (current_rescan) {
+                    RefreshLinuxWatchRoots();
+                    ScanExistingLinuxMounts();
+                } else {
+                    PollLinuxInotify();
+                }
 #endif
-        }
-        if (rescan_existing && !m_scan_cancel.load()) {
-            const std::vector<UsbVolumeInfo> active = GetActiveVolumes();
-            for (size_t i = 0; i < active.size() && !m_scan_cancel.load(); ++i) {
-                OnVolumeMounted(active[i].mount_path, active[i].volume_label, active[i].is_optical, true);
             }
-        }
+            if (current_rescan && !m_scan_cancel.load()) {
+                const std::vector<UsbVolumeInfo> active = GetActiveVolumes();
+                for (size_t i = 0; i < active.size() && !m_scan_cancel.load(); ++i) {
+                    OnVolumeMounted(active[i].mount_path, active[i].volume_label, active[i].is_optical, true);
+                }
+            }
+            current_rescan = m_pending_forced_rescan.exchange(false);
+        } while (current_rescan && !m_scan_cancel.load());
         m_scan_running.store(false);
     });
 }
@@ -693,7 +705,7 @@ void KioskUsbBridge::ScanVolumeRecursive(
     const std::string& volume_label,
     int depth,
     int max_depth,
-    int& out_media_added,
+    std::vector<MediaPoolRecord>& out_media_records,
     std::vector<UsbArchiveCandidate>& out_archives,
     std::string& out_docs_dir
 ) {
@@ -713,7 +725,7 @@ void KioskUsbBridge::ScanVolumeRecursive(
             if (depth < max_depth) {
                 ScanVolumeRecursive(full_path, mount_root, volume_label,
                                     depth + 1, max_depth,
-                                    out_media_added, out_archives, out_docs_dir);
+                                    out_media_records, out_archives, out_docs_dir);
             }
             continue;
         }
@@ -737,9 +749,7 @@ void KioskUsbBridge::ScanVolumeRecursive(
                     rec.is_write_protected = false;
                     rec.is_removable_usb = true;
                     rec.media_group = "USB: " + volume_label;
-                    if (KioskDatabase::GetInstance().InsertMedia(rec)) {
-                        ++out_media_added;
-                    }
+                    out_media_records.push_back(rec);
                 }
             }
             continue;
@@ -785,20 +795,13 @@ bool KioskUsbBridge::OnVolumeMounted(const std::string& mount_path,
                                   ? DeriveVolumeLabelFromPath(norm_path)
                                   : explicit_label;
 
-    int media_added = 0;
+    std::vector<MediaPoolRecord> candidate_media;
     std::vector<UsbArchiveCandidate> archives;
     std::string docs_dir;
     // Scan top 3 directory levels (depths 0..3); live hotplug invokes this on the worker thread
-    ScanVolumeRecursive(norm_path, norm_path, label, 0, 3, media_added, archives, docs_dir);
+    ScanVolumeRecursive(norm_path, norm_path, label, 0, 3, candidate_media, archives, docs_dir);
 
-    UsbVolumeInfo vol;
-    vol.mount_path = norm_path;
-    vol.volume_label = label;
-    vol.is_optical = is_optical;
-    vol.media_count = media_added;
-    vol.archive_count = static_cast<int>(archives.size());
-    vol.documents_dir = docs_dir;
-
+    int media_added = 0;
     bool published = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -807,19 +810,28 @@ bool KioskUsbBridge::OnVolumeMounted(const std::string& mount_path,
         }
         if (already_tracked) {
             bool still_tracked = false;
+            size_t tracked_idx = 0;
             for (size_t i = 0; i < m_active_volumes.size(); ++i) {
                 if (PathStartsWithMount(m_active_volumes[i].mount_path, norm_path) &&
                     PathStartsWithMount(norm_path, m_active_volumes[i].mount_path)) {
-                    m_active_volumes[i].media_count += media_added;
-                    m_active_volumes[i].archive_count = static_cast<int>(archives.size());
-                    m_active_volumes[i].documents_dir = docs_dir;
                     still_tracked = true;
+                    tracked_idx = i;
                     break;
                 }
             }
             if (!still_tracked) {
                 return false; // Volume was removed while rescan was in flight; drop stale results
             }
+            if (KioskDatabase::GetInstance().IsOpen()) {
+                for (size_t k = 0; k < candidate_media.size(); ++k) {
+                    if (KioskDatabase::GetInstance().InsertMedia(candidate_media[k])) {
+                        ++media_added;
+                    }
+                }
+            }
+            m_active_volumes[tracked_idx].media_count += media_added;
+            m_active_volumes[tracked_idx].archive_count = static_cast<int>(archives.size());
+            m_active_volumes[tracked_idx].documents_dir = docs_dir;
             for (std::vector<UsbArchiveCandidate>::iterator it = m_discovered_archives.begin();
                  it != m_discovered_archives.end(); ) {
                 if (PathStartsWithMount(it->mount_path, norm_path)) {
@@ -831,6 +843,20 @@ bool KioskUsbBridge::OnVolumeMounted(const std::string& mount_path,
             m_discovered_archives.insert(m_discovered_archives.end(), archives.begin(), archives.end());
             published = true;
         } else {
+            if (KioskDatabase::GetInstance().IsOpen()) {
+                for (size_t k = 0; k < candidate_media.size(); ++k) {
+                    if (KioskDatabase::GetInstance().InsertMedia(candidate_media[k])) {
+                        ++media_added;
+                    }
+                }
+            }
+            UsbVolumeInfo vol;
+            vol.mount_path = norm_path;
+            vol.volume_label = label;
+            vol.is_optical = is_optical;
+            vol.media_count = media_added;
+            vol.archive_count = static_cast<int>(archives.size());
+            vol.documents_dir = docs_dir;
             m_active_volumes.push_back(vol);
             m_discovered_archives.insert(m_discovered_archives.end(), archives.begin(), archives.end());
             published = true;

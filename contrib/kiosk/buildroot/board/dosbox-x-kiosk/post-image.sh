@@ -22,10 +22,76 @@ EOF
 # 2. Build a tiny BusyBox initramfs (< 4 MB) running initramfs-overlayroot.sh as /init
 rm -rf "${INITRAMFS_DIR}"
 mkdir -p "${INITRAMFS_DIR}/bin" "${INITRAMFS_DIR}/sbin" "${INITRAMFS_DIR}/proc" \
-         "${INITRAMFS_DIR}/sys" "${INITRAMFS_DIR}/dev" "${INITRAMFS_DIR}/lib" "${INITRAMFS_DIR}/lib64"
+         "${INITRAMFS_DIR}/sys" "${INITRAMFS_DIR}/dev" "${INITRAMFS_DIR}/lib" \
+         "${INITRAMFS_DIR}/lib64" "${INITRAMFS_DIR}/usr/lib"
 cp -a "${TARGET_DIR}/bin/busybox" "${INITRAMFS_DIR}/bin/busybox"
-cp -a "${TARGET_DIR}/lib"/ld-* "${TARGET_DIR}/lib"/libc.so* "${INITRAMFS_DIR}/lib/" 2>/dev/null || true
-cp -a "${TARGET_DIR}/lib64"/ld-* "${INITRAMFS_DIR}/lib64/" 2>/dev/null || true
+
+# Copy complete ELF NEEDED dependency closure for busybox (including libresolv.so.2, libc, ld-linux)
+READELF_BIN="$(command -v readelf || true)"
+if [ -z "${READELF_BIN}" ]; then
+    echo "ERROR: readelf not found on build host; cannot resolve BusyBox initramfs shared library closure" >&2
+    exit 1
+fi
+
+copy_elf_closure() {
+    bin_path="$1"
+    # Copy dynamic loader (PT_INTERP) if present
+    interp="$("${READELF_BIN}" -l "${bin_path}" 2>/dev/null | sed -n 's/.*program interpreter: \(.*\)\].*/\1/p' | head -n 1)"
+    if [ -n "${interp}" ]; then
+        copy_target_lib "${interp#/}"
+    fi
+    # Queue NEEDED libraries iteratively
+    queue="$("${READELF_BIN}" -d "${bin_path}" 2>/dev/null | sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p')"
+    seen=""
+    while [ -n "${queue}" ]; do
+        next_queue=""
+        for lib in ${queue}; do
+            case " ${seen} " in
+                *" ${lib} "*) continue ;;
+            esac
+            seen="${seen} ${lib}"
+            found=""
+            for search_dir in lib lib64 usr/lib usr/lib64; do
+                if [ -e "${TARGET_DIR}/${search_dir}/${lib}" ] || [ -L "${TARGET_DIR}/${search_dir}/${lib}" ]; then
+                    found="${search_dir}/${lib}"
+                    break
+                fi
+            done
+            if [ -z "${found}" ]; then
+                echo "ERROR: Missing required initramfs library '${lib}' in ${TARGET_DIR}" >&2
+                exit 1
+            fi
+            copy_target_lib "${found}"
+            deps="$("${READELF_BIN}" -d "${TARGET_DIR}/${found}" 2>/dev/null | sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p')"
+            for d in ${deps}; do
+                next_queue="${next_queue} ${d}"
+            done
+        done
+        queue="${next_queue}"
+    done
+}
+
+copy_target_lib() {
+    rel="$1"
+    dir="$(dirname "${rel}")"
+    mkdir -p "${INITRAMFS_DIR}/${dir}"
+    cp -a "${TARGET_DIR}/${rel}" "${INITRAMFS_DIR}/${rel}"
+    # If symlink, also copy its resolved target within TARGET_DIR
+    if [ -L "${TARGET_DIR}/${rel}" ]; then
+        link_target="$(readlink "${TARGET_DIR}/${rel}")"
+        case "${link_target}" in
+            /*) target_rel="${link_target#/}" ;;
+            *)  target_rel="${dir}/${link_target}" ;;
+        esac
+        if [ -e "${TARGET_DIR}/${target_rel}" ]; then
+            mkdir -p "${INITRAMFS_DIR}/$(dirname "${target_rel}")"
+            cp -a "${TARGET_DIR}/${target_rel}" "${INITRAMFS_DIR}/${target_rel}"
+        fi
+    fi
+}
+
+copy_elf_closure "${TARGET_DIR}/bin/busybox"
+
 for applet in sh mount mkdir sleep head grep sed switch_root; do
     ln -sf busybox "${INITRAMFS_DIR}/bin/${applet}"
 done

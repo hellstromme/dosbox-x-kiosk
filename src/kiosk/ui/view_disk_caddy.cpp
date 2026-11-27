@@ -12,7 +12,39 @@
 #include <fstream>
 #include <sstream>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace {
+
+// Opens a path read-only without blocking on FIFOs/special files on POSIX.
+FILE* OpenRegularFileReadOnly(const std::string& path) {
+    if (path.empty()) return nullptr;
+#if !defined(_WIN32)
+    int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
+    if (fd < 0) return nullptr;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return nullptr;
+    }
+    int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0) {
+        (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    }
+    FILE* fp = fdopen(fd, "rb");
+    if (!fp) {
+        close(fd);
+        return nullptr;
+    }
+    return fp;
+#else
+    return std::fopen(path.c_str(), "rb");
+#endif
+}
 
 std::string ToUpperAscii(const std::string& s) {
     std::string out = s;
@@ -238,7 +270,7 @@ bool DiskCaddyView::ExtractIso9660VolumeLabelFromFile(const std::string& file_pa
         return false;
     }
 
-    FILE* fp = std::fopen(file_path.c_str(), "rb");
+    FILE* fp = OpenRegularFileReadOnly(file_path);
     if (!fp) {
         return false;
     }
@@ -348,7 +380,7 @@ bool DiskCaddyView::InspectMediaFile(const std::string& file_path, InspectedMedi
         std::string first_bin_path;
         out_info.has_redbook_audio = DetectCueSheetRedbookAudio(file_path, first_bin_path);
 
-        FILE* fp = std::fopen(file_path.c_str(), "rb");
+        FILE* fp = OpenRegularFileReadOnly(file_path);
         if (!fp) {
             return false;
         }
@@ -371,7 +403,7 @@ bool DiskCaddyView::InspectMediaFile(const std::string& file_path, InspectedMedi
         return true;
     }
 
-    FILE* fp = std::fopen(file_path.c_str(), "rb");
+    FILE* fp = OpenRegularFileReadOnly(file_path);
     if (!fp) {
         return false;
     }

@@ -1223,17 +1223,17 @@ int KioskDatabase::PurgeStaleRemovableUsbMedia() {
 
     if (candidates.empty()) return 0;
 
-    // 2. Check UTF-8-safe file existence outside DB mutex
-    std::vector<std::string> stale_ids;
+    // 2. Check UTF-8-safe confirmed-missing status outside DB mutex (preserves rows on EACCES)
+    std::vector<std::pair<std::string, std::string> > stale_entries;
     for (size_t i = 0; i < candidates.size(); ++i) {
-        if (!KioskHost::FileExists(candidates[i].second)) {
-            stale_ids.push_back(candidates[i].first);
+        if (KioskHost::IsFileConfirmedMissing(candidates[i].second)) {
+            stale_entries.push_back(candidates[i]);
         }
     }
 
-    if (stale_ids.empty()) return 0;
+    if (stale_entries.empty()) return 0;
 
-    // 3. Batch-delete stale rows in a single transaction
+    // 3. Batch-delete stale rows in a single transaction, revalidating is_removable_usb and file_path
     int deleted = 0;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1244,16 +1244,17 @@ int KioskDatabase::PurgeStaleRemovableUsbMedia() {
         }
         bool ok = true;
         int pending_deleted = 0;
-        const char* del_sql = "DELETE FROM media_pool WHERE id = ?;";
+        const char* del_sql = "DELETE FROM media_pool WHERE id = ? AND is_removable_usb = 1 AND file_path = ?;";
         sqlite3_stmt* del = nullptr;
         if (sqlite3_prepare_v2(m_db, del_sql, -1, &del, nullptr) != SQLITE_OK) {
             ok = false;
         } else {
-            for (size_t i = 0; i < stale_ids.size(); ++i) {
+            for (size_t i = 0; i < stale_entries.size(); ++i) {
                 sqlite3_reset(del);
-                sqlite3_bind_text(del, 1, stale_ids[i].c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(del, 1, stale_entries[i].first.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(del, 2, stale_entries[i].second.c_str(), -1, SQLITE_TRANSIENT);
                 if (sqlite3_step(del) == SQLITE_DONE) {
-                    ++pending_deleted;
+                    pending_deleted += sqlite3_changes(m_db);
                 } else {
                     ok = false;
                     break;

@@ -35,6 +35,8 @@ public:
     static bool EnsureDataDirectories(const std::string& root_override = "");
     static bool EnsureDirectoryRecursive(const std::string& dir_path);
     static bool FileExists(const std::string& file_path);
+    // Returns true ONLY when the OS confirms the path does not exist (returns false on EACCES / permission errors)
+    static bool IsFileConfirmedMissing(const std::string& file_path);
     static std::string JoinPath(const std::string& base, const std::string& child);
 
     // Optional systemd sd_notify() supervision (no-op unless HAVE_LIBSYSTEMD is defined)

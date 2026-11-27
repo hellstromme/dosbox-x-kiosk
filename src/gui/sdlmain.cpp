@@ -6029,6 +6029,7 @@ void GFX_Events() {
 #if defined(C_KIOSK)
     if (KioskManager::GetInstance().IsKioskModeActive()) {
         KioskHost::PingSystemdWatchdog();
+        KioskUsbBridge::GetInstance().PollEventsNonBlocking();
     }
 #endif
 #if defined(C_SDL2) /* SDL 2.x---------------------------------- */

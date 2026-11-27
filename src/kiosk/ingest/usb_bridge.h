@@ -83,7 +83,7 @@ private:
                              const std::string& volume_label,
                              int depth,
                              int max_depth,
-                             int& out_media_added,
+                             std::vector<MediaPoolRecord>& out_media_records,
                              std::vector<UsbArchiveCandidate>& out_archives,
                              std::string& out_docs_dir);
     void EjectActiveDrivesUnderMount(const std::string& mount_path);
@@ -97,6 +97,7 @@ private:
     std::atomic<bool> m_os_polling_enabled;
     std::atomic<bool> m_scan_running;
     std::atomic<bool> m_scan_cancel;
+    std::atomic<bool> m_pending_forced_rescan;
     std::thread m_scan_thread;
     std::thread::id m_main_thread_id;
     uint32_t m_last_poll_ticks = 0;

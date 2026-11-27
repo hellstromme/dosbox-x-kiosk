@@ -167,6 +167,29 @@ bool KioskHost::FileExists(const std::string& file_path) {
 #endif
 }
 
+bool KioskHost::IsFileConfirmedMissing(const std::string& file_path) {
+    if (file_path.empty()) return true;
+#if defined(_WIN32)
+    std::wstring wp = Utf8ToWide(file_path);
+    if (wp.empty()) return false;
+    DWORD attrs = GetFileAttributesW(wp.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        return false; // Path exists (file or directory)
+    }
+    const DWORD err = GetLastError();
+    return (err == ERROR_FILE_NOT_FOUND ||
+            err == ERROR_PATH_NOT_FOUND ||
+            err == ERROR_NOT_READY ||
+            err == ERROR_DEV_NOT_EXIST);
+#else
+    struct stat st;
+    if (stat(file_path.c_str(), &st) == 0) {
+        return false; // Path exists
+    }
+    return (errno == ENOENT || errno == ENOTDIR);
+#endif
+}
+
 std::string KioskHost::GetDataRootDir() {
 #if defined(_WIN32)
     const wchar_t* local_app = _wgetenv(L"LOCALAPPDATA");
@@ -228,6 +251,9 @@ std::string KioskHost::GetIconCacheDir(const std::string& root_override) {
 
 std::string KioskHost::GetDefaultDatabasePath(const std::string& root_override) {
     const std::string root = root_override.empty() ? GetDataRootDir() : root_override;
+    if (root_override.empty() && root == ".") {
+        return JoinPath(".", "dosbox-kiosk-catalog.db");
+    }
     return JoinPath(root, "catalog.db");
 }
 

@@ -24,10 +24,13 @@ find_kiosk_root() {
     return 1
 }
 
+# Wait up to 20s for slower asynchronous USB/NVMe/SATA block devices (exits immediately once found)
 ROOT_DEV=""
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+ATTEMPT=0
+while [ "$ATTEMPT" -lt 100 ]; do
     ROOT_DEV="$(find_kiosk_root || true)"
     [ -n "$ROOT_DEV" ] && break
+    ATTEMPT=$((ATTEMPT + 1))
     sleep 0.2
 done
 

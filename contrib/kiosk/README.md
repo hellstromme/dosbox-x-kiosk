@@ -65,9 +65,10 @@ For full Linux distributions using `systemd`:
    getent group kiosk >/dev/null || sudo groupadd -r kiosk
    id -u kiosk >/dev/null 2>&1 || sudo useradd -r -g kiosk -m -d /var/lib/dosbox-kiosk -s /usr/sbin/nologin kiosk
    sudo install -d -o kiosk -g kiosk -m 0755 /var/lib/dosbox-kiosk /var/lib/dosbox-kiosk/config
-   sudo install -o kiosk -g kiosk -m 0644 contrib/kiosk/buildroot/board/dosbox-x-kiosk/rootfs-overlay/var/lib/dosbox-kiosk/config/kiosk_base.conf /var/lib/dosbox-kiosk/config/
+   sudo install -o kiosk -g kiosk -m 0644 contrib/kiosk/buildroot/board/dosbox-x-kiosk/rootfs-overlay/etc/dosbox-kiosk/kiosk_base.conf /var/lib/dosbox-kiosk/config/
    sudo install -m 0644 contrib/kiosk/systemd/dosbox-kiosk.service /etc/systemd/system/
-   sudo install -m 0644 contrib/kiosk/buildroot/board/dosbox-x-kiosk/rootfs-overlay/etc/udev/rules.d/99-kiosk-automount.rules /etc/udev/rules.d/
+   sudo install -m 0644 contrib/kiosk/systemd/kiosk-usb-mount@.service /etc/systemd/system/
+   sudo install -m 0644 contrib/kiosk/systemd/99-kiosk-automount-systemd.rules /etc/udev/rules.d/
    sudo install -m 0755 contrib/kiosk/buildroot/board/dosbox-x-kiosk/rootfs-overlay/usr/libexec/kiosk-usb-mount.sh /usr/libexec/
    sudo systemctl daemon-reload
    sudo systemctl enable --now dosbox-kiosk.service
