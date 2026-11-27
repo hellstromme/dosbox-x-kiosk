@@ -33,8 +33,13 @@ case "$ACTION" in
         mkdir -p "$MOUNT_POINT"
         MOUNTED=0
         case "$FS_TYPE" in
-            vfat|msdos|exfat|ntfs|ntfs3)
+            vfat|msdos)
                 if mount -o "rw,noexec,nosuid,nodev,flush,uid=${KIOSK_UID},gid=${KIOSK_GID}" "$DEVNODE" "$MOUNT_POINT" 2>/dev/null; then
+                    MOUNTED=1
+                fi
+                ;;
+            exfat|ntfs|ntfs3)
+                if mount -o "rw,noexec,nosuid,nodev,uid=${KIOSK_UID},gid=${KIOSK_GID}" "$DEVNODE" "$MOUNT_POINT" 2>/dev/null; then
                     MOUNTED=1
                 fi
                 ;;
@@ -44,7 +49,7 @@ case "$ACTION" in
                 fi
                 ;;
             *)
-                if mount -o "rw,noexec,nosuid,nodev,flush,uid=${KIOSK_UID},gid=${KIOSK_GID}" "$DEVNODE" "$MOUNT_POINT" 2>/dev/null || \
+                if mount -o "rw,noexec,nosuid,nodev,uid=${KIOSK_UID},gid=${KIOSK_GID}" "$DEVNODE" "$MOUNT_POINT" 2>/dev/null || \
                    mount -o rw,noexec,nosuid,nodev "$DEVNODE" "$MOUNT_POINT" 2>/dev/null; then
                     MOUNTED=1
                 fi
@@ -66,12 +71,11 @@ case "$ACTION" in
             RECORDED_MP="$(cat "$STATE_FILE" 2>/dev/null || true)"
             rm -f "$STATE_FILE"
             if [ -n "$RECORDED_MP" ] && [ -d "$RECORDED_MP" ]; then
-                # Only unmount if this device actually owns the mountpoint (or lazy-cleanup detached mount)
-                if grep -q "^${DEVNODE} ${RECORDED_MP} " /proc/mounts 2>/dev/null || \
-                   grep -q " ${RECORDED_MP} " /proc/mounts 2>/dev/null; then
+                # Unmount only if this exact device still owns the recorded mountpoint
+                if grep -q "^${DEVNODE} ${RECORDED_MP} " /proc/mounts 2>/dev/null; then
                     umount -l "$RECORDED_MP" 2>/dev/null || true
+                    rmdir "$RECORDED_MP" 2>/dev/null || true
                 fi
-                rmdir "$RECORDED_MP" 2>/dev/null || true
             fi
         fi
         ;;

@@ -24,7 +24,7 @@ namespace {
 FILE* OpenRegularFileReadOnly(const std::string& path) {
     if (path.empty()) return nullptr;
 #if !defined(_WIN32)
-    int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
+    int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
     if (fd < 0) return nullptr;
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
@@ -308,16 +308,20 @@ bool DiskCaddyView::DetectCueSheetRedbookAudio(const std::string& cue_path, std:
         return false;
     }
 
-    std::ifstream ifs(cue_path.c_str());
-    if (!ifs.is_open()) {
+    FILE* fp = OpenRegularFileReadOnly(cue_path);
+    if (!fp) {
         return false;
     }
 
     const std::string parent_dir = ExtractParentDirectory(cue_path);
     bool has_audio = false;
-    std::string line;
+    char line_buf[1024];
 
-    while (std::getline(ifs, line)) {
+    while (std::fgets(line_buf, sizeof(line_buf), fp) != nullptr) {
+        std::string line(line_buf);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+            line.pop_back();
+        }
         std::string upper = ToUpperAscii(line);
 
         // Parse FILE "<filename>" BINARY
@@ -350,6 +354,7 @@ bool DiskCaddyView::DetectCueSheetRedbookAudio(const std::string& cue_path, std:
         }
     }
 
+    std::fclose(fp);
     return has_audio;
 }
 

@@ -70,6 +70,8 @@ For full Linux distributions using `systemd`:
    sudo install -m 0644 contrib/kiosk/systemd/kiosk-usb-mount@.service /etc/systemd/system/
    sudo install -m 0644 contrib/kiosk/systemd/99-kiosk-automount-systemd.rules /etc/udev/rules.d/
    sudo install -m 0755 contrib/kiosk/buildroot/board/dosbox-x-kiosk/rootfs-overlay/usr/libexec/kiosk-usb-mount.sh /usr/libexec/
+   sudo udevadm control --reload-rules
+   sudo udevadm trigger --subsystem-match=block --action=add
    sudo systemctl daemon-reload
    sudo systemctl enable --now dosbox-kiosk.service
    ```

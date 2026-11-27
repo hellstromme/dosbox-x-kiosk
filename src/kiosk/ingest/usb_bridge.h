@@ -67,6 +67,9 @@ public:
     static bool PathStartsWithMount(const std::string& file_path, const std::string& mount_path);
     static std::string DeriveVolumeLabelFromPath(const std::string& mount_path);
 
+    // Validates that a removable-USB media path resolves (after symlinks) inside an active removable root
+    bool IsPathContainedInActiveRemovableMount(const std::string& file_path) const;
+
 private:
     KioskUsbBridge();
     ~KioskUsbBridge();
@@ -95,9 +98,10 @@ private:
     std::atomic<bool> m_initialized;
     std::atomic<uint64_t> m_change_revision;
     std::atomic<bool> m_os_polling_enabled;
-    std::atomic<bool> m_scan_running;
+    bool m_scan_running = false;            // Guarded by m_mutex
     std::atomic<bool> m_scan_cancel;
-    std::atomic<bool> m_pending_forced_rescan;
+    bool m_pending_forced_rescan = false;   // Guarded by m_mutex
+    uint64_t m_removal_generation = 0;      // Guarded by m_mutex; bumped in OnVolumeRemoved()
     std::thread m_scan_thread;
     std::thread::id m_main_thread_id;
     uint32_t m_last_poll_ticks = 0;

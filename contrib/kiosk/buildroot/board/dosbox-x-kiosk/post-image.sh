@@ -72,22 +72,28 @@ copy_elf_closure() {
 }
 
 copy_target_lib() {
-    rel="$1"
-    dir="$(dirname "${rel}")"
-    mkdir -p "${INITRAMFS_DIR}/${dir}"
-    cp -a "${TARGET_DIR}/${rel}" "${INITRAMFS_DIR}/${rel}"
-    # If symlink, also copy its resolved target within TARGET_DIR
-    if [ -L "${TARGET_DIR}/${rel}" ]; then
-        link_target="$(readlink "${TARGET_DIR}/${rel}")"
-        case "${link_target}" in
-            /*) target_rel="${link_target#/}" ;;
-            *)  target_rel="${dir}/${link_target}" ;;
-        esac
-        if [ -e "${TARGET_DIR}/${target_rel}" ]; then
-            mkdir -p "${INITRAMFS_DIR}/$(dirname "${target_rel}")"
-            cp -a "${TARGET_DIR}/${target_rel}" "${INITRAMFS_DIR}/${target_rel}"
+    cur="$1"
+    hops=0
+    while [ "$hops" -lt 16 ]; do
+        dir="$(dirname "${cur}")"
+        if [ ! -e "${TARGET_DIR}/${cur}" ] && [ ! -L "${TARGET_DIR}/${cur}" ]; then
+            echo "ERROR: Missing required initramfs library/target '${cur}' in ${TARGET_DIR}" >&2
+            exit 1
         fi
-    fi
+        mkdir -p "${INITRAMFS_DIR}/${dir}"
+        cp -a "${TARGET_DIR}/${cur}" "${INITRAMFS_DIR}/${cur}"
+        if [ ! -L "${TARGET_DIR}/${cur}" ]; then
+            return 0
+        fi
+        link_target="$(readlink "${TARGET_DIR}/${cur}")"
+        case "${link_target}" in
+            /*) cur="${link_target#/}" ;;
+            *)  cur="${dir}/${link_target}" ;;
+        esac
+        hops=$((hops + 1))
+    done
+    echo "ERROR: Symlink loop while staging initramfs library '${1}'" >&2
+    exit 1
 }
 
 copy_elf_closure "${TARGET_DIR}/bin/busybox"

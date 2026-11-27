@@ -4,6 +4,7 @@
 
 #include "config_synthesizer.h"
 #include "archetypes.h"
+#include "../kiosk_db.h"
 #include "../kiosk_host.h"
 #include "../kiosk_main.h"
 #include "../ingest/usb_bridge.h"
@@ -75,9 +76,17 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
     ss << "[autoexec]\n"
        << "@echo off\n";
 
-    // Group caddy bindings by target drive ('A', 'B', 'D', 'E')
+    // Group caddy bindings by target drive ('A', 'B', 'D', 'E'), verifying USB path containment
     std::map<std::string, std::vector<CaddyBindingRecord>> drive_bindings;
     for (const auto& b : caddy) {
+        if (!b.media_id.empty() && KioskDatabase::GetInstance().IsOpen()) {
+            MediaPoolRecord mrec;
+            if (KioskDatabase::GetInstance().GetMedia(b.media_id, mrec) && mrec.is_removable_usb) {
+                if (!KioskUsbBridge::GetInstance().IsPathContainedInActiveRemovableMount(b.resolved_file_path)) {
+                    continue; // Reject USB media path that no longer resolves inside an active removable root
+                }
+            }
+        }
         drive_bindings[b.target_drive].push_back(b);
     }
     for (auto& pair : drive_bindings) {

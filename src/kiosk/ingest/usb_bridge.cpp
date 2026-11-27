@@ -28,6 +28,8 @@
 #else
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -199,6 +201,7 @@ KioskUsbBridge::KioskUsbBridge()
       m_scan_running(false),
       m_scan_cancel(false),
       m_pending_forced_rescan(false),
+      m_removal_generation(0),
       m_main_thread_id(std::this_thread::get_id()),
       m_last_poll_ticks(0),
       m_inotify_fd(-1),
@@ -350,11 +353,18 @@ bool KioskUsbBridge::Initialize(const std::string& watch_root, bool enable_os_po
 
 void KioskUsbBridge::JoinScanThread() {
     m_scan_cancel.store(true);
-    m_pending_forced_rescan.store(false);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_pending_forced_rescan = false;
+    }
     if (m_scan_thread.joinable()) {
         m_scan_thread.join();
     }
-    m_scan_running.store(false);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_scan_running = false;
+        m_pending_forced_rescan = false;
+    }
     m_scan_cancel.store(false);
 }
 
@@ -380,20 +390,24 @@ void KioskUsbBridge::DispatchAsyncPoll(bool rescan_existing) {
     if (!m_initialized.load()) {
         return;
     }
-    if (m_scan_running.load()) {
-        if (rescan_existing) {
-            m_pending_forced_rescan.store(true);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_scan_running) {
+            if (rescan_existing) {
+                m_pending_forced_rescan = true;
+            }
+            return;
         }
-        return;
+        m_scan_running = true;
+        m_pending_forced_rescan = false;
     }
     if (m_scan_thread.joinable()) {
         m_scan_thread.join();
     }
     m_scan_cancel.store(false);
-    m_scan_running.store(true);
     m_scan_thread = std::thread([this, rescan_existing]() {
         bool current_rescan = rescan_existing;
-        do {
+        for (;;) {
             if (m_os_polling_enabled.load() && !m_scan_cancel.load()) {
 #if defined(_WIN32)
                 PollWindowsLogicalDrives();
@@ -412,9 +426,15 @@ void KioskUsbBridge::DispatchAsyncPoll(bool rescan_existing) {
                     OnVolumeMounted(active[i].mount_path, active[i].volume_label, active[i].is_optical, true);
                 }
             }
-            current_rescan = m_pending_forced_rescan.exchange(false);
-        } while (current_rescan && !m_scan_cancel.load());
-        m_scan_running.store(false);
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_pending_forced_rescan && !m_scan_cancel.load()) {
+                m_pending_forced_rescan = false;
+                current_rescan = true;
+                continue;
+            }
+            m_scan_running = false;
+            break;
+        }
     });
 }
 
@@ -693,7 +713,12 @@ void KioskUsbBridge::PollWindowsLogicalDrives() {
     for (size_t k = 0; k < current_drives.size(); ++k) {
         const int bit = current_drives[k].bit;
         if (bit >= 0 && bit < 26 && (added_or_swapped_mask & (1u << bit)) != 0) {
-            OnVolumeMounted(current_drives[k].root, current_drives[k].label, current_drives[k].is_optical);
+            if (!OnVolumeMounted(current_drives[k].root, current_drives[k].label, current_drives[k].is_optical)) {
+                // Retry on next poll if transient arrival failed before becoming tracked
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_last_drive_mask &= ~(1u << bit);
+                m_drive_serials[bit] = 0;
+            }
         }
     }
 #endif
@@ -777,8 +802,10 @@ bool KioskUsbBridge::OnVolumeMounted(const std::string& mount_path,
     }
 
     bool already_tracked = false;
+    uint64_t start_removal_gen = 0;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        start_removal_gen = m_removal_generation;
         for (size_t i = 0; i < m_active_volumes.size(); ++i) {
             if (PathStartsWithMount(m_active_volumes[i].mount_path, norm_path) &&
                 PathStartsWithMount(norm_path, m_active_volumes[i].mount_path)) {
@@ -805,8 +832,8 @@ bool KioskUsbBridge::OnVolumeMounted(const std::string& mount_path,
     bool published = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_scan_cancel.load()) {
-            return false;
+        if (m_scan_cancel.load() || m_removal_generation != start_removal_gen) {
+            return false; // A removal or shutdown occurred while scan was in flight; drop stale results
         }
         if (already_tracked) {
             bool still_tracked = false;
@@ -937,6 +964,7 @@ bool KioskUsbBridge::OnVolumeRemoved(const std::string& mount_path) {
     bool was_tracked = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        ++m_removal_generation;
         for (std::vector<UsbVolumeInfo>::iterator it = m_active_volumes.begin();
              it != m_active_volumes.end(); ) {
             if (PathStartsWithMount(it->mount_path, norm_path) &&
@@ -1069,6 +1097,63 @@ std::string KioskUsbBridge::GetPreferredUsbDocumentsDir() const {
         }
     }
     return "";
+}
+
+bool KioskUsbBridge::IsPathContainedInActiveRemovableMount(const std::string& file_path) const {
+    if (file_path.empty()) return false;
+    std::vector<UsbVolumeInfo> vols = GetActiveVolumes();
+    if (vols.empty()) return false;
+
+    std::string resolved_file;
+#if defined(_WIN32)
+    std::wstring wpath = Utf8ToWideLocal(file_path);
+    if (wpath.empty()) return false;
+    HANDLE h = CreateFileW(wpath.c_str(), FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info;
+    const bool is_reg = (GetFileInformationByHandle(h, &info) != 0) &&
+                        ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0);
+    typedef DWORD (WINAPI *GetFinalPathNameByHandleWFn)(HANDLE, LPWSTR, DWORD, DWORD);
+    static GetFinalPathNameByHandleWFn pGetFinalPath =
+        reinterpret_cast<GetFinalPathNameByHandleWFn>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetFinalPathNameByHandleW"));
+    wchar_t final_buf[MAX_PATH * 4];
+    DWORD n = 0;
+    if (is_reg && pGetFinalPath) {
+        n = pGetFinalPath(h, final_buf, MAX_PATH * 4, 0 /* FILE_NAME_NORMALIZED */);
+    } else if (is_reg) {
+        n = GetFullPathNameW(wpath.c_str(), MAX_PATH * 4, final_buf, nullptr);
+    }
+    CloseHandle(h);
+    if (!is_reg || n == 0 || n >= MAX_PATH * 4) return false;
+    std::wstring wfinal(final_buf, n);
+    if (wfinal.compare(0, 4, L"\\\\?\\") == 0) {
+        wfinal = wfinal.substr(4);
+    }
+    resolved_file = WideToUtf8Local(wfinal);
+#else
+    char resolved_buf[PATH_MAX];
+    if (!realpath(file_path.c_str(), resolved_buf)) return false;
+    struct stat st;
+    if (stat(resolved_buf, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    resolved_file = resolved_buf;
+#endif
+
+    for (size_t i = 0; i < vols.size(); ++i) {
+        std::string resolved_root = vols[i].mount_path;
+#if !defined(_WIN32)
+        char root_buf[PATH_MAX];
+        if (realpath(vols[i].mount_path.c_str(), root_buf)) {
+            resolved_root = root_buf;
+        }
+#endif
+        if (PathStartsWithMount(resolved_file, resolved_root)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 #endif // defined(C_KIOSK)
