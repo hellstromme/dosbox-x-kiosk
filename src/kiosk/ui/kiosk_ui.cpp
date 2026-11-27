@@ -160,7 +160,8 @@ void KioskUI::Shutdown() {
     if (m_context_initialized) {
         ImGui::DestroyContext();
         m_context_initialized = false;
-        m_cache_loaded = false;
+        m_loaded_generation = 0;
+        m_cache_generation.fetch_add(1, std::memory_order_acq_rel);
         m_settings_draft_loaded = false;
         m_cached_items.clear();
         m_cached_machines.clear();
@@ -235,7 +236,7 @@ void KioskUI::RenderFrame() {
 }
 
 void KioskUI::InvalidateCatalogCache() {
-    m_cache_loaded = false;
+    m_cache_generation.fetch_add(1, std::memory_order_acq_rel);
     ViewWatchdog::GetInstance().InvalidatePreview();
 }
 
@@ -244,7 +245,8 @@ void KioskUI::InvalidateSettingsDraft() {
 }
 
 void KioskUI::EnsureCatalogCacheLoaded() {
-    if (m_cache_loaded) return;
+    const uint64_t target_gen = m_cache_generation.load(std::memory_order_acquire);
+    if (m_loaded_generation == target_gen) return;
 
     KioskDatabase& db = KioskDatabase::GetInstance();
     if (db.IsOpen()) {
@@ -267,7 +269,7 @@ void KioskUI::EnsureCatalogCacheLoaded() {
         ApplyTheme(m_cached_config.theme_name);
     }
 
-    m_cache_loaded = true;
+    m_loaded_generation = target_gen;
 }
 
 void KioskUI::SetActiveTab(KioskHubTab tab) {

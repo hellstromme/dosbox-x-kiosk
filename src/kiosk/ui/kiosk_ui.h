@@ -82,7 +82,8 @@ private:
 
     bool m_context_initialized = false;
     bool m_backend_initialized = false;
-    std::atomic<bool> m_cache_loaded{false};
+    std::atomic<uint64_t> m_cache_generation{1};
+    uint64_t m_loaded_generation = 0;
     SDL_Window* m_window = nullptr;
 
     KioskHubTab m_active_tab = KioskHubTab::GAMES;

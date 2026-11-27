@@ -799,17 +799,26 @@ bool KioskUsbBridge::OnVolumeMounted(const std::string& mount_path,
     vol.archive_count = static_cast<int>(archives.size());
     vol.documents_dir = docs_dir;
 
+    bool published = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_scan_cancel.load()) {
+            return false;
+        }
         if (already_tracked) {
+            bool still_tracked = false;
             for (size_t i = 0; i < m_active_volumes.size(); ++i) {
                 if (PathStartsWithMount(m_active_volumes[i].mount_path, norm_path) &&
                     PathStartsWithMount(norm_path, m_active_volumes[i].mount_path)) {
                     m_active_volumes[i].media_count += media_added;
                     m_active_volumes[i].archive_count = static_cast<int>(archives.size());
                     m_active_volumes[i].documents_dir = docs_dir;
+                    still_tracked = true;
                     break;
                 }
+            }
+            if (!still_tracked) {
+                return false; // Volume was removed while rescan was in flight; drop stale results
             }
             for (std::vector<UsbArchiveCandidate>::iterator it = m_discovered_archives.begin();
                  it != m_discovered_archives.end(); ) {
@@ -820,10 +829,15 @@ bool KioskUsbBridge::OnVolumeMounted(const std::string& mount_path,
                 }
             }
             m_discovered_archives.insert(m_discovered_archives.end(), archives.begin(), archives.end());
+            published = true;
         } else {
             m_active_volumes.push_back(vol);
             m_discovered_archives.insert(m_discovered_archives.end(), archives.begin(), archives.end());
+            published = true;
         }
+    }
+    if (!published) {
+        return false;
     }
     m_change_revision.fetch_add(1);
 
