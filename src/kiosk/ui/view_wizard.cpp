@@ -9,6 +9,7 @@
 #include "../kiosk_db.h"
 #include "../machine/archetypes.h"
 #include "../machine/config_synthesizer.h"
+#include "../fs/fat_volume.h"
 #include "logging.h"
 #include "imgui.h"
 
@@ -362,6 +363,7 @@ HddCreateStatus ViewWizard::CreateBlankHddImageEx(const std::string& file_path, 
         std::remove(file_path.c_str());
         return HddCreateStatus::IO_ERROR;
     }
+    KioskFileSectorDevice::QuarantinePendingJournal(file_path); // Belonged to a deleted image
     return HddCreateStatus::OK;
 #else
     // Atomic exclusive creation (O_CREAT | O_EXCL) guarantees we never truncate an existing disk image
@@ -375,6 +377,7 @@ HddCreateStatus ViewWizard::CreateBlankHddImageEx(const std::string& file_path, 
         std::remove(file_path.c_str());
         return HddCreateStatus::IO_ERROR;
     }
+    KioskFileSectorDevice::QuarantinePendingJournal(file_path); // Belonged to a deleted image
     return HddCreateStatus::OK;
 #endif
 }

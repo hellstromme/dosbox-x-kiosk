@@ -9,6 +9,7 @@
 #include "machine/archetypes.h"
 #include "machine/config_synthesizer.h"
 #include "machine/boot_injector.h"
+#include "fs/fat_volume.h"
 #include "ui/kiosk_ui.h"
 #include "ui/view_carousel.h"
 #include "ui/input_router.h"
@@ -17,6 +18,7 @@
 #include "control.h"
 #include "dosbox.h"
 #include "logging.h"
+#include "programs.h"
 #include "SDL.h"
 
 #include <cstdio>
@@ -35,6 +37,80 @@
 #endif
 
 extern void Kiosk_PumpPreBootFrame(void);
+
+// Z:\KIOSKLCK.COM: emitted by ConfigSynthesizer right before an INTEGRATED_DOS catalog launch.
+// Engages the one-way host-program lock (see Kiosk_IsHostReachingProgram in kiosk_types.h).
+class KIOSKLCK : public Program {
+public:
+    void Run(void) override {
+        if (KioskManager::GetInstance().IsKioskModeActive()) {
+            Kiosk_EngageHostProgramLock();
+            LOG_MSG("KIOSK: Host-reaching Z:\\ programs locked for this game session.");
+        }
+    }
+};
+
+static void KIOSKLCK_ProgramStart(Program** make) {
+    *make = new KIOSKLCK;
+}
+
+void Kiosk_RegisterDosPrograms(void) {
+    PROGRAMS_MakeFile("KIOSKLCK.COM", KIOSKLCK_ProgramStart, "/SYSTEM/");
+}
+
+static const char* KioskStateName(KioskState state) {
+    switch (state) {
+        case KioskState::DISABLED:                return "DISABLED";
+        case KioskState::STATE_KIOSK_BOOT:        return "STATE_KIOSK_BOOT";
+        case KioskState::STATE_COUNTDOWN_IDLE:    return "STATE_COUNTDOWN_IDLE";
+        case KioskState::STATE_SHELL_INTERACTIVE: return "STATE_SHELL_INTERACTIVE";
+        case KioskState::STATE_SYNTHESIZE_LAUNCH: return "STATE_SYNTHESIZE_LAUNCH";
+        case KioskState::STATE_EMULATION_RUNNING: return "STATE_EMULATION_RUNNING";
+        case KioskState::STATE_RUNTIME_OVERLAY:   return "STATE_RUNTIME_OVERLAY";
+        default:                                  return "UNKNOWN";
+    }
+}
+
+// The kiosk lifecycle in one place. Initialize() resets to STATE_KIOSK_BOOT and Shutdown()
+// to DISABLED unconditionally; every other change must be listed here.
+bool KioskManager::IsLegalTransition(KioskState from, KioskState to) {
+    if (to == KioskState::DISABLED) return true; // Appliance exit / shutdown from anywhere
+    switch (from) {
+        case KioskState::STATE_KIOSK_BOOT:
+            return to == KioskState::STATE_COUNTDOWN_IDLE || to == KioskState::STATE_SHELL_INTERACTIVE ||
+                   to == KioskState::STATE_SYNTHESIZE_LAUNCH; // boot_timeout_sec == 0: immediate default boot
+        case KioskState::STATE_COUNTDOWN_IDLE:
+            return to == KioskState::STATE_SHELL_INTERACTIVE || to == KioskState::STATE_SYNTHESIZE_LAUNCH;
+        case KioskState::STATE_SHELL_INTERACTIVE:
+            return to == KioskState::STATE_SYNTHESIZE_LAUNCH;
+        case KioskState::STATE_SYNTHESIZE_LAUNCH:
+            return to == KioskState::STATE_EMULATION_RUNNING || to == KioskState::STATE_SHELL_INTERACTIVE;
+        case KioskState::STATE_EMULATION_RUNNING:
+            return to == KioskState::STATE_RUNTIME_OVERLAY || to == KioskState::STATE_SHELL_INTERACTIVE;
+        case KioskState::STATE_RUNTIME_OVERLAY:
+            return to == KioskState::STATE_EMULATION_RUNNING || to == KioskState::STATE_SHELL_INTERACTIVE;
+        case KioskState::DISABLED:
+        default:
+            return false; // Only Initialize() leaves DISABLED
+    }
+}
+
+bool KioskManager::TryTransition(KioskState to) {
+    KioskState cur = m_state.load();
+    while (true) {
+        if (!IsLegalTransition(cur, to)) {
+            LOG_MSG("KIOSK: Rejected state transition %s -> %s", KioskStateName(cur), KioskStateName(to));
+            return false;
+        }
+        if (m_state.compare_exchange_weak(cur, to)) return true;
+    }
+}
+
+bool KioskManager::TryTransitionFrom(KioskState from, KioskState to) {
+    if (!IsLegalTransition(from, to)) return false;
+    KioskState expected = from;
+    return m_state.compare_exchange_strong(expected, to);
+}
 
 KioskManager::KioskManager()
     : m_state(KioskState::DISABLED),
@@ -134,17 +210,17 @@ bool KioskManager::Initialize(const std::string& db_path, const std::string& bas
     m_exit_requested.store(false);
     m_last_shutdown_reason.store(KioskShutdownReason::NONE);
     m_completed_sessions.store(0);
-    m_state.store(KioskState::STATE_KIOSK_BOOT);
+    m_state.store(KioskState::STATE_KIOSK_BOOT); // Deliberate reset: (re)initialization starts the lifecycle
 
     LOG_MSG("KIOSK: Subsystems initialized successfully (SQLite %s, ImGui %s).",
             KioskDatabase::GetInstance().GetSQLiteVersion().c_str(),
             KioskUI::GetInstance().GetImGuiVersion().c_str());
 
     if (m_skip_countdown.load()) {
-        m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+        TryTransition(KioskState::STATE_SHELL_INTERACTIVE);
         LOG_MSG("KIOSK: Entering STATE_SHELL_INTERACTIVE (--kiosk-skip-countdown active)");
     } else if (loaded_cfg.boot_timeout_sec > 0) {
-        m_state.store(KioskState::STATE_COUNTDOWN_IDLE);
+        TryTransition(KioskState::STATE_COUNTDOWN_IDLE);
         LOG_MSG("KIOSK: Entering STATE_COUNTDOWN_IDLE (Watchdog: %ds, Action: %s)",
                 loaded_cfg.boot_timeout_sec, loaded_cfg.default_boot_action.c_str());
     } else {
@@ -205,6 +281,7 @@ void KioskManager::RunMainLoop() {
 }
 
 void KioskManager::Shutdown() {
+    KioskFileSectorDevice::ReleaseGuestSessionPin(); // Guest no longer has the HDD mounted
     bool was_init = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -220,7 +297,7 @@ void KioskManager::Shutdown() {
         ViewCarousel::GetInstance().WaitForPendingImport();
         KioskUI::GetInstance().Shutdown();
         KioskDatabase::GetInstance().Close();
-        m_state.store(KioskState::DISABLED);
+        m_state.store(KioskState::DISABLED); // Deliberate reset: subsystems are gone
         m_kiosk_active.store(false);
         m_skip_countdown.store(false);
     }
@@ -279,9 +356,8 @@ void KioskManager::UpdateWatchdog(float delta_sec) {
 }
 
 void KioskManager::CancelWatchdog() {
-    if (m_state.load() == KioskState::STATE_COUNTDOWN_IDLE) {
+    if (TryTransitionFrom(KioskState::STATE_COUNTDOWN_IDLE, KioskState::STATE_SHELL_INTERACTIVE)) {
         LOG_MSG("KIOSK: Watchdog countdown cancelled by user input; transitioning to STATE_SHELL_INTERACTIVE.");
-        m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
     }
 }
 
@@ -508,11 +584,11 @@ LaunchContext KioskManager::ResolveDefaultBootContext() const {
 
 bool KioskManager::TriggerDefaultBootAction() {
     LaunchContext ctx = ResolveDefaultBootContext();
+    if (!TryTransition(KioskState::STATE_SYNTHESIZE_LAUNCH)) return false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_launch_ctx = ctx;
     }
-    m_state.store(KioskState::STATE_SYNTHESIZE_LAUNCH);
     LOG_MSG("KIOSK: Transitioned to STATE_SYNTHESIZE_LAUNCH (Machine: '%s', Item: '%s').",
             ctx.machine_id.c_str(), ctx.catalog_item_id.c_str());
     return true;
@@ -541,11 +617,12 @@ bool KioskManager::RequestLaunchMachine(const std::string& machine_id, const std
     ctx.is_real_hdd_boot = (mach.boot_mode == "REAL_HDD_BOOT");
     ctx.custom_disk_path = custom_disk_path;
 
+    // Only from the countdown or the shell: never while a launch or session is in flight
+    if (!TryTransition(KioskState::STATE_SYNTHESIZE_LAUNCH)) return false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_launch_ctx = ctx;
     }
-    m_state.store(KioskState::STATE_SYNTHESIZE_LAUNCH);
     return true;
 }
 
@@ -564,11 +641,12 @@ bool KioskManager::RequestLaunchItem(const std::string& item_id) {
     ctx.machine_id = item.machine_id;
     ctx.is_real_hdd_boot = has_mach && (mach.boot_mode == "REAL_HDD_BOOT");
 
+    // Only from the countdown or the shell: never while a launch or session is in flight
+    if (!TryTransition(KioskState::STATE_SYNTHESIZE_LAUNCH)) return false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_launch_ctx = ctx;
     }
-    m_state.store(KioskState::STATE_SYNTHESIZE_LAUNCH);
     return true;
 }
 
@@ -577,11 +655,12 @@ bool KioskManager::RequestDefaultDosboxLaunch() {
     ctx.machine_id.clear();
     ctx.catalog_item_id.clear();
     ctx.is_real_hdd_boot = false;
+    // Only from the countdown or the shell: never while a launch or session is in flight
+    if (!TryTransition(KioskState::STATE_SYNTHESIZE_LAUNCH)) return false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_launch_ctx = ctx;
     }
-    m_state.store(KioskState::STATE_SYNTHESIZE_LAUNCH);
     return true;
 }
 
@@ -611,6 +690,18 @@ std::string KioskManager::GetDefaultSessionConfPath() const {
 }
 
 bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf) {
+    // Releases the guest-session HDD pin on every failure path after it was taken
+    struct GuestPinGuard {
+        bool armed = false;
+        ~GuestPinGuard() {
+            if (armed) KioskFileSectorDevice::ReleaseGuestSessionPin();
+        }
+    } guest_pin;
+    if (m_state.load() != KioskState::STATE_SYNTHESIZE_LAUNCH) {
+        LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch ignored: no launch was requested (state %s).",
+                KioskStateName(m_state.load()));
+        return false;
+    }
     LaunchContext ctx;
     std::string base_conf;
     {
@@ -688,13 +779,26 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
             hdd_file_exists = hdd_probe.is_open();
         }
 
+        // Roll back any kiosk FAT write interrupted by a crash or power cut before DOSBox-X
+        // mounts the image (the installer path below never opens it through the FAT layer).
+        // Non-blocking: if an import is writing this image right now, refuse the launch.
+        KioskFileSectorDevice::ReleaseGuestSessionPin(); // A previous launch in this process
+        if (hdd_file_exists &&
+            !KioskFileSectorDevice::RecoverPendingJournal(machine.primary_hdd_path, nullptr, /*wait_for_lock=*/false)) {
+            LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: '%s' is busy or an interrupted write could not be rolled back.",
+                    machine.primary_hdd_path.c_str());
+            KioskUI::GetInstance().ShowToast("Disk image is busy (an import may be running). Try again shortly.", 4.0f);
+            TryTransition(KioskState::STATE_SHELL_INTERACTIVE);
+            return false;
+        }
+
         if (!machine.os_installed && item_ptr == nullptr && has_installer_media && hdd_file_exists) {
             boot_installer_media = true;
             LOG_MSG("KIOSK: Pending OS installation (!os_installed) with bound installer media; booting installer without AUTOEXEC hook.");
         } else if (!hdd_file_exists || !BootInjector::GetInstance().EnsureOneTimeAutoexecHook(machine.primary_hdd_path)) {
             LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to prepare primary HDD image '%s'.",
                     machine.primary_hdd_path.c_str());
-            m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+            TryTransition(KioskState::STATE_SHELL_INTERACTIVE);
             return false;
         } else {
             std::string dispatch_path = BootInjector::GetInstance().GetDefaultDispatchImagePath();
@@ -709,7 +813,7 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
                 if (!BootInjector::GetInstance().BuildDispatchVolume(dispatch_path, machine, *item_ptr)) {
                     LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to build dispatch volume '%s'.",
                             dispatch_path.c_str());
-                    m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+                    TryTransition(KioskState::STATE_SHELL_INTERACTIVE);
                     return false;
                 }
                 active_dispatch_path = dispatch_path;
@@ -718,11 +822,26 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
                 if (!BootInjector::GetInstance().BuildIdleDispatchVolume(dispatch_path)) {
                     LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: Unable to build idle dispatch volume '%s'.",
                             dispatch_path.c_str());
-                    m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+                    TryTransition(KioskState::STATE_SHELL_INTERACTIVE);
                     return false;
                 }
                 active_dispatch_path = dispatch_path;
             }
+        }
+
+        // Keep kiosk writers (e.g. a background Mode B import) off this image while the guest
+        // has it mounted; the pin lasts until teardown / re-exec.
+        if (hdd_file_exists && KioskFileSectorDevice::PinForGuestSession(machine.primary_hdd_path)) {
+            guest_pin.armed = true; // Released by the guard on any failure below
+        } else if (hdd_file_exists) {
+            LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: '%s' is being written or has an interrupted write pending.",
+                    machine.primary_hdd_path.c_str());
+            KioskUI::GetInstance().ShowToast("Disk image is busy (an import may be running). Try again shortly.", 4.0f);
+            if (!active_dispatch_path.empty()) {
+                BootInjector::GetInstance().CleanupDispatchVolume(active_dispatch_path);
+            }
+            TryTransition(KioskState::STATE_SHELL_INTERACTIVE);
+            return false;
         }
     }
 
@@ -739,7 +858,7 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
             if (!active_dispatch_path.empty()) {
                 BootInjector::GetInstance().CleanupDispatchVolume(active_dispatch_path);
             }
-            m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+            TryTransition(KioskState::STATE_SHELL_INTERACTIVE);
             return false;
         }
         session_conf_path = candidate_conf;
@@ -752,7 +871,8 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
         m_session_conf_path = session_conf_path;
     }
 
-    m_state.store(KioskState::STATE_EMULATION_RUNNING);
+    guest_pin.armed = false; // Launch succeeded: the pin stays until session teardown
+    TryTransitionFrom(KioskState::STATE_SYNTHESIZE_LAUNCH, KioskState::STATE_EMULATION_RUNNING);
     LOG_MSG("KIOSK: Configuration synthesized (%u bytes); entering STATE_EMULATION_RUNNING.",
             static_cast<unsigned int>(out_synthesized_conf.size()));
     return true;
@@ -774,20 +894,18 @@ std::string KioskManager::GetSessionConfPath() const {
 }
 
 void KioskManager::EnterRuntimeOverlay() {
-    if (m_state.load() != KioskState::STATE_EMULATION_RUNNING) {
+    if (!TryTransitionFrom(KioskState::STATE_EMULATION_RUNNING, KioskState::STATE_RUNTIME_OVERLAY)) {
         return;
     }
     LOG_MSG("KIOSK: Entering STATE_RUNTIME_OVERLAY (Emulation paused).");
-    m_state.store(KioskState::STATE_RUNTIME_OVERLAY);
     RuntimeOverlay::GetInstance().OnEnterOverlay();
 }
 
 void KioskManager::ResumeEmulation() {
-    if (m_state.load() != KioskState::STATE_RUNTIME_OVERLAY) {
+    if (!TryTransitionFrom(KioskState::STATE_RUNTIME_OVERLAY, KioskState::STATE_EMULATION_RUNNING)) {
         return;
     }
     LOG_MSG("KIOSK: Resuming STATE_EMULATION_RUNNING.");
-    m_state.store(KioskState::STATE_EMULATION_RUNNING);
 }
 
 void KioskManager::AbortSessionToShell() {
@@ -847,6 +965,9 @@ bool KioskManager::BuildInSessionRebootAutoexec(
     // - Otherwise (all installer media ejected), boot from primary HDD C:.
     const bool boot_installer = !live_drive_a.empty() || (!machine.os_installed && !live_drive_d.empty());
 
+    // No journal recovery needed here: the guest-session pin taken at launch has kept every
+    // kiosk FAT writer off this HDD since it was mounted, so no kiosk write can be pending.
+
     if (!boot_installer && !machine.os_installed && !machine.primary_hdd_path.empty()) {
         std::ifstream hdd(machine.primary_hdd_path.c_str(), std::ios::binary);
         if (hdd.is_open()) {
@@ -875,9 +996,12 @@ bool KioskManager::BuildInSessionRebootAutoexec(
 }
 
 void KioskManager::OnGuestShutdown(KioskShutdownReason reason) {
-    if (m_state.load() == KioskState::STATE_SHELL_INTERACTIVE &&
-        m_last_shutdown_reason.load() == reason) {
-        return; // Already processed this session shutdown (e.g., via AbortSessionToShell)
+    // Only a running (or overlay-paused) session can end. A second notification for the same
+    // session (overlay abort, then the unwinding catch handler) finds the shell state and is a
+    // no-op, as is a shutdown after appliance exit (DISABLED).
+    if (!TryTransitionFrom(KioskState::STATE_EMULATION_RUNNING, KioskState::STATE_SHELL_INTERACTIVE) &&
+        !TryTransitionFrom(KioskState::STATE_RUNTIME_OVERLAY, KioskState::STATE_SHELL_INTERACTIVE)) {
+        return;
     }
     LOG_MSG("KIOSK: Guest session ended (Reason: %s). Returning to STATE_SHELL_INTERACTIVE.",
             KioskShutdownReasonToString(reason));
@@ -889,7 +1013,6 @@ void KioskManager::OnGuestShutdown(KioskShutdownReason reason) {
         m_launch_ctx = LaunchContext();
     }
     KioskUI::GetInstance().InvalidateCatalogCache();
-    m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
 }
 
 bool KioskManager::RelaunchIntoInteractiveShell(
@@ -984,7 +1107,7 @@ bool KioskManager::RelaunchIntoInteractiveShell(
 void KioskManager::RequestApplianceExit() {
     LOG_MSG("KIOSK: Appliance exit requested.");
     m_exit_requested.store(true);
-    m_state.store(KioskState::DISABLED);
+    TryTransition(KioskState::DISABLED);
 }
 
 #endif // defined(C_KIOSK)

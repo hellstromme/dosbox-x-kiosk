@@ -4,6 +4,8 @@
 #include "kiosk_types.h"
 #include <string>
 #include <vector>
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 
 struct sqlite3;
@@ -19,6 +21,12 @@ public:
     static std::string GetDefaultDatabasePath();
 
     std::string GetSQLiteVersion() const;
+
+    // Change notification without upward dependencies: every successful mutation (and every
+    // Open/Close) bumps a monotonic generation. Consumers (UI caches, previews) poll it and
+    // reload when it moves; the data layer never calls into them.
+    uint64_t GetChangeGeneration() const { return m_change_generation.load(std::memory_order_acquire); }
+    uint64_t GetConfigGeneration() const { return m_config_generation.load(std::memory_order_acquire); }
     bool InitializeSchema();
     bool SeedDefaultData();
 
@@ -84,7 +92,13 @@ private:
     bool OpenInternal(const std::string& path);
     bool ExecuteSqlInternal(const char* sql);
     void CloseInternal();
+    void NotifyChanged(bool config_changed = false) {
+        m_change_generation.fetch_add(1, std::memory_order_acq_rel);
+        if (config_changed) m_config_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
 
+    std::atomic<uint64_t> m_change_generation{1};
+    std::atomic<uint64_t> m_config_generation{1};
     mutable std::mutex m_mutex;
     sqlite3* m_db = nullptr;
     std::string m_active_path;

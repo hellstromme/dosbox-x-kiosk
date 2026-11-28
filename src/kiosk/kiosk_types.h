@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <atomic>
 
 // Archetype identifier constants
 namespace KioskArchetypes {
@@ -263,6 +264,70 @@ struct KioskGuestShutdownException {
     explicit KioskGuestShutdownException(KioskShutdownReason r = KioskShutdownReason::APM_POWER_OFF)
         : reason(r) {}
 };
+
+// Deferred guest-shutdown request.
+// Sites that may run inside JIT-generated code (I/O port handlers called from the
+// dynamic cores) or inside nested UI/debugger loops must never throw
+// KioskGuestShutdownException directly: generated code has no unwind info.
+// They post a request here instead, and normal_loop() raises it between CPU slices.
+inline std::atomic<int>& Kiosk_PendingGuestShutdownSlot() {
+    static std::atomic<int> pending(static_cast<int>(KioskShutdownReason::NONE));
+    return pending;
+}
+
+inline void Kiosk_PostGuestShutdown(KioskShutdownReason reason) {
+    Kiosk_PendingGuestShutdownSlot().store(static_cast<int>(reason));
+}
+
+inline KioskShutdownReason Kiosk_GetPendingGuestShutdown() {
+    return static_cast<KioskShutdownReason>(Kiosk_PendingGuestShutdownSlot().load(std::memory_order_relaxed));
+}
+
+inline void Kiosk_ClearPendingGuestShutdown() {
+    Kiosk_PendingGuestShutdownSlot().store(static_cast<int>(KioskShutdownReason::NONE));
+}
+
+// Kiosk host-program lock (INTEGRATED_DOS catalog launches).
+// The generated [autoexec] performs its own MOUNT/IMGMOUNT lines, then runs Z:\KIOSKLCK.COM
+// right before the game. From then on, Z:\ programs that can reach host files, settings,
+// ports or the network refuse to run, so an imported game's own .BAT cannot run
+// "Z:\MOUNT.COM H C:\" and escape the container. One-way: nothing unlocks it in-session.
+inline std::atomic<bool>& Kiosk_HostProgramLockSlot() {
+    static std::atomic<bool> locked(false);
+    return locked;
+}
+
+inline void Kiosk_EngageHostProgramLock() { Kiosk_HostProgramLockSlot().store(true); }
+inline bool Kiosk_IsHostProgramLocked() { return Kiosk_HostProgramLockSlot().load(); }
+
+inline bool Kiosk_IsHostReachingProgram(const std::string& program_name) {
+    static const char* const kBlocked[] = {
+        "MOUNT.COM", "IMGMOUNT.COM", "IMGMAKE.COM", "VHDMAKE.COM", "BOOT.COM", "CONFIG.COM",
+        "CFGTOOL.COM", "START.COM", "SERIAL.COM", "PARALLEL.COM", "ETHNET.COM", "IPXNET.COM",
+        "LOADROM.COM"
+    };
+    std::string upper(program_name);
+    for (size_t i = 0; i < upper.size(); ++i) {
+        if (upper[i] >= 'a' && upper[i] <= 'z') upper[i] = static_cast<char>(upper[i] - 'a' + 'A');
+    }
+    for (size_t i = 0; i < sizeof(kBlocked) / sizeof(kBlocked[0]); ++i) {
+        if (upper == kBlocked[i]) return true;
+    }
+    return false;
+}
+
+// Throws (and clears) the pending request, if any. Call only from plain C++ frames
+// that are safe to unwind, i.e. normal_loop() outside the CPU decoder.
+// Note: in C_DEBUG builds a request posted while the debugger owns the loop (DEBUG_Loop
+// replaces normal_loop) is raised once the debugger returns control.
+inline void Kiosk_RaisePendingGuestShutdown() {
+    std::atomic<int>& slot = Kiosk_PendingGuestShutdownSlot();
+    if (slot.load(std::memory_order_relaxed) == static_cast<int>(KioskShutdownReason::NONE)) return;
+    const int pending = slot.exchange(static_cast<int>(KioskShutdownReason::NONE));
+    if (pending != static_cast<int>(KioskShutdownReason::NONE)) {
+        throw KioskGuestShutdownException(static_cast<KioskShutdownReason>(pending));
+    }
+}
 
 inline const char* KioskShutdownReasonToString(KioskShutdownReason reason) {
     switch (reason) {

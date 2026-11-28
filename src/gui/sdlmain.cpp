@@ -5989,16 +5989,23 @@ static void Kiosk_RunRuntimeOverlayLoop(void) {
         SDL_Delay(16);
     }
 
-    if (SDL2_AudioDevice != 0) {
+    const bool aborting = KioskManager::GetInstance().IsExitRequested() ||
+        KioskManager::GetInstance().GetState() != KioskState::STATE_EMULATION_RUNNING;
+
+    if (SDL2_AudioDevice != 0 && !aborting) {
         SDL_PauseAudioDevice(SDL2_AudioDevice, 0);
     }
 
     MAPPER_ReleaseAllKeys();
     CPU_Reset_AutoAdjust();
 
-    if (KioskManager::GetInstance().IsExitRequested() ||
-        KioskManager::GetInstance().GetState() != KioskState::STATE_EMULATION_RUNNING) {
-        throw KioskGuestShutdownException(KioskShutdownReason::USER_OVERLAY_ABORT);
+    if (aborting) {
+        /* GFX_Events() is also reached from callback idle loops and the debugger;
+         * defer the unwind to normal_loop() instead of throwing from here. */
+        Kiosk_PostGuestShutdown(KioskShutdownReason::USER_OVERLAY_ABORT);
+        CPU_CycleLeft += CPU_Cycles;
+        CPU_Cycles = 0;
+        return;
     }
 
 #if C_OPENGL
@@ -6098,6 +6105,9 @@ void GFX_Events() {
             if (is_overlay_hotkey) {
                 if (kstate == KioskState::STATE_EMULATION_RUNNING) {
                     Kiosk_RunRuntimeOverlayLoop();
+                    if (Kiosk_GetPendingGuestShutdown() != KioskShutdownReason::NONE) {
+                        return; /* session is ending; normal_loop() unwinds it */
+                    }
                     continue;
                 } else if (kstate == KioskState::STATE_RUNTIME_OVERLAY) {
                     KioskManager::GetInstance().ResumeEmulation();
@@ -8635,7 +8645,31 @@ void jsc_run(const char *jskey) {
 void DISP2_Init(uint8_t color), DISP2_Shut();
 //extern void UI_Init(void);
 void grGlideShutdown(void);
+#if defined(C_KIOSK)
+struct KioskRelaunchRequest {
+    bool reexec_to_shell = false;
+    std::string db_path;
+    std::string conf_path;
+};
+
+static int DOSBOX_MainBody(int argc, char* argv[], KioskRelaunchRequest& kiosk_relaunch);
+
 int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
+    KioskRelaunchRequest kiosk_relaunch;
+    const int rc = DOSBOX_MainBody(argc, argv, kiosk_relaunch);
+    /* Relaunch only after DOSBOX_MainBody() has returned: its "myconf" Config object
+     * (and with it every section destroy function) must be gone first, because a
+     * POSIX execv() replaces the process image without running any destructors. */
+    if (kiosk_relaunch.reexec_to_shell) {
+        if (!KioskManager::RelaunchIntoInteractiveShell(argv[0], kiosk_relaunch.db_path, kiosk_relaunch.conf_path)) return 1;
+    }
+    return rc;
+}
+
+static int DOSBOX_MainBody(int argc, char* argv[], KioskRelaunchRequest& kiosk_relaunch) {
+#else
+int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
+#endif
 #if (defined __i386__ || defined __x86_64__) && (!defined IS_OLDMACOS && (defined BSD || defined LINUX))
     dropPrivilegesTemp();
 #endif
@@ -8643,9 +8677,9 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
     Config myconf(&com_line);
     bool saved_opt_test;
 #if defined(C_KIOSK)
-    bool kiosk_reexec_to_shell = false;
-    std::string saved_kiosk_db;
-    std::string saved_kiosk_conf;
+    bool& kiosk_reexec_to_shell = kiosk_relaunch.reexec_to_shell;
+    std::string& saved_kiosk_db = kiosk_relaunch.db_path;
+    std::string& saved_kiosk_conf = kiosk_relaunch.conf_path;
 #endif
 #if defined(C_DOSBOX_AGENT)
     dosbox_agent::AgentServer agent_server;
@@ -10540,8 +10574,12 @@ fresh_boot:
 #if C_DEBUG
             if (control->opt_break_start) DEBUG_EnableDebugger();
 #endif
+#if defined(C_KIOSK)
+            Kiosk_ClearPendingGuestShutdown(); /* never carry a request into a new boot */
+#endif
             DOSBOX_RunMachine();
 #if defined(C_KIOSK)
+            Kiosk_RaisePendingGuestShutdown();
             if (KioskManager::GetInstance().IsKioskModeActive() && !control->opt_exit && !control->opt_test && !KioskManager::GetInstance().IsExitRequested()) {
                 KioskManager::GetInstance().OnGuestShutdown(KioskShutdownReason::SHELL_EXIT);
                 kiosk_reexec_to_shell = true;
@@ -10549,6 +10587,7 @@ fresh_boot:
 #endif
 #if defined(C_KIOSK)
         } catch (const KioskGuestShutdownException& e) {
+            Kiosk_ClearPendingGuestShutdown(); /* teardown may re-enter the CPU loop */
             LOG_MSG("KIOSK: Caught guest shutdown exception (%s)", KioskShutdownReasonToString(e.reason));
             KioskManager::GetInstance().OnGuestShutdown(e.reason);
             run_machine = false;
@@ -11061,11 +11100,6 @@ fresh_boot:
          * freed resources. */
         control = NULL; /* any deref past this point and you deserve to segfault */
     }
-#if defined(C_KIOSK)
-    if (kiosk_reexec_to_shell) {
-        if (!KioskManager::RelaunchIntoInteractiveShell(argv[0], saved_kiosk_db, saved_kiosk_conf)) return 1;
-    }
-#endif
     return saved_opt_test&&testerr?1:0;
 }
 

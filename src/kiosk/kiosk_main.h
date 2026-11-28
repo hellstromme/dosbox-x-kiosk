@@ -17,9 +17,11 @@ public:
     void RunMainLoop();
     void Shutdown();
 
-    // State getters/setters
+    // Lifecycle state. Read-only from outside: transitions happen only through the intent
+    // methods below (RequestLaunch*, CancelWatchdog, EnterRuntimeOverlay, OnGuestShutdown, ...),
+    // each validated against IsLegalTransition().
     KioskState GetState() const { return m_state.load(); }
-    void SetState(KioskState state) { m_state.store(state); }
+    static bool IsLegalTransition(KioskState from, KioskState to);
 
     bool IsKioskModeActive() const { return m_kiosk_active.load(); }
     void SetKioskModeActive(bool active) { m_kiosk_active.store(active); }
@@ -91,6 +93,11 @@ private:
     ~KioskManager();
     KioskManager(const KioskManager&) = delete;
     KioskManager& operator=(const KioskManager&) = delete;
+
+    // Atomically moves to `to` if the current state allows it; logs and returns false otherwise.
+    bool TryTransition(KioskState to);
+    // Atomically moves from exactly `from` to `to` (compare-and-swap); false if the state differs.
+    bool TryTransitionFrom(KioskState from, KioskState to);
 
     void CleanupSessionArtifactsLocked();
     void UpdateParsedOverlayHotkeyLocked();

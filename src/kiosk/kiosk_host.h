@@ -39,6 +39,12 @@ public:
     static bool IsFileConfirmedMissing(const std::string& file_path);
     static std::string JoinPath(const std::string& base, const std::string& child);
 
+    // Strips trailing separators (keeps "/" and Windows drive roots such as "E:\\").
+    static std::string NormalizeDirPath(const std::string& path);
+    // True when file_path equals dir_path or lies beneath it (separator-aware; on Windows
+    // case-insensitive and '/' == '\\'). Used for USB mount containment checks.
+    static bool PathIsWithin(const std::string& file_path, const std::string& dir_path);
+
     // Optional systemd sd_notify() supervision (no-op unless HAVE_LIBSYSTEMD is defined)
     static bool IsSystemdSupportCompiled();
     static void NotifySystemdReady();

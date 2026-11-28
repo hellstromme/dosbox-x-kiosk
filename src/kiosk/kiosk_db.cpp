@@ -4,8 +4,6 @@
 
 #include "kiosk_db.h"
 #include "kiosk_host.h"
-#include "ingest/usb_bridge.h"
-#include "ui/kiosk_ui.h"
 #include "sqlite3.h"
 #include "logging.h"
 #include <cstdio>
@@ -123,10 +121,12 @@ bool KioskDatabase::OpenInternal(const std::string& db_path) {
     }
 
     SeedDefaultData();
+    NotifyChanged(/*config_changed=*/true); // A different database: every cached view is stale
     return true;
 }
 
 void KioskDatabase::Close() {
+    NotifyChanged(/*config_changed=*/true);
     std::lock_guard<std::mutex> lock(m_mutex);
     CloseInternal();
 }
@@ -379,8 +379,7 @@ bool KioskDatabase::UpdateConfig(const KioskConfigRecord& config) {
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc == SQLITE_DONE) {
-        KioskUI::GetInstance().InvalidateCatalogCache();
-        KioskUI::GetInstance().InvalidateSettingsDraft();
+        NotifyChanged(/*config_changed=*/true);
         return true;
     }
     return false;
@@ -475,7 +474,7 @@ bool KioskDatabase::InsertMachine(const MachineRecord& machine) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -542,7 +541,7 @@ bool KioskDatabase::InsertMachineWithBindings(
             ExecuteSqlInternal("ROLLBACK;");
             return false;
         }
-        KioskUI::GetInstance().InvalidateCatalogCache();
+        NotifyChanged();
         return true;
     }
 
@@ -574,7 +573,7 @@ bool KioskDatabase::UpdateMachine(const MachineRecord& machine) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -589,7 +588,7 @@ bool KioskDatabase::DeleteMachine(const std::string& id) {
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -804,7 +803,7 @@ bool KioskDatabase::InsertCatalogItem(const CatalogItemRecord& item) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -842,7 +841,7 @@ bool KioskDatabase::UpdateCatalogItem(const CatalogItemRecord& item) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -857,7 +856,7 @@ bool KioskDatabase::DeleteCatalogItem(const std::string& id) {
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -873,7 +872,7 @@ bool KioskDatabase::IncrementPlayCount(const std::string& id) {
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -1010,7 +1009,7 @@ bool KioskDatabase::InsertMedia(const MediaPoolRecord& media) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -1041,7 +1040,7 @@ bool KioskDatabase::UpdateMedia(const MediaPoolRecord& media) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -1056,7 +1055,7 @@ bool KioskDatabase::DeleteMedia(const std::string& id) {
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -1074,7 +1073,7 @@ bool KioskDatabase::RenameMediaGroup(const std::string& old_group, const std::st
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc == SQLITE_DONE) {
-        KioskUI::GetInstance().InvalidateCatalogCache();
+        NotifyChanged();
         return true;
     }
     return false;
@@ -1106,7 +1105,7 @@ bool KioskDatabase::AssignMediaGroupBatch(const std::vector<std::string>& media_
     sqlite3_finalize(stmt);
 
     if (all_ok && ExecuteSqlInternal("COMMIT;")) {
-        KioskUI::GetInstance().InvalidateCatalogCache();
+        NotifyChanged();
         return true;
     }
     ExecuteSqlInternal("ROLLBACK;");
@@ -1160,7 +1159,7 @@ int KioskDatabase::DeleteRemovableUsbMediaByPrefix(const std::string& mount_pref
             while (sqlite3_step(sel) == SQLITE_ROW) {
                 const std::string id = ColumnTextSafe(sel, 0);
                 const std::string fp = ColumnTextSafe(sel, 1);
-                if (KioskUsbBridge::PathStartsWithMount(fp, mount_prefix)) {
+                if (KioskHost::PathIsWithin(fp, mount_prefix)) {
                     ids_to_delete.push_back(id);
                 }
             }
@@ -1199,7 +1198,7 @@ int KioskDatabase::DeleteRemovableUsbMediaByPrefix(const std::string& mount_pref
         }
     }
     if (deleted > 0) {
-        KioskUI::GetInstance().InvalidateCatalogCache();
+        NotifyChanged();
     }
     return deleted;
 }
@@ -1270,7 +1269,7 @@ int KioskDatabase::PurgeStaleRemovableUsbMedia() {
         }
     }
     if (deleted > 0) {
-        KioskUI::GetInstance().InvalidateCatalogCache();
+        NotifyChanged();
     }
     return deleted;
 }
@@ -1357,7 +1356,7 @@ bool KioskDatabase::AddCaddyBinding(const CaddyBindingRecord& binding) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -1372,7 +1371,7 @@ bool KioskDatabase::DeleteCaddyBinding(int id) {
     sqlite3_bind_int(stmt, 1, id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -1387,7 +1386,7 @@ bool KioskDatabase::ClearCaddyBindingsForMachine(const std::string& machine_id) 
     sqlite3_bind_text(stmt, 1, machine_id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -1402,7 +1401,7 @@ bool KioskDatabase::ClearCaddyBindingsForItem(const std::string& item_id) {
     sqlite3_bind_text(stmt, 1, item_id.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -1491,7 +1490,7 @@ bool KioskDatabase::InsertOSDistribution(const OSDistributionRecord& os) {
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 
@@ -1545,7 +1544,7 @@ bool KioskDatabase::InsertSoftwareSignature(const SoftwareSignatureRecord& sig) 
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_DONE) { KioskUI::GetInstance().InvalidateCatalogCache(); return true; }
+    if (rc == SQLITE_DONE) { NotifyChanged(); return true; }
     return false;
 }
 

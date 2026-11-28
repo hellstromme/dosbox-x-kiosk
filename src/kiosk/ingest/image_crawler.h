@@ -2,6 +2,7 @@
 #define DOSBOX_KIOSK_IMAGE_CRAWLER_H
 
 #include "../kiosk_types.h"
+#include "../fs/fat_volume.h"
 #include "signature_matcher.h"
 #include <cstddef>
 #include <cstdint>
@@ -10,80 +11,52 @@
 
 class imageDisk;
 
-struct FatDirEntry {
-    std::string name;         // Reconstructed VFAT LFN (UTF-8) or 8.3 short name
-    std::string short_name;   // Canonical 8.3 short name (uppercase)
-    bool is_directory = false;
-    uint8_t attributes = 0;
-    uint32_t first_cluster = 0;
-    uint32_t file_size = 0;
-};
-
+// Strictly read-only facade over the shared KioskFatVolume (src/kiosk/fs/fat_volume.h)
 class FatReadOnlyVfs {
 public:
     FatReadOnlyVfs() = default;
-    ~FatReadOnlyVfs();
+    ~FatReadOnlyVfs() = default;
 
     FatReadOnlyVfs(const FatReadOnlyVfs&) = delete;
     FatReadOnlyVfs& operator=(const FatReadOnlyVfs&) = delete;
 
-    // Opens a raw .img/.ima or .vhd disk image strictly read-only via DOSBox-X imageDisk.
+    // Opens a raw .img/.ima or .vhd disk image strictly read-only.
     bool OpenImageFile(const std::string& image_path);
 
     // Wraps an already-open imageDisk without taking ownership (used for unit tests / in-memory disks).
     bool OpenFromImageDisk(imageDisk* non_owning_disk);
 
-    void Close();
-    bool IsOpen() const { return m_mounted; }
+    void Close() { m_volume.Close(); }
+    bool IsOpen() const { return m_volume.IsMounted(); }
 
-    FilesystemType GetFilesystemType() const { return m_fs_type; }
-    uint32_t GetPartitionLbaStart() const { return m_part_lba; }
-    uint32_t GetBytesPerSector() const { return m_bytes_per_sector; }
-    uint32_t GetSectorsPerCluster() const { return m_sectors_per_cluster; }
-    uint32_t GetClusterCount() const { return m_cluster_count; }
-    bool IsWriteProtected() const { return m_write_protected; }
+    FilesystemType GetFilesystemType() const { return m_volume.GetFilesystemType(); }
+    uint32_t GetPartitionLbaStart() const { return m_volume.GetPartitionLbaStart(); }
+    uint32_t GetBytesPerSector() const { return m_volume.GetBytesPerSector(); }
+    uint32_t GetSectorsPerCluster() const { return m_volume.GetSectorsPerCluster(); }
+    uint32_t GetClusterCount() const { return m_volume.GetClusterCount(); }
+    bool IsWriteProtected() const { return !m_volume.IsWritable(); }
 
     // Lists entries in the given directory (pass nullptr for root directory).
-    bool ListDirectory(const FatDirEntry* dir, std::vector<FatDirEntry>& out_entries) const;
+    bool ListDirectory(const FatDirEntry* dir, std::vector<FatDirEntry>& out_entries) const {
+        return m_volume.ListDirectory(dir, out_entries);
+    }
 
     // Case-insensitive path lookup (supports optional "C:\" prefix and LFN or 8.3 names).
-    bool FindPath(const std::string& guest_path, FatDirEntry& out_entry) const;
+    bool FindPath(const std::string& guest_path, FatDirEntry& out_entry) const {
+        return m_volume.FindPath(guest_path, out_entry);
+    }
 
     // Reads up to max_bytes of a file entry strictly read-only.
     bool ReadFile(
         const FatDirEntry& entry,
         std::vector<uint8_t>& out_data,
         size_t max_bytes = 16U * 1024U * 1024U
-    ) const;
+    ) const {
+        return m_volume.ReadFile(entry, out_data, max_bytes);
+    }
 
 private:
-    bool MountPartition();
-    bool ParseBpb(uint32_t part_lba, uint32_t max_part_sectors = 0);
-    bool ReadSector(uint32_t abs_lba, uint8_t out_sector[512]) const;
-    bool GetNextCluster(uint32_t cluster, uint32_t& out_next) const;
-    bool IsEndOfChain(uint32_t cluster) const;
-    uint32_t ClusterToLba(uint32_t cluster) const;
-    void ParseDirectoryBuffer(const std::vector<uint8_t>& buf, std::vector<FatDirEntry>& out_entries) const;
-
-    imageDisk* m_disk = nullptr;
-    bool m_owns_disk = false;
-    bool m_mounted = false;
-    bool m_write_protected = true;
-
-    FilesystemType m_fs_type = FilesystemType::FAT16;
-    uint32_t m_part_lba = 0;
-    uint32_t m_bytes_per_sector = 512;
-    uint32_t m_sectors_per_cluster = 1;
-    uint32_t m_reserved_sectors = 1;
-    uint32_t m_num_fats = 2;
-    uint32_t m_root_entry_count = 0;
-    uint32_t m_total_sectors = 0;
-    uint32_t m_fat_size_sectors = 0;
-    uint32_t m_root_dir_sectors = 0;
-    uint32_t m_first_data_sector = 0;
-    uint32_t m_cluster_count = 0;
-    uint32_t m_root_cluster = 0;
-    uint32_t m_active_fat_index = 0;
+    KioskFatVolume m_volume;
 };
 
 struct Win31GrpItem {

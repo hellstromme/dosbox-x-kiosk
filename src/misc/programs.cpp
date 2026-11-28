@@ -48,6 +48,9 @@
 #include "bios_disk.h"
 #include "imagedisk_msdosblockdev.h"
 #include "sdlmain.h"
+#if defined(C_KIOSK)
+#include "kiosk/kiosk_types.h"
+#endif
 #include "cpu.h"
 #if defined(WIN32)
 #include "windows.h"
@@ -162,6 +165,15 @@ static Bitu PROGRAMS_Handler(void) {
 	InternalProgramEntry *ipe = internal_progs[index];
 	if (ipe == NULL) E_Exit("Attempt to run internal program slot with nothing allocated");
 	if (ipe->main == NULL) return CBRET_NONE;
+#if defined(C_KIOSK)
+	if (Kiosk_IsHostProgramLocked() && Kiosk_IsHostReachingProgram(ipe->name)) {
+		static const char kDenied[] = "This command is disabled in Kiosk game sessions.\r\n";
+		uint16_t len = static_cast<uint16_t>(sizeof(kDenied) - 1);
+		DOS_WriteFile(STDOUT, reinterpret_cast<const uint8_t*>(kDenied), &len);
+		LOG_MSG("KIOSK: Blocked host-reaching program %s in locked game session", ipe->name.c_str());
+		return CBRET_NONE;
+	}
+#endif
 	PROGRAMS_Main * handler = internal_progs[index]->main;
 	(*handler)(&new_program);
 

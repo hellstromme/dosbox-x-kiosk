@@ -32,7 +32,8 @@ ViewWatchdog& ViewWatchdog::GetInstance() {
 }
 
 void ViewWatchdog::RefreshPreview() {
-    const uint64_t target_gen = m_preview_generation.load(std::memory_order_acquire);
+    const uint64_t target_gen = m_preview_generation.load(std::memory_order_acquire) +
+                                KioskDatabase::GetInstance().GetChangeGeneration();
     KioskManager& mgr = KioskManager::GetInstance();
     KioskDatabase& db = KioskDatabase::GetInstance();
     const KioskConfigRecord cfg = mgr.GetConfig();
@@ -85,7 +86,8 @@ void ViewWatchdog::RefreshPreview() {
 }
 
 void ViewWatchdog::Render(float remaining_sec) {
-    if (m_loaded_preview_generation != m_preview_generation.load(std::memory_order_acquire)) {
+    if (m_loaded_preview_generation != m_preview_generation.load(std::memory_order_acquire) +
+                                       KioskDatabase::GetInstance().GetChangeGeneration()) {
         RefreshPreview();
     }
 

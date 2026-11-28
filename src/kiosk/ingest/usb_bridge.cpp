@@ -219,49 +219,11 @@ KioskUsbBridge& KioskUsbBridge::GetInstance() {
 }
 
 std::string KioskUsbBridge::NormalizeMountPath(const std::string& path) {
-    std::string out = path;
-    while (out.size() > 1) {
-        const char back = out[out.size() - 1];
-#if defined(_WIN32)
-        if (back != '/' && back != '\\') break;
-        // Preserve Windows drive root trailing slash ("E:\")
-        if (out.size() == 3 && out[1] == ':') break;
-#else
-        if (back != '/') break;
-#endif
-        out.pop_back();
-    }
-    return out;
+    return KioskHost::NormalizeDirPath(path);
 }
 
 bool KioskUsbBridge::PathStartsWithMount(const std::string& file_path, const std::string& mount_path) {
-    const std::string norm_mount = NormalizeMountPath(mount_path);
-    if (norm_mount.empty() || file_path.size() < norm_mount.size()) {
-        return false;
-    }
-
-    std::string lhs = file_path;
-    std::string rhs = norm_mount;
-#if defined(_WIN32)
-    for (size_t i = 0; i < lhs.size(); ++i) {
-        if (lhs[i] == '\\') lhs[i] = '/';
-    }
-    for (size_t i = 0; i < rhs.size(); ++i) {
-        if (rhs[i] == '\\') rhs[i] = '/';
-    }
-    lhs = ToLowerAscii(lhs);
-    rhs = ToLowerAscii(rhs);
-#endif
-    if (lhs.compare(0, rhs.size(), rhs) != 0) {
-        return false;
-    }
-    if (lhs.size() == rhs.size()) {
-        return true;
-    }
-    if (!rhs.empty() && rhs[rhs.size() - 1] == '/') {
-        return true;
-    }
-    return lhs[rhs.size()] == '/';
+    return KioskHost::PathIsWithin(file_path, mount_path);
 }
 
 std::string KioskUsbBridge::DeriveVolumeLabelFromPath(const std::string& mount_path) {
@@ -308,7 +270,6 @@ bool KioskUsbBridge::Initialize(const std::string& watch_root, bool enable_os_po
         m_last_poll_ticks = 0;
         m_last_drive_mask = 0;
         std::memset(m_drive_serials, 0, sizeof(m_drive_serials));
-        m_pending_cache_invalidation = false;
         m_pending_toast_msg.clear();
         m_pending_toast_sec = 0.0f;
         m_pending_eject_mounts.clear();
@@ -439,14 +400,11 @@ void KioskUsbBridge::DispatchAsyncPoll(bool rescan_existing) {
 }
 
 void KioskUsbBridge::DrainPendingMainThreadActions() {
-    bool do_invalidate = false;
     std::string toast_msg;
     float toast_sec = 0.0f;
     std::vector<std::string> eject_mounts;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        do_invalidate = m_pending_cache_invalidation;
-        m_pending_cache_invalidation = false;
         toast_msg.swap(m_pending_toast_msg);
         toast_sec = m_pending_toast_sec;
         m_pending_toast_sec = 0.0f;
@@ -455,9 +413,6 @@ void KioskUsbBridge::DrainPendingMainThreadActions() {
 
     for (size_t i = 0; i < eject_mounts.size(); ++i) {
         EjectActiveDrivesUnderMount(eject_mounts[i]);
-    }
-    if (do_invalidate) {
-        KioskUI::GetInstance().InvalidateCatalogCache();
     }
     if (!toast_msg.empty()) {
         KioskUI::GetInstance().ShowToast(toast_msg, toast_sec);
@@ -914,17 +869,11 @@ bool KioskUsbBridge::OnVolumeMounted(const std::string& mount_path,
     }
 
     if (on_main_thread) {
-        if (media_added > 0) {
-            KioskUI::GetInstance().InvalidateCatalogCache();
-        }
         if (!toast_msg.empty()) {
             KioskUI::GetInstance().ShowToast(toast_msg, toast_sec);
         }
     } else {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (media_added > 0) {
-            m_pending_cache_invalidation = true;
-        }
         if (!toast_msg.empty()) {
             m_pending_toast_msg = toast_msg;
             m_pending_toast_sec = toast_sec;
@@ -1006,11 +955,9 @@ bool KioskUsbBridge::OnVolumeRemoved(const std::string& mount_path) {
         const std::string label = removed_label.empty() ? DeriveVolumeLabelFromPath(norm_path) : removed_label;
         const std::string msg = "Removable drive '" + label + "' disconnected.";
         if (on_main_thread) {
-            KioskUI::GetInstance().InvalidateCatalogCache();
             KioskUI::GetInstance().ShowToast(msg, 3.5f);
         } else {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_pending_cache_invalidation = true;
             m_pending_toast_msg = msg;
             m_pending_toast_sec = 3.5f;
         }

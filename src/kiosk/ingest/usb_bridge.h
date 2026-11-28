@@ -107,7 +107,6 @@ private:
     uint32_t m_last_poll_ticks = 0;
 
     // Pending main-thread UI/emulation actions queued by the background worker
-    bool m_pending_cache_invalidation = false;
     std::string m_pending_toast_msg;
     float m_pending_toast_sec = 0.0f;
     std::vector<std::string> m_pending_eject_mounts;
