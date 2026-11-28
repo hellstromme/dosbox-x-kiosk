@@ -7,6 +7,7 @@
 #include "logging.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <cctype>
@@ -19,6 +20,9 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <io.h>
+#include <fcntl.h>
+#include <cwchar>
+#include <cwctype>
 #else
 #include <fcntl.h>
 #include <sys/types.h>
@@ -427,14 +431,26 @@ bool ParseFatGeometry(const uint8_t* vbr, uint32_t part_lba, uint32_t max_part_s
 // ---- Per-image lock registry ----
 // Serialises every open, commit and recovery of one image across threads (import worker,
 // launch path, crawler): readers share, writers and recovery are exclusive.
+// Canonical key so relative/absolute spellings (and POSIX symlinks) share one mutex.
 std::string NormalizeLockKey(const std::string& path) {
-    std::string key(path);
 #if defined(_WIN32)
-    for (size_t i = 0; i < key.size(); ++i) {
-        key[i] = (key[i] == '/') ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(key[i])));
+    std::wstring wide = Utf8ToWide(path);
+    wchar_t full[4096];
+    const DWORD n = GetFullPathNameW(wide.c_str(), 4096, full, nullptr);
+    if (n > 0 && n < 4096) wide.assign(full, n);
+    std::string key;
+    for (size_t i = 0; i < wide.size(); ++i) {
+        const wchar_t c = (wide[i] == L'/') ? L'\\' : static_cast<wchar_t>(towlower(wide[i]));
+        AppendUtf8(key, static_cast<uint32_t>(c));
     }
-#endif
     return key;
+#else
+    char* resolved = realpath(path.c_str(), nullptr);
+    if (!resolved) return path; // Not created yet: the raw spelling is all there is
+    std::string key(resolved);
+    std::free(resolved);
+    return key;
+#endif
 }
 
 std::shared_ptr<std::shared_timed_mutex> AcquireImageMutex(const std::string& path) {
@@ -464,7 +480,18 @@ std::FILE* CreateHostFileExclusive(const std::string& path, int posix_mode) {
     RemoveHostFile(path);
 #if defined(_WIN32)
     (void)posix_mode;
-    return _wfopen(Utf8ToWide(path).c_str(), L"wbx");
+    // CREATE_NEW via Win32 (works on every CRT, unlike the C11 "x" fopen mode)
+    HANDLE h = CreateFileW(Utf8ToWide(path).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return nullptr;
+    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_WRONLY | _O_BINARY);
+    if (fd < 0) {
+        CloseHandle(h);
+        return nullptr;
+    }
+    std::FILE* f = _fdopen(fd, "wb");
+    if (!f) _close(fd);
+    return f;
 #else
     int flags = O_WRONLY | O_CREAT | O_EXCL;
 #ifdef O_NOFOLLOW
@@ -668,7 +695,10 @@ bool KioskFileSectorDevice::RecoverPendingJournal(const std::string& image_path,
 
 void KioskFileSectorDevice::QuarantinePendingJournal(const std::string& image_path) {
     std::shared_ptr<std::shared_timed_mutex> mtx = AcquireImageMutex(image_path);
-    if (!mtx->try_lock_for(kImageLockTimeout)) return;
+    if (!mtx->try_lock_for(kImageLockTimeout)) {
+        LOG_MSG("KIOSK: Could not lock %s to quarantine a stale FAT journal (busy)", image_path.c_str());
+        return;
+    }
     if (HasPendingJournal(image_path)) {
         QuarantineJournalFile(JournalPathFor(image_path), "image was recreated");
     }
@@ -842,7 +872,16 @@ bool KioskFileSectorDevice::CommitSectorsAtomically(const SectorMap& sectors) {
         return false;
     }
 
-    // 3. Commit point
+    // 3. Commit point: invalidate the journal header durably before unlinking it. If the
+    // unlink is lost (no directory fsync on Windows), recovery sees a torn journal and keeps
+    // the committed image instead of rolling it back.
+    if (std::FILE* inval = OpenHostFile(jpath, "rb+")) {
+        const uint8_t zeros[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        const bool ok_inval = SeekHostFile(inval, 0) && std::fwrite(zeros, 1, sizeof(zeros), inval) == sizeof(zeros) &&
+                              SyncHostFile(inval);
+        std::fclose(inval);
+        if (!ok_inval) LOG_MSG("KIOSK: Could not invalidate FAT journal %s before removal", jpath.c_str());
+    }
     RemoveHostFile(jpath);
     SyncParentDirectory(jpath);
     return true;

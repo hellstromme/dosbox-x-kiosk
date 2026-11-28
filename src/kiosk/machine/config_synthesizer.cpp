@@ -362,6 +362,9 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
                 ss << "ECHO Kiosk: launch command rejected (unsafe characters).\n"
                    << "EXIT\n";
             } else {
+                // All kiosk mounts are done: from here on the game (and any .BAT it ships) can
+                // no longer run host-reaching Z:\ programs such as MOUNT or CONFIG.
+                ss << "Z:\\KIOSKLCK.COM\n";
                 ss << drive_letter << ":\n";
                 if (!work_dir.empty()) {
                     ss << "CD \\" << work_dir << "\n";

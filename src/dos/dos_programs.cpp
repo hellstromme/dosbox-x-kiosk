@@ -10234,6 +10234,12 @@ void Add_VFiles(bool usecp) {
 	PROGRAMS_MakeFile("MOUNT.COM",MOUNT_ProgramStart,"/SYSTEM/");
 #endif
 	PROGRAMS_MakeFile("BOOT.COM",BOOT_ProgramStart,"/SYSTEM/");
+#if defined(C_KIOSK)
+	{
+		void Kiosk_RegisterDosPrograms(void);
+		Kiosk_RegisterDosPrograms(); /* Z:\KIOSKLCK.COM (kiosk mode only) */
+	}
+#endif
 #if !defined(OSFREE)
 	PROGRAMS_MakeFile("CONFIG.COM",CONFIG_ProgramStart,"/SYSTEM/");
 	PROGRAMS_MakeFile("COUNTRY.COM",COUNTRY_ProgramStart,"/SYSTEM/");

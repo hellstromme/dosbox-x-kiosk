@@ -6,6 +6,7 @@
 #include "kioskext_bin.h"
 #include "logging.h"
 #include "../fs/fat_volume.h"
+#include "config_synthesizer.h"
 
 #include <algorithm>
 #include <cctype>
@@ -296,6 +297,25 @@ std::string BootInjector::SynthesizeKioskGoBat(
 
     for (size_t i = 0; i < work_dir.size(); ++i) {
         if (work_dir[i] == '/') work_dir[i] = '\\';
+    }
+
+    // Fields may come from imported (untrusted) metadata: never let them inject batch lines,
+    // %expansion%, redirection or extra commands into the guest's B:\KIOSKGO.BAT.
+    const std::string exe_raw = TrimWhitespace(item.guest_executable);
+    std::string dir_check = work_dir;
+    if (dir_check.size() >= 2 && dir_check.front() == '"' && dir_check.back() == '"') {
+        dir_check = dir_check.substr(1, dir_check.size() - 2);
+    }
+    if (!std::isalpha(static_cast<unsigned char>(drive_letter)) ||
+        !ConfigSynthesizer::IsSafeGuestDosPath(dir_check) ||
+        !ConfigSynthesizer::IsSafeGuestExecutable(exe_raw) ||
+        !ConfigSynthesizer::IsSafeGuestArguments(item.guest_arguments)) {
+        LOG_MSG("KIOSK: Rejected unsafe launch command for item %s in KIOSKGO.BAT", item.id.c_str());
+        ss << "ECHO Kiosk: launch command rejected (unsafe characters).\r\n";
+        if (item.return_on_exit) {
+            ss << "B:\\KIOSKEXT.COM\r\n";
+        }
+        return ss.str();
     }
 
     ss << drive_letter << ":\r\n";

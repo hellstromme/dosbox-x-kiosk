@@ -287,8 +287,39 @@ inline void Kiosk_ClearPendingGuestShutdown() {
     Kiosk_PendingGuestShutdownSlot().store(static_cast<int>(KioskShutdownReason::NONE));
 }
 
+// Kiosk host-program lock (INTEGRATED_DOS catalog launches).
+// The generated [autoexec] performs its own MOUNT/IMGMOUNT lines, then runs Z:\KIOSKLCK.COM
+// right before the game. From then on, Z:\ programs that can reach host files, settings,
+// ports or the network refuse to run, so an imported game's own .BAT cannot run
+// "Z:\MOUNT.COM H C:\" and escape the container. One-way: nothing unlocks it in-session.
+inline std::atomic<bool>& Kiosk_HostProgramLockSlot() {
+    static std::atomic<bool> locked(false);
+    return locked;
+}
+
+inline void Kiosk_EngageHostProgramLock() { Kiosk_HostProgramLockSlot().store(true); }
+inline bool Kiosk_IsHostProgramLocked() { return Kiosk_HostProgramLockSlot().load(); }
+
+inline bool Kiosk_IsHostReachingProgram(const std::string& program_name) {
+    static const char* const kBlocked[] = {
+        "MOUNT.COM", "IMGMOUNT.COM", "IMGMAKE.COM", "VHDMAKE.COM", "BOOT.COM", "CONFIG.COM",
+        "CFGTOOL.COM", "START.COM", "SERIAL.COM", "PARALLEL.COM", "ETHNET.COM", "IPXNET.COM",
+        "LOADROM.COM"
+    };
+    std::string upper(program_name);
+    for (size_t i = 0; i < upper.size(); ++i) {
+        if (upper[i] >= 'a' && upper[i] <= 'z') upper[i] = static_cast<char>(upper[i] - 'a' + 'A');
+    }
+    for (size_t i = 0; i < sizeof(kBlocked) / sizeof(kBlocked[0]); ++i) {
+        if (upper == kBlocked[i]) return true;
+    }
+    return false;
+}
+
 // Throws (and clears) the pending request, if any. Call only from plain C++ frames
 // that are safe to unwind, i.e. normal_loop() outside the CPU decoder.
+// Note: in C_DEBUG builds a request posted while the debugger owns the loop (DEBUG_Loop
+// replaces normal_loop) is raised once the debugger returns control.
 inline void Kiosk_RaisePendingGuestShutdown() {
     std::atomic<int>& slot = Kiosk_PendingGuestShutdownSlot();
     if (slot.load(std::memory_order_relaxed) == static_cast<int>(KioskShutdownReason::NONE)) return;

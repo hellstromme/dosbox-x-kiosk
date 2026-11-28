@@ -18,6 +18,7 @@
 #include "control.h"
 #include "dosbox.h"
 #include "logging.h"
+#include "programs.h"
 #include "SDL.h"
 
 #include <cstdio>
@@ -36,6 +37,26 @@
 #endif
 
 extern void Kiosk_PumpPreBootFrame(void);
+
+// Z:\KIOSKLCK.COM: emitted by ConfigSynthesizer right before an INTEGRATED_DOS catalog launch.
+// Engages the one-way host-program lock (see Kiosk_IsHostReachingProgram in kiosk_types.h).
+class KIOSKLCK : public Program {
+public:
+    void Run(void) override {
+        if (KioskManager::GetInstance().IsKioskModeActive()) {
+            Kiosk_EngageHostProgramLock();
+            LOG_MSG("KIOSK: Host-reaching Z:\\ programs locked for this game session.");
+        }
+    }
+};
+
+static void KIOSKLCK_ProgramStart(Program** make) {
+    *make = new KIOSKLCK;
+}
+
+void Kiosk_RegisterDosPrograms(void) {
+    PROGRAMS_MakeFile("KIOSKLCK.COM", KIOSKLCK_ProgramStart, "/SYSTEM/");
+}
 
 KioskManager::KioskManager()
     : m_state(KioskState::DISABLED),
@@ -874,6 +895,9 @@ bool KioskManager::BuildInSessionRebootAutoexec(
     // - If Drive A: is ejected and OS is not yet marked installed but CD D: is present, boot D:.
     // - Otherwise (all installer media ejected), boot from primary HDD C:.
     const bool boot_installer = !live_drive_a.empty() || (!machine.os_installed && !live_drive_d.empty());
+
+    // No journal recovery needed here: the guest-session pin taken at launch has kept every
+    // kiosk FAT writer off this HDD since it was mounted, so no kiosk write can be pending.
 
     if (!boot_installer && !machine.os_installed && !machine.primary_hdd_path.empty()) {
         std::ifstream hdd(machine.primary_hdd_path.c_str(), std::ios::binary);

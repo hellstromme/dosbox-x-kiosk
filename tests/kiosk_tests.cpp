@@ -4755,7 +4755,7 @@ TEST(KioskFatVolumeTest, Fat12EntriesStraddlingSectorBoundaryRoundTrip) {
     ASSERT_TRUE(BootInjector::GetInstance().BuildFat12ImageInMemory({}, img));
     const std::vector<uint8_t> payload = TestPatternBytes(800U * 512U + 123U, 5);
     {
-        KioskMemorySectorDevice dev(img);
+        KioskMemorySectorDevice dev(img, KioskMemorySectorDevice::kWritable);
         KioskFatVolume vol;
         std::string err;
         ASSERT_TRUE(vol.Mount(&dev, &err)) << err;
@@ -4773,7 +4773,7 @@ TEST(KioskFatVolumeTest, Fat12EntriesStraddlingSectorBoundaryRoundTrip) {
 
     // Rewriting in place shrinks the chain and frees the tail
     {
-        KioskMemorySectorDevice dev(img);
+        KioskMemorySectorDevice dev(img, KioskMemorySectorDevice::kWritable);
         KioskFatVolume vol;
         std::string err;
         ASSERT_TRUE(vol.Mount(&dev, &err)) << err;
@@ -4815,7 +4815,7 @@ TEST(KioskFatVolumeTest, Fat32FsInfoFreeCountTracksAllocations) {
     TestWriteLe32(fat + 8, 0x0FFFFFFFU);
 
     {
-        KioskMemorySectorDevice dev(img);
+        KioskMemorySectorDevice dev(img, KioskMemorySectorDevice::kWritable);
         KioskFatVolume vol;
         std::string err;
         ASSERT_TRUE(vol.Mount(&dev, &err)) << err;
@@ -5018,7 +5018,7 @@ TEST(KioskFatVolumeTest, Fat32WithMirroringDisabledWritesOnlyTheActiveFat) {
     }
     const std::vector<uint8_t> fat0_before(fat0, fat0 + 8U * 512U);
     {
-        KioskMemorySectorDevice dev(img);
+        KioskMemorySectorDevice dev(img, KioskMemorySectorDevice::kWritable);
         KioskFatVolume vol;
         std::string err;
         ASSERT_TRUE(vol.Mount(&dev, &err)) << err;
@@ -5035,7 +5035,7 @@ TEST(KioskFatVolumeTest, TrimmedImageMountsWritableButNeverAllocatesPastEof) {
     std::vector<uint8_t> img;
     ASSERT_TRUE(BootInjector::GetInstance().BuildFat12ImageInMemory({}, img));
     img.resize(100U * 512U);
-    KioskMemorySectorDevice dev(img);
+    KioskMemorySectorDevice dev(img, KioskMemorySectorDevice::kWritable);
     KioskFatVolume vol;
     std::string err;
     ASSERT_TRUE(vol.Mount(&dev, &err)) << err;
@@ -5070,6 +5070,101 @@ TEST(KioskFatVolumeTest, OddSizedImageStillRollsBack) {
     ASSERT_EQ(original.size(), after.size());
     EXPECT_TRUE(std::equal(original.begin(), original.begin() + kSynthFat16RootOffset + kSynthFat16RootBytes,
                            after.begin()));
+    std::remove(hdd.c_str());
+}
+
+TEST(KioskSynthesizerTest, GameLaunchLocksHostReachingZDrivePrograms) {
+    // Blocklist covers every Z:\ program that reaches host files, settings, ports or network
+    const char* blocked[] = {"MOUNT.COM", "imgmount.com", "IMGMAKE.COM", "VHDMAKE.COM", "BOOT.COM",
+                             "CONFIG.COM", "CFGTOOL.COM", "START.COM", "SERIAL.COM", "PARALLEL.COM",
+                             "ETHNET.COM", "IPXNET.COM", "LOADROM.COM"};
+    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); ++i) {
+        EXPECT_TRUE(Kiosk_IsHostReachingProgram(blocked[i])) << blocked[i];
+    }
+    const char* allowed[] = {"MIXER.COM", "MOUSE.COM", "KEYB.COM", "LOADFIX.COM", "KIOSKLCK.COM", "IMGSWAP.COM"};
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); ++i) {
+        EXPECT_FALSE(Kiosk_IsHostReachingProgram(allowed[i])) << allowed[i];
+    }
+
+    // The lock is engaged after the kiosk's own mounts and immediately before the game
+    MachineRecord m;
+    m.id = "mach-lock";
+    m.archetype_id = KioskArchetypes::DX_386;
+    m.boot_mode = "INTEGRATED_DOS";
+    CatalogItemRecord item;
+    item.id = "game-lock";
+    item.host_container_dir = "C:\\games\\lock";
+    item.guest_working_dir = "C:\\GAME";
+    item.guest_executable = "GAME.BAT";
+    item.return_on_exit = true;
+    CaddyBindingRecord cd;
+    cd.target_drive = "D";
+    cd.slot_order = 1;
+    cd.resolved_file_path = "C:\\games\\lock\\cd.iso";
+    const std::string conf = ConfigSynthesizer::GetInstance().SynthesizeAutoexec(m, &item, {cd});
+    const size_t mount_pos = conf.find("MOUNT C");
+    const size_t cd_pos = conf.find("IMGMOUNT D");
+    const size_t lock_pos = conf.find("Z:\\KIOSKLCK.COM\n");
+    const size_t launch_pos = conf.find("C:\\GAME\\GAME.BAT");
+    ASSERT_NE(std::string::npos, lock_pos);
+    EXPECT_LT(mount_pos, lock_pos);
+    EXPECT_LT(cd_pos, lock_pos);
+    EXPECT_LT(lock_pos, launch_pos);
+
+    // A machine-only INTEGRATED_DOS boot (deliberate DOS prompt) is not locked
+    const std::string prompt_conf = ConfigSynthesizer::GetInstance().SynthesizeAutoexec(m, nullptr, {});
+    EXPECT_EQ(std::string::npos, prompt_conf.find("KIOSKLCK"));
+}
+
+TEST(KioskBootInjectorTest, KioskGoBatRejectsUnsafeImportedFields) {
+    MachineRecord m;
+    m.id = "mach-gobat";
+    m.os_id = "MSDOS622";
+    CatalogItemRecord base;
+    base.id = "item-gobat";
+    base.guest_working_dir = "C:\\GAMES\\DOOM2";
+    base.guest_executable = "DOOM2.EXE";
+    base.guest_arguments = "-skill 4";
+    base.return_on_exit = true;
+
+    const std::string ok_bat = BootInjector::GetInstance().SynthesizeKioskGoBat(m, base);
+    EXPECT_NE(std::string::npos, ok_bat.find("DOOM2.EXE -skill 4\r\n"));
+
+    CatalogItemRecord bad_args = base;
+    bad_args.guest_arguments = "-skill 4\r\nDELTREE /Y C:\\";
+    CatalogItemRecord bad_dir = base;
+    bad_dir.guest_working_dir = "C:\\GAMES\\%COMSPEC%";
+    CatalogItemRecord bad_exe = base;
+    bad_exe.guest_executable = "DOOM2.EXE > NUL";
+    const CatalogItemRecord* bad[] = {&bad_args, &bad_dir, &bad_exe};
+    for (size_t i = 0; i < 3; ++i) {
+        const std::string bat = BootInjector::GetInstance().SynthesizeKioskGoBat(m, *bad[i]);
+        EXPECT_NE(std::string::npos, bat.find("launch command rejected")) << i;
+        EXPECT_EQ(std::string::npos, bat.find("DELTREE")) << i;
+        EXPECT_EQ(std::string::npos, bat.find("%COMSPEC%")) << i;
+        EXPECT_EQ(std::string::npos, bat.find("> NUL")) << i;
+        EXPECT_NE(std::string::npos, bat.find("B:\\KIOSKEXT.COM\r\n")) << i; // Still returns to the kiosk
+    }
+}
+
+TEST(KioskFatVolumeTest, ImageLocksAreKeyedByCanonicalPath) {
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatcanon.img";
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    const size_t slash = hdd.find_last_of("\\/");
+    ASSERT_NE(std::string::npos, slash);
+    const std::string alias = hdd.substr(0, slash + 1) + "." + hdd.substr(slash, 1) + hdd.substr(slash + 1);
+    ASSERT_NE(hdd, alias);
+    {
+        KioskFatVolume writer;
+        std::string err;
+        ASSERT_TRUE(writer.OpenImageFile(hdd, true, &err)) << err;
+        bool busy_via_alias = false;
+        std::thread t([&]() {
+            busy_via_alias = !KioskFileSectorDevice::RecoverPendingJournal(alias, nullptr, /*wait_for_lock=*/false);
+        });
+        t.join();
+        EXPECT_TRUE(busy_via_alias); // "dir/./img" contends with "dir/img"
+    }
     std::remove(hdd.c_str());
 }
 

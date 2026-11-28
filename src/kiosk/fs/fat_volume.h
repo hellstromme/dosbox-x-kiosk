@@ -120,8 +120,10 @@ private:
 // Read-only (or writable) view over an in-memory raw image
 class KioskMemorySectorDevice : public KioskSectorDevice {
 public:
+    // Read-only unless writable access is requested explicitly (never inferred from constness)
     explicit KioskMemorySectorDevice(const std::vector<uint8_t>& image) : m_ro(&image) {}
-    explicit KioskMemorySectorDevice(std::vector<uint8_t>& image) : m_ro(&image), m_rw(&image) {}
+    enum WritableTag { kWritable };
+    KioskMemorySectorDevice(std::vector<uint8_t>& image, WritableTag) : m_ro(&image), m_rw(&image) {}
 
     uint64_t GetSectorCount() const override { return m_ro->size() / 512U; }
     bool IsWritable() const override { return m_rw != nullptr; }
