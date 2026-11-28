@@ -14,6 +14,7 @@ libkiosk_a_SOURCES = kiosk_main.cpp kiosk_main.h kiosk_types.h \
                      machine/archetypes.cpp machine/archetypes.h \
                      machine/config_synthesizer.cpp machine/config_synthesizer.h \
                      machine/boot_injector.cpp machine/boot_injector.h machine/kioskext_bin.h \
+                     fs/fat_volume.cpp fs/fat_volume.h \
                      ingest/signature_matcher.cpp ingest/signature_matcher.h \
                      ingest/image_crawler.cpp ingest/image_crawler.h \
                      ingest/conf_translator.cpp ingest/conf_translator.h \

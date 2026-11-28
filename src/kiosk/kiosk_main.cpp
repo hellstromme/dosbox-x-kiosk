@@ -9,6 +9,7 @@
 #include "machine/archetypes.h"
 #include "machine/config_synthesizer.h"
 #include "machine/boot_injector.h"
+#include "fs/fat_volume.h"
 #include "ui/kiosk_ui.h"
 #include "ui/view_carousel.h"
 #include "ui/input_router.h"
@@ -205,6 +206,7 @@ void KioskManager::RunMainLoop() {
 }
 
 void KioskManager::Shutdown() {
+    KioskFileSectorDevice::ReleaseGuestSessionPin(); // Guest no longer has the HDD mounted
     bool was_init = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -688,6 +690,19 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
             hdd_file_exists = hdd_probe.is_open();
         }
 
+        // Roll back any kiosk FAT write interrupted by a crash or power cut before DOSBox-X
+        // mounts the image (the installer path below never opens it through the FAT layer).
+        // Non-blocking: if an import is writing this image right now, refuse the launch.
+        KioskFileSectorDevice::ReleaseGuestSessionPin(); // A previous launch in this process
+        if (hdd_file_exists &&
+            !KioskFileSectorDevice::RecoverPendingJournal(machine.primary_hdd_path, nullptr, /*wait_for_lock=*/false)) {
+            LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: '%s' is busy or an interrupted write could not be rolled back.",
+                    machine.primary_hdd_path.c_str());
+            KioskUI::GetInstance().ShowToast("Disk image is busy (an import may be running). Try again shortly.", 4.0f);
+            m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+            return false;
+        }
+
         if (!machine.os_installed && item_ptr == nullptr && has_installer_media && hdd_file_exists) {
             boot_installer_media = true;
             LOG_MSG("KIOSK: Pending OS installation (!os_installed) with bound installer media; booting installer without AUTOEXEC hook.");
@@ -723,6 +738,19 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
                 }
                 active_dispatch_path = dispatch_path;
             }
+        }
+
+        // Keep kiosk writers (e.g. a background Mode B import) off this image while the guest
+        // has it mounted; the pin lasts until teardown / re-exec.
+        if (hdd_file_exists && !KioskFileSectorDevice::PinForGuestSession(machine.primary_hdd_path)) {
+            LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: '%s' is being written by another kiosk operation.",
+                    machine.primary_hdd_path.c_str());
+            KioskUI::GetInstance().ShowToast("Disk image is busy (an import may be running). Try again shortly.", 4.0f);
+            if (!active_dispatch_path.empty()) {
+                BootInjector::GetInstance().CleanupDispatchVolume(active_dispatch_path);
+            }
+            m_state.store(KioskState::STATE_SHELL_INTERACTIVE);
+            return false;
         }
     }
 

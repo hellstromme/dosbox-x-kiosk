@@ -28,8 +28,11 @@
 #include "ide.h"
 #include "pic.h"
 #include "timer.h"
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
+#include <thread>
 #include "dosbox.h"
 #include "SDL.h"
 #include "sqlite3.h"
@@ -4524,6 +4527,550 @@ TEST(KioskPhase8Test, UsbBridgeMountScanThreeLevelsAndRemovePurge) {
     std::remove(gog_d2.c_str());
     bridge.Shutdown();
     KioskDatabase::GetInstance().Close();
+}
+
+// ============================================================================
+// Phase 9: Shared journaled FAT layer (src/kiosk/fs/fat_volume.*)
+// ============================================================================
+
+namespace {
+
+std::vector<uint8_t> TestReadWholeFile(const std::string& path) {
+    std::ifstream in(path.c_str(), std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+bool TestFileExists(const std::string& path) {
+    std::ifstream in(path.c_str(), std::ios::binary);
+    return in.is_open();
+}
+
+std::vector<uint8_t> TestPatternBytes(size_t n, uint8_t seed) {
+    std::vector<uint8_t> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = static_cast<uint8_t>((i * 31U + seed) & 0xFFU);
+    return v;
+}
+
+// FAT16 region of WriteSyntheticFat16HddImage(): LBA 64 .. 64 + 2 * 36 sectors
+const size_t kSynthFat16FatOffset = 64U * 512U;
+const size_t kSynthFat16FatBytes = 72U * 512U;
+const size_t kSynthFat16RootOffset = (64U + 72U) * 512U;
+const size_t kSynthFat16RootBytes = 16U * 512U;
+
+// Disarms the commit fault hook even when an assertion aborts the test early
+struct FatFaultInjectionGuard {
+    ~FatFaultInjectionGuard() { KioskFileSectorDevice::SetCommitFaultInjection(-1); }
+};
+
+uint16_t TestReadFat12Raw(const std::vector<uint8_t>& img, uint32_t cluster) {
+    const size_t off = 512U + cluster + cluster / 2U; // FAT 1 starts at sector 1 on the 1.44MB floppy
+    const uint16_t raw = static_cast<uint16_t>(img[off] | (static_cast<uint16_t>(img[off + 1]) << 8));
+    return (cluster & 1U) ? static_cast<uint16_t>(raw >> 4) : static_cast<uint16_t>(raw & 0x0FFFU);
+}
+
+} // anonymous namespace
+
+TEST(KioskFatVolumeTest, InterruptedCommitRollsBackToExactOriginalImage) {
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatjournal.img";
+    const std::string journal = KioskFileSectorDevice::JournalPathFor(hdd);
+    std::remove(journal.c_str());
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    const std::vector<uint8_t> original = TestReadWholeFile(hdd);
+    FatFaultInjectionGuard guard;
+
+    // Power cut after the journal is durable and 2 metadata sectors were applied
+    KioskFileSectorDevice::SetCommitFaultInjection(2);
+    EXPECT_FALSE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(hdd));
+    EXPECT_TRUE(TestFileExists(journal));
+    EXPECT_NE(original, TestReadWholeFile(hdd)); // Torn state on disk
+
+    // Recovery restores every byte of metadata; only previously free clusters may differ
+    bool rolled_back = false;
+    ASSERT_TRUE(KioskFileSectorDevice::RecoverPendingJournal(hdd, &rolled_back));
+    EXPECT_TRUE(rolled_back);
+    EXPECT_FALSE(TestFileExists(journal));
+    const std::vector<uint8_t> recovered = TestReadWholeFile(hdd);
+    ASSERT_EQ(original.size(), recovered.size());
+    EXPECT_TRUE(std::equal(original.begin(), original.begin() + kSynthFat16RootOffset + kSynthFat16RootBytes,
+                           recovered.begin()));
+
+    FatReadOnlyVfs vfs;
+    ASSERT_TRUE(vfs.OpenImageFile(hdd));
+    FatDirEntry e;
+    EXPECT_FALSE(vfs.FindPath("C:\\AUTOEXEC.BAT", e));
+    vfs.Close();
+
+    // A clean retry succeeds and leaves no journal behind
+    EXPECT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(hdd));
+    EXPECT_FALSE(TestFileExists(journal));
+    ASSERT_TRUE(vfs.OpenImageFile(hdd));
+    ASSERT_TRUE(vfs.FindPath("C:\\AUTOEXEC.BAT", e));
+    std::vector<uint8_t> content;
+    ASSERT_TRUE(vfs.ReadFile(e, content));
+    EXPECT_EQ(BootInjector::GetAutoexecHookBlock(), std::string(content.begin(), content.end()));
+    vfs.Close();
+    std::remove(hdd.c_str());
+}
+
+TEST(KioskFatVolumeTest, ReadOnlyOpenRefusesPendingJournalAndTornJournalIsDiscarded) {
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatjournal2.img";
+    const std::string journal = KioskFileSectorDevice::JournalPathFor(hdd);
+    std::remove(journal.c_str());
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    const std::vector<uint8_t> original = TestReadWholeFile(hdd);
+
+    FatFaultInjectionGuard guard;
+    // Read-only opens never write: they refuse an image with a pending rollback
+    KioskFileSectorDevice::SetCommitFaultInjection(0);
+    EXPECT_FALSE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(hdd));
+    ASSERT_TRUE(TestFileExists(journal));
+    {
+        FatReadOnlyVfs vfs;
+        EXPECT_FALSE(vfs.OpenImageFile(hdd));
+    }
+    EXPECT_TRUE(TestFileExists(journal));
+    // A writable open (as the launch path and writers do) rolls back first
+    {
+        KioskFatVolume vol;
+        std::string err;
+        ASSERT_TRUE(vol.OpenImageFile(hdd, true, &err)) << err;
+        EXPECT_FALSE(vol.PathExists("C:\\AUTOEXEC.BAT"));
+    }
+    EXPECT_FALSE(TestFileExists(journal));
+
+    // A truncated journal (crash while writing it) never touches the image
+    const std::vector<uint8_t> before_torn = TestReadWholeFile(hdd);
+    {
+        std::ofstream torn(journal.c_str(), std::ios::binary | std::ios::trunc);
+        torn << "KSKJRNL1 truncated";
+    }
+    bool rolled_back = true;
+    ASSERT_TRUE(KioskFileSectorDevice::RecoverPendingJournal(hdd, &rolled_back));
+    EXPECT_FALSE(rolled_back);
+    EXPECT_FALSE(TestFileExists(journal));
+    EXPECT_EQ(before_torn, TestReadWholeFile(hdd));
+    EXPECT_TRUE(std::equal(original.begin(), original.begin() + kSynthFat16RootOffset + kSynthFat16RootBytes,
+                           before_torn.begin()));
+    std::remove(hdd.c_str());
+}
+
+TEST(KioskFatVolumeTest, DiscardedTransactionLeavesMetadataUntouched) {
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatdiscard.img";
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    const std::vector<uint8_t> original = TestReadWholeFile(hdd);
+    {
+        KioskFatVolume vol;
+        std::string err;
+        ASSERT_TRUE(vol.OpenImageFile(hdd, /*writable=*/true, &err)) << err;
+        uint32_t dir = 0;
+        ASSERT_TRUE(vol.EnsureDirectoryPath("C:\\GAMES\\Long Named Game", true, dir, err)) << err;
+        ASSERT_TRUE(vol.AddFile(dir, "PLAY.EXE", TestPatternBytes(5000, 7), true, err)) << err;
+        EXPECT_TRUE(vol.HasPendingChanges());
+        // Staged changes are visible through the same volume before commit
+        EXPECT_TRUE(vol.PathExists("C:\\GAMES\\Long Named Game\\PLAY.EXE"));
+        // Destroyed without Commit()
+    }
+    const std::vector<uint8_t> after = TestReadWholeFile(hdd);
+    EXPECT_TRUE(std::equal(original.begin() + kSynthFat16FatOffset,
+                           original.begin() + kSynthFat16RootOffset + kSynthFat16RootBytes,
+                           after.begin() + kSynthFat16FatOffset));
+    FatReadOnlyVfs vfs;
+    ASSERT_TRUE(vfs.OpenImageFile(hdd));
+    FatDirEntry e;
+    EXPECT_FALSE(vfs.FindPath("C:\\GAMES", e));
+    vfs.Close();
+    std::remove(hdd.c_str());
+}
+
+TEST(KioskFatVolumeTest, Fat16WriterRoundTripsLfnDirectoryGrowthAndMirroredFats) {
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatwrite.img";
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    std::string err;
+    {
+        KioskFatVolume vol;
+        ASSERT_TRUE(vol.OpenImageFile(hdd, true, &err)) << err;
+        EXPECT_EQ(FilesystemType::FAT16, vol.GetFilesystemType());
+        const uint64_t free_before = vol.ComputeFreeBytes();
+        uint32_t dir = 0;
+        ASSERT_TRUE(vol.EnsureDirectoryPath("\\GAMES\\Ultima Underworld", true, dir, err)) << err;
+        // 40 files with long names force the 1-sector-per-cluster directory to grow
+        for (int i = 0; i < 40; ++i) {
+            const std::string name = "Level Data File " + std::to_string(i) + ".dat";
+            ASSERT_TRUE(vol.AddFile(dir, name, TestPatternBytes(700 + i, static_cast<uint8_t>(i)), true, err)) << err;
+        }
+        ASSERT_TRUE(vol.AddFile(dir, "UW.EXE", TestPatternBytes(3000, 99), true, err)) << err;
+        EXPECT_FALSE(vol.AddFile(dir, "uw.exe", TestPatternBytes(10, 1), true, err)); // Duplicate
+        EXPECT_LT(vol.ComputeFreeBytes(), free_before);
+        ASSERT_TRUE(vol.Commit(&err)) << err;
+        EXPECT_FALSE(vol.HasPendingChanges());
+    }
+    EXPECT_FALSE(TestFileExists(KioskFileSectorDevice::JournalPathFor(hdd)));
+
+    const std::vector<uint8_t> img = TestReadWholeFile(hdd);
+    // Both FAT copies were written identically (mirroring enabled)
+    const size_t half = kSynthFat16FatBytes / 2U;
+    const std::vector<uint8_t> fat0(img.begin() + kSynthFat16FatOffset, img.begin() + kSynthFat16FatOffset + half);
+    const std::vector<uint8_t> fat1(img.begin() + kSynthFat16FatOffset + half,
+                                    img.begin() + kSynthFat16FatOffset + 2U * half);
+    // FAT 1 of the synthetic image started blank, so compare only the entries written now
+    // Every entry written now must appear in both copies; require that plenty were checked.
+    size_t mirrored = 0;
+    for (size_t off = 2U * 2U; off < half; off += 2U) {
+        if (fat1[off] != 0 || fat1[off + 1] != 0) {
+            ASSERT_EQ(fat0[off], fat1[off]) << off;
+            ASSERT_EQ(fat0[off + 1], fat1[off + 1]) << off;
+            ++mirrored;
+        }
+    }
+    EXPECT_GE(mirrored, 50U);
+
+    FatReadOnlyVfs vfs;
+    ASSERT_TRUE(vfs.OpenImageFile(hdd));
+    FatDirEntry d;
+    ASSERT_TRUE(vfs.FindPath("C:\\GAMES\\Ultima Underworld", d));
+    EXPECT_TRUE(d.is_directory);
+    EXPECT_EQ("Ultima Underworld", d.name);
+    std::vector<FatDirEntry> listing;
+    ASSERT_TRUE(vfs.ListDirectory(&d, listing));
+    EXPECT_EQ(41U, listing.size());
+    for (int i = 0; i < 40; i += 13) {
+        FatDirEntry f;
+        ASSERT_TRUE(vfs.FindPath("C:\\GAMES\\Ultima Underworld\\Level Data File " + std::to_string(i) + ".dat", f));
+        std::vector<uint8_t> bytes;
+        ASSERT_TRUE(vfs.ReadFile(f, bytes));
+        EXPECT_EQ(TestPatternBytes(700 + i, static_cast<uint8_t>(i)), bytes);
+    }
+    FatDirEntry exe;
+    ASSERT_TRUE(vfs.FindPath("\\GAMES\\ULTIMAUN\\UW.EXE", exe));
+    std::vector<uint8_t> exe_bytes;
+    ASSERT_TRUE(vfs.ReadFile(exe, exe_bytes));
+    EXPECT_EQ(TestPatternBytes(3000, 99), exe_bytes);
+    vfs.Close();
+    std::remove(hdd.c_str());
+}
+
+TEST(KioskFatVolumeTest, Fat12EntriesStraddlingSectorBoundaryRoundTrip) {
+    // Cluster 341 is the first FAT12 entry whose 12 bits straddle FAT sectors 0 and 1
+    std::vector<uint8_t> img;
+    ASSERT_TRUE(BootInjector::GetInstance().BuildFat12ImageInMemory({}, img));
+    const std::vector<uint8_t> payload = TestPatternBytes(800U * 512U + 123U, 5);
+    {
+        KioskMemorySectorDevice dev(img);
+        KioskFatVolume vol;
+        std::string err;
+        ASSERT_TRUE(vol.Mount(&dev, &err)) << err;
+        ASSERT_EQ(FilesystemType::FAT12, vol.GetFilesystemType());
+        ASSERT_TRUE(vol.AddFile(KioskFatVolume::kRootDir, "BIG.DAT", payload, false, err)) << err;
+        ASSERT_TRUE(vol.Commit(&err)) << err;
+    }
+    std::vector<uint8_t> back;
+    ASSERT_TRUE(BootInjector::GetInstance().ReadFileFromFat12Image(img, "BIG.DAT", back));
+    EXPECT_EQ(payload, back);
+    // Independent raw decode of the straddling entries (odd 341 at byte 511, even 682 at byte 1023)
+    EXPECT_EQ(342U, TestReadFat12Raw(img, 341));
+    EXPECT_EQ(683U, TestReadFat12Raw(img, 682));
+    EXPECT_EQ(0x0FFFU, TestReadFat12Raw(img, 802)); // Last of 801 clusters (2..802)
+
+    // Rewriting in place shrinks the chain and frees the tail
+    {
+        KioskMemorySectorDevice dev(img);
+        KioskFatVolume vol;
+        std::string err;
+        ASSERT_TRUE(vol.Mount(&dev, &err)) << err;
+        const uint64_t free_before = vol.ComputeFreeBytes();
+        ASSERT_TRUE(vol.WriteFileReplacing(KioskFatVolume::kRootDir, "BIG.DAT", TestPatternBytes(600, 9), err)) << err;
+        ASSERT_TRUE(vol.Commit(&err)) << err;
+        KioskFatVolume reread;
+        ASSERT_TRUE(reread.Mount(&dev, &err));
+        EXPECT_EQ(free_before + 799U * 512U, reread.ComputeFreeBytes());
+    }
+    ASSERT_TRUE(BootInjector::GetInstance().ReadFileFromFat12Image(img, "BIG.DAT", back));
+    EXPECT_EQ(TestPatternBytes(600, 9), back);
+}
+
+TEST(KioskFatVolumeTest, Fat32FsInfoFreeCountTracksAllocations) {
+    // Minimal FAT32 superfloppy: 32 reserved sectors (FSInfo at 1), 1 FAT of 8 sectors, root cluster 2
+    const uint32_t total = 32U + 8U + 600U;
+    std::vector<uint8_t> img(static_cast<size_t>(total) * 512U, 0);
+    uint8_t* vbr = img.data();
+    vbr[0] = 0xEB; vbr[1] = 0x58; vbr[2] = 0x90;
+    TestWriteLe16(vbr + 11, 512);
+    vbr[13] = 1;
+    TestWriteLe16(vbr + 14, 32);
+    vbr[16] = 1;
+    TestWriteLe32(vbr + 32, total);
+    TestWriteLe32(vbr + 36, 8);
+    TestWriteLe32(vbr + 44, 2);
+    TestWriteLe16(vbr + 48, 1);
+    vbr[510] = 0x55; vbr[511] = 0xAA;
+    uint8_t* fsi = img.data() + 512U;
+    TestWriteLe32(fsi, 0x41615252U);
+    TestWriteLe32(fsi + 484, 0x61417272U);
+    TestWriteLe32(fsi + 488, 599U); // 600 clusters, root uses 1
+    TestWriteLe32(fsi + 492, 3U);
+    fsi[510] = 0x55; fsi[511] = 0xAA;
+    uint8_t* fat = img.data() + 32U * 512U;
+    TestWriteLe32(fat + 0, 0x0FFFFFF8U);
+    TestWriteLe32(fat + 4, 0x0FFFFFFFU);
+    TestWriteLe32(fat + 8, 0x0FFFFFFFU);
+
+    {
+        KioskMemorySectorDevice dev(img);
+        KioskFatVolume vol;
+        std::string err;
+        ASSERT_TRUE(vol.Mount(&dev, &err)) << err;
+        ASSERT_EQ(FilesystemType::FAT32, vol.GetFilesystemType());
+        ASSERT_TRUE(vol.AddFile(KioskFatVolume::kRootDir, "FIVE.BIN", TestPatternBytes(5U * 512U, 1), false, err)) << err;
+        ASSERT_TRUE(vol.Commit(&err)) << err;
+    }
+    uint32_t free_count = static_cast<uint32_t>(fsi[488]) | (static_cast<uint32_t>(fsi[489]) << 8) |
+                          (static_cast<uint32_t>(fsi[490]) << 16) | (static_cast<uint32_t>(fsi[491]) << 24);
+    EXPECT_EQ(594U, free_count);
+}
+
+TEST(KioskFatVolumeTest, PartitionSelectionPrefersActiveFatEntry) {
+    // Two FAT16 partitions: entry 0 inactive, entry 1 active -> the active one wins
+    const uint32_t part_secs = 9000;
+    std::vector<uint8_t> single;
+    const std::string tmp = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatsel.img";
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(tmp));
+    single = TestReadWholeFile(tmp);
+    std::remove(tmp.c_str());
+
+    const uint32_t second_lba = 63U + part_secs;
+    std::vector<uint8_t> img(static_cast<size_t>(second_lba + part_secs) * 512U, 0);
+    std::copy(single.begin(), single.end(), img.begin());
+    std::copy(single.begin() + 63U * 512U, single.end(), img.begin() + static_cast<size_t>(second_lba) * 512U);
+    uint8_t* p0 = img.data() + 0x1BE;
+    p0[0] = 0x00; // first entry no longer active
+    uint8_t* p1 = img.data() + 0x1BE + 16;
+    p1[0] = 0x80;
+    p1[4] = 0x06;
+    TestWriteLe32(p1 + 8, second_lba);
+    TestWriteLe32(p1 + 12, part_secs);
+
+    KioskMemorySectorDevice dev(img);
+    uint32_t lba = 0;
+    uint32_t count = 0;
+    ASSERT_TRUE(KioskFatVolume::SelectPartition(dev, true, lba, count));
+    EXPECT_EQ(second_lba, lba);
+
+    // A FAT-typed partition whose boot sector is inconsistent rejects the disk
+    TestWriteLe16(img.data() + static_cast<size_t>(second_lba) * 512U + 19, 0);
+    TestWriteLe32(img.data() + static_cast<size_t>(second_lba) * 512U + 32, part_secs + 50U);
+    EXPECT_FALSE(KioskFatVolume::SelectPartition(dev, true, lba, count));
+}
+
+TEST(KioskFatVolumeTest, HostAutoexecRewriteReplacesViaTempFile) {
+    const std::string path = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".host_autoexec.bat";
+    {
+        std::ofstream out(path.c_str(), std::ios::binary | std::ios::trunc);
+        out << "@ECHO OFF\r\nPATH C:\\DOS\r\n";
+    }
+    ASSERT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(path));
+    EXPECT_FALSE(TestFileExists(path + ".kiosk-tmp"));
+    const std::vector<uint8_t> bytes = TestReadWholeFile(path);
+    const std::string text(bytes.begin(), bytes.end());
+    EXPECT_EQ(0U, text.find("@ECHO OFF\r\nPATH C:\\DOS\r\n"));
+    EXPECT_NE(std::string::npos, text.find("IF EXIST B:\\KIOSKGO.BAT CALL B:\\KIOSKGO.BAT"));
+    std::remove(path.c_str());
+}
+
+TEST(KioskFatVolumeTest, StaleJournalForReplacedImageIsQuarantinedNotApplied) {
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatstale.img";
+    const std::string journal = KioskFileSectorDevice::JournalPathFor(hdd);
+    std::remove(journal.c_str());
+    std::remove((journal + ".bad").c_str());
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    FatFaultInjectionGuard guard;
+    KioskFileSectorDevice::SetCommitFaultInjection(1);
+    EXPECT_FALSE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(hdd));
+    ASSERT_TRUE(TestFileExists(journal));
+
+    // The machine is deleted and a new image created at the same path (same size, new contents)
+    std::vector<uint8_t> replacement = TestReadWholeFile(hdd);
+    std::fill(replacement.begin(), replacement.end(), static_cast<uint8_t>(0x5A));
+    {
+        std::ofstream out(hdd.c_str(), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(replacement.data()), static_cast<std::streamsize>(replacement.size()));
+    }
+    bool rolled_back = true;
+    ASSERT_TRUE(KioskFileSectorDevice::RecoverPendingJournal(hdd, &rolled_back));
+    EXPECT_FALSE(rolled_back);
+    EXPECT_FALSE(TestFileExists(journal));
+    EXPECT_TRUE(TestFileExists(journal + ".bad"));
+    EXPECT_EQ(replacement, TestReadWholeFile(hdd)); // Not a single sector overwritten
+
+    // A size change is rejected the same way
+    std::remove((journal + ".bad").c_str());
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    KioskFileSectorDevice::SetCommitFaultInjection(1);
+    EXPECT_FALSE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(hdd));
+    ASSERT_TRUE(TestFileExists(journal));
+    {
+        std::ofstream grow(hdd.c_str(), std::ios::binary | std::ios::app);
+        const std::vector<uint8_t> pad(4096, 0);
+        grow.write(reinterpret_cast<const char*>(pad.data()), static_cast<std::streamsize>(pad.size()));
+    }
+    ASSERT_TRUE(KioskFileSectorDevice::RecoverPendingJournal(hdd, &rolled_back));
+    EXPECT_FALSE(rolled_back);
+    EXPECT_TRUE(TestFileExists(journal + ".bad"));
+
+    // Creating a fresh image quarantines any leftover journal up front
+    std::remove((journal + ".bad").c_str());
+    {
+        std::ofstream j(journal.c_str(), std::ios::binary | std::ios::trunc);
+        j << "leftover";
+    }
+    KioskFileSectorDevice::QuarantinePendingJournal(hdd);
+    EXPECT_FALSE(TestFileExists(journal));
+    std::remove((journal + ".bad").c_str());
+    std::remove(hdd.c_str());
+}
+
+TEST(KioskFatVolumeTest, FailedCommitRollsBackImmediatelyAndRefusesRetry) {
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatretry.img";
+    const std::string journal = KioskFileSectorDevice::JournalPathFor(hdd);
+    std::remove(journal.c_str());
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    const std::vector<uint8_t> original = TestReadWholeFile(hdd);
+    FatFaultInjectionGuard guard;
+    {
+        KioskFatVolume vol;
+        std::string err;
+        ASSERT_TRUE(vol.OpenImageFile(hdd, true, &err)) << err;
+        ASSERT_TRUE(vol.AddFile(KioskFatVolume::kRootDir, "RETRY.BIN", TestPatternBytes(2000, 3), false, err)) << err;
+        KioskFileSectorDevice::SetCommitFaultInjection(1, /*simulate_power_cut=*/false); // I/O error mid-apply
+        EXPECT_FALSE(vol.Commit(&err));
+        EXPECT_FALSE(vol.IsMounted());
+        EXPECT_FALSE(vol.HasPendingChanges());
+        EXPECT_FALSE(vol.Commit(&err)); // No second attempt against a half-written image
+    }
+    EXPECT_FALSE(TestFileExists(journal));
+    const std::vector<uint8_t> after = TestReadWholeFile(hdd);
+    EXPECT_TRUE(std::equal(original.begin(), original.begin() + kSynthFat16RootOffset + kSynthFat16RootBytes,
+                           after.begin()));
+    std::remove(hdd.c_str());
+}
+
+TEST(KioskFatVolumeTest, WritersHoldAnExclusivePerImageLock) {
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatlock.img";
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    // Contention is always probed from a second thread (re-locking on the owner is undefined)
+    auto probe_from_other_thread = [&hdd](bool writable) -> bool {
+        bool opened = false;
+        std::thread t([&]() {
+            if (writable) {
+                opened = KioskFileSectorDevice::RecoverPendingJournal(hdd, nullptr, /*wait_for_lock=*/false);
+            } else {
+                FatReadOnlyVfs vfs;
+                opened = vfs.OpenImageFile(hdd);
+            }
+        });
+        t.join();
+        return opened;
+    };
+    {
+        KioskFatVolume writer;
+        std::string err;
+        ASSERT_TRUE(writer.OpenImageFile(hdd, true, &err)) << err;
+        EXPECT_FALSE(probe_from_other_thread(true));  // Launch-path probe reports busy
+        EXPECT_FALSE(probe_from_other_thread(false)); // Readers fail fast instead of stalling the UI
+    }
+    EXPECT_TRUE(probe_from_other_thread(true));
+    {
+        FatReadOnlyVfs reader;
+        ASSERT_TRUE(reader.OpenImageFile(hdd));
+        EXPECT_TRUE(probe_from_other_thread(false));  // Readers share the lock
+        EXPECT_FALSE(probe_from_other_thread(true));  // Writers/recovery are excluded
+    }
+    // A guest-session pin keeps writers out until released
+    ASSERT_TRUE(KioskFileSectorDevice::PinForGuestSession(hdd));
+    EXPECT_FALSE(probe_from_other_thread(true));
+    EXPECT_TRUE(probe_from_other_thread(false));
+    KioskFileSectorDevice::ReleaseGuestSessionPin();
+    EXPECT_TRUE(probe_from_other_thread(true));
+    std::remove(hdd.c_str());
+}
+
+TEST(KioskFatVolumeTest, Fat32WithMirroringDisabledWritesOnlyTheActiveFat) {
+    // FAT32 superfloppy with 2 FATs, BPB_ExtFlags = 0x0081 (mirroring off, FAT #1 active)
+    const uint32_t total = 32U + 2U * 8U + 600U;
+    std::vector<uint8_t> img(static_cast<size_t>(total) * 512U, 0);
+    uint8_t* vbr = img.data();
+    vbr[0] = 0xEB; vbr[1] = 0x58; vbr[2] = 0x90;
+    TestWriteLe16(vbr + 11, 512);
+    vbr[13] = 1;
+    TestWriteLe16(vbr + 14, 32);
+    vbr[16] = 2;
+    TestWriteLe32(vbr + 32, total);
+    TestWriteLe32(vbr + 36, 8);
+    TestWriteLe16(vbr + 40, 0x0081);
+    TestWriteLe32(vbr + 44, 2);
+    vbr[510] = 0x55; vbr[511] = 0xAA;
+    uint8_t* fat0 = img.data() + 32U * 512U;
+    uint8_t* fat1 = img.data() + 40U * 512U;
+    uint8_t* fats[2] = {fat0, fat1};
+    for (int i = 0; i < 2; ++i) {
+        TestWriteLe32(fats[i] + 0, 0x0FFFFFF8U);
+        TestWriteLe32(fats[i] + 4, 0x0FFFFFFFU);
+        TestWriteLe32(fats[i] + 8, 0x0FFFFFFFU);
+    }
+    const std::vector<uint8_t> fat0_before(fat0, fat0 + 8U * 512U);
+    {
+        KioskMemorySectorDevice dev(img);
+        KioskFatVolume vol;
+        std::string err;
+        ASSERT_TRUE(vol.Mount(&dev, &err)) << err;
+        ASSERT_TRUE(vol.AddFile(KioskFatVolume::kRootDir, "ACTIVE.BIN", TestPatternBytes(3U * 512U, 2), false, err)) << err;
+        ASSERT_TRUE(vol.Commit(&err)) << err;
+    }
+    EXPECT_EQ(fat0_before, std::vector<uint8_t>(fat0, fat0 + 8U * 512U)); // Inactive FAT untouched
+    const uint32_t c3 = static_cast<uint32_t>(fat1[12]) | (static_cast<uint32_t>(fat1[13]) << 8);
+    EXPECT_EQ(4U, c3); // Active FAT carries the new chain 3 -> 4 -> 5
+}
+
+TEST(KioskFatVolumeTest, TrimmedImageMountsWritableButNeverAllocatesPastEof) {
+    // The BPB describes a 1.44MB floppy, but the file holds only 100 sectors (data starts at 33)
+    std::vector<uint8_t> img;
+    ASSERT_TRUE(BootInjector::GetInstance().BuildFat12ImageInMemory({}, img));
+    img.resize(100U * 512U);
+    KioskMemorySectorDevice dev(img);
+    KioskFatVolume vol;
+    std::string err;
+    ASSERT_TRUE(vol.Mount(&dev, &err)) << err;
+    EXPECT_EQ((100U - 33U) * 512U, vol.ComputeFreeBytes());
+    EXPECT_FALSE(vol.AddFile(KioskFatVolume::kRootDir, "TOOBIG.BIN", TestPatternBytes(80U * 512U, 1), false, err));
+    vol.DiscardChanges();
+    EXPECT_TRUE(vol.AddFile(KioskFatVolume::kRootDir, "FITS.BIN", TestPatternBytes(60U * 512U, 1), false, err)) << err;
+    EXPECT_TRUE(vol.Commit(&err)) << err;
+}
+
+TEST(KioskFatVolumeTest, OddSizedImageStillRollsBack) {
+    // Image size not a multiple of 512 (trailing partial sector) must not defeat recovery
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatodd.img";
+    const std::string journal = KioskFileSectorDevice::JournalPathFor(hdd);
+    std::remove(journal.c_str());
+    std::remove((journal + ".bad").c_str());
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    {
+        std::ofstream tail(hdd.c_str(), std::ios::binary | std::ios::app);
+        tail << "odd-tail";
+    }
+    const std::vector<uint8_t> original = TestReadWholeFile(hdd);
+    FatFaultInjectionGuard guard;
+    KioskFileSectorDevice::SetCommitFaultInjection(1);
+    EXPECT_FALSE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(hdd));
+    ASSERT_TRUE(TestFileExists(journal));
+    bool rolled_back = false;
+    ASSERT_TRUE(KioskFileSectorDevice::RecoverPendingJournal(hdd, &rolled_back));
+    EXPECT_TRUE(rolled_back);
+    EXPECT_FALSE(TestFileExists(journal + ".bad"));
+    const std::vector<uint8_t> after = TestReadWholeFile(hdd);
+    ASSERT_EQ(original.size(), after.size());
+    EXPECT_TRUE(std::equal(original.begin(), original.begin() + kSynthFat16RootOffset + kSynthFat16RootBytes,
+                           after.begin()));
+    std::remove(hdd.c_str());
 }
 
 #endif // defined(C_DEBUG) && defined(C_KIOSK)
