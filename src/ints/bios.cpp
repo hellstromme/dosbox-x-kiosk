@@ -1615,9 +1615,15 @@ void bochs_port_8900_write(Bitu /*port*/, Bitu val, Bitu /*iolen*/) {
             bochs_port_8900_idx = 0;
             LOG_MSG("KIOSK: Caught Port 0x8900 ('Shutdown') hardware power-off signal.");
             if (KioskManager::GetInstance().IsKioskModeActive()) {
-                throw KioskGuestShutdownException(KioskShutdownReason::PORT_8900_SHUTDOWN);
+                /* This handler can be called directly from dynamic-core generated code,
+                 * which cannot be unwound by a C++ exception. Post the request and end
+                 * the current CPU slice; normal_loop() raises it safely. The dynamic cores
+                 * only notice the zeroed cycle count at the next block boundary, so the
+                 * rest of the current translated block still runs. */
+                Kiosk_PostGuestShutdown(KioskShutdownReason::PORT_8900_SHUTDOWN);
+                CPU_CycleLeft += CPU_Cycles;
+                CPU_Cycles = 0;
             }
-            throw int(0);
         }
     } else if (c == bochs_port_8900_seq[0]) {
         bochs_port_8900_idx = 1;

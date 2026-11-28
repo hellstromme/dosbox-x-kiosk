@@ -37,6 +37,18 @@ public:
     // Validates that a host path can be safely emitted as a single quoted [autoexec] MOUNT argument
     static bool IsSafeAutoexecMountPath(const std::string& path);
 
+    // Validates a guest DOS directory (drive prefix already stripped) for an unquoted CD line
+    static bool IsSafeGuestDosPath(const std::string& path);
+
+    // Validates a guest executable: relative DOS path, bare name or .EXE/.COM/.BAT file
+    static bool IsSafeGuestExecutable(const std::string& exe);
+
+    // True for drive letters a kiosk launch may target (A-E; never Z:)
+    static bool IsLaunchableGuestDrive(char drive_letter);
+
+    // Validates guest arguments: no batch expansion, redirection, piping or control chars
+    static bool IsSafeGuestArguments(const std::string& args);
+
 private:
     ConfigSynthesizer() = default;
 };

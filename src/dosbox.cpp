@@ -82,6 +82,9 @@
 #include "parport.h"
 #include "keyboard.h"
 #include "clockdomain.h"
+#if defined(C_KIOSK)
+#include "kiosk/kiosk_types.h"
+#endif
 
 #if __APPLE__ && __MAC_OS_X_VERSION_MIN_REQUIRED < 101200
 /* FIX_ME: A workaround to avoid build error. Change version to 101300 if error occurs for Sierra (10.12) */
@@ -471,6 +474,11 @@ static Bitu Normal_Loop(void) {
         while (1) {
 #if defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
             dosbox_agent::AGENT_BridgePump();
+#endif
+#if defined(C_KIOSK)
+            /* Raise guest shutdown requests posted from JIT-reachable I/O handlers
+             * or nested UI loops here, where the stack is safe to unwind. */
+            Kiosk_RaisePendingGuestShutdown();
 #endif
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */

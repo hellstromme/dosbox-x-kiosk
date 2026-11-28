@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <atomic>
 
 // Archetype identifier constants
 namespace KioskArchetypes {
@@ -263,6 +264,39 @@ struct KioskGuestShutdownException {
     explicit KioskGuestShutdownException(KioskShutdownReason r = KioskShutdownReason::APM_POWER_OFF)
         : reason(r) {}
 };
+
+// Deferred guest-shutdown request.
+// Sites that may run inside JIT-generated code (I/O port handlers called from the
+// dynamic cores) or inside nested UI/debugger loops must never throw
+// KioskGuestShutdownException directly: generated code has no unwind info.
+// They post a request here instead, and normal_loop() raises it between CPU slices.
+inline std::atomic<int>& Kiosk_PendingGuestShutdownSlot() {
+    static std::atomic<int> pending(static_cast<int>(KioskShutdownReason::NONE));
+    return pending;
+}
+
+inline void Kiosk_PostGuestShutdown(KioskShutdownReason reason) {
+    Kiosk_PendingGuestShutdownSlot().store(static_cast<int>(reason));
+}
+
+inline KioskShutdownReason Kiosk_GetPendingGuestShutdown() {
+    return static_cast<KioskShutdownReason>(Kiosk_PendingGuestShutdownSlot().load(std::memory_order_relaxed));
+}
+
+inline void Kiosk_ClearPendingGuestShutdown() {
+    Kiosk_PendingGuestShutdownSlot().store(static_cast<int>(KioskShutdownReason::NONE));
+}
+
+// Throws (and clears) the pending request, if any. Call only from plain C++ frames
+// that are safe to unwind, i.e. normal_loop() outside the CPU decoder.
+inline void Kiosk_RaisePendingGuestShutdown() {
+    std::atomic<int>& slot = Kiosk_PendingGuestShutdownSlot();
+    if (slot.load(std::memory_order_relaxed) == static_cast<int>(KioskShutdownReason::NONE)) return;
+    const int pending = slot.exchange(static_cast<int>(KioskShutdownReason::NONE));
+    if (pending != static_cast<int>(KioskShutdownReason::NONE)) {
+        throw KioskGuestShutdownException(static_cast<KioskShutdownReason>(pending));
+    }
+}
 
 inline const char* KioskShutdownReasonToString(KioskShutdownReason reason) {
     switch (reason) {

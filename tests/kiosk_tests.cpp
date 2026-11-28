@@ -426,8 +426,122 @@ TEST(KioskSynthesizerTest, SynthesizeIntegratedDosWithCaddyAndSpacedExe) {
 
     EXPECT_NE(std::string::npos, conf.find("IMGMOUNT A \"C:\\games\\disk1.img\" -t floppy"));
     EXPECT_NE(std::string::npos, conf.find("IMGMOUNT D \"C:\\games\\music.iso\" -t iso"));
-    EXPECT_NE(std::string::npos, conf.find("\"MY GAME.EXE\" -v"));
+    EXPECT_NE(std::string::npos, conf.find("\"C:\\CUSTOM\\MY GAME.EXE\" -v"));
     EXPECT_NE(std::string::npos, conf.find("EXIT"));
+}
+
+TEST(KioskSynthesizerTest, LaunchUsesAbsoluteExecutablePath) {
+    MachineRecord m;
+    m.id = "mach-dos-abs";
+    m.archetype_id = KioskArchetypes::DX_386;
+    m.boot_mode = "INTEGRATED_DOS";
+
+    CatalogItemRecord item;
+    item.id = "game-abs";
+    item.host_container_dir = "C:\\games\\abs";
+    item.guest_working_dir = "D:\\";
+    item.guest_executable = "SETUP.EXE";
+
+    const std::string conf = ConfigSynthesizer::GetInstance().SynthesizeAutoexec(m, &item, {});
+    EXPECT_NE(std::string::npos, conf.find("D:\nD:\\SETUP.EXE\n"));
+    EXPECT_EQ(std::string::npos, conf.find("CD "));
+
+    // Bare names from imported confs ("tie") stay launchable, pinned to their directory,
+    // and legitimate switches and quoted arguments are emitted verbatim.
+    CatalogItemRecord bare = item;
+    bare.guest_working_dir = "C:\\TIE\\";
+    bare.guest_executable = "TIE";
+    bare.guest_arguments = "/S:5 -skill 4 \"a b\"";
+    bare.return_on_exit = true;
+    const std::string bare_conf = ConfigSynthesizer::GetInstance().SynthesizeAutoexec(m, &bare, {});
+    EXPECT_NE(std::string::npos, bare_conf.find("C:\nCD \\TIE\nC:\\TIE\\TIE /S:5 -skill 4 \"a b\"\nEXIT\n"));
+    EXPECT_EQ(std::string::npos, bare_conf.find("rejected"));
+}
+
+TEST(KioskGuestShutdownTest, PendingRequestIsRaisedOnceAndClearable) {
+    Kiosk_ClearPendingGuestShutdown();
+    EXPECT_NO_THROW(Kiosk_RaisePendingGuestShutdown());
+
+    // Overlay "Quit to Kiosk" posts instead of throwing from inside GFX_Events()
+    Kiosk_PostGuestShutdown(KioskShutdownReason::USER_OVERLAY_ABORT);
+    bool raised = false;
+    try {
+        Kiosk_RaisePendingGuestShutdown();
+    } catch (const KioskGuestShutdownException& ex) {
+        raised = true;
+        EXPECT_EQ(KioskShutdownReason::USER_OVERLAY_ABORT, ex.reason);
+    }
+    EXPECT_TRUE(raised);
+    EXPECT_NO_THROW(Kiosk_RaisePendingGuestShutdown());
+
+    // A request left over from a torn-down session is discarded, not raised later
+    Kiosk_PostGuestShutdown(KioskShutdownReason::PORT_8900_SHUTDOWN);
+    Kiosk_ClearPendingGuestShutdown();
+    EXPECT_EQ(KioskShutdownReason::NONE, Kiosk_GetPendingGuestShutdown());
+    EXPECT_NO_THROW(Kiosk_RaisePendingGuestShutdown());
+}
+
+TEST(KioskSynthesizerTest, HostileImportedFieldsAreNotEmitted) {
+    MachineRecord m;
+    m.id = "mach-dos-hostile";
+    m.archetype_id = KioskArchetypes::DX_386;
+    m.boot_mode = "INTEGRATED_DOS";
+
+    CatalogItemRecord base;
+    base.id = "game-hostile";
+    base.host_container_dir = "C:\\games\\hostile";
+    base.guest_working_dir = "C:\\GAME";
+    base.guest_executable = "GAME.EXE";
+    base.return_on_exit = true;
+
+    struct Case { const char* name; CatalogItemRecord item; };
+    std::vector<Case> cases;
+    { CatalogItemRecord it = base; it.guest_arguments = "-x | MOUNT H C:\\"; cases.push_back({"pipe in args", it}); }
+    { CatalogItemRecord it = base; it.guest_arguments = "%PATH%"; cases.push_back({"batch expansion", it}); }
+    { CatalogItemRecord it = base; it.guest_arguments = "> C:\\OUT.TXT"; cases.push_back({"redirection", it}); }
+    { CatalogItemRecord it = base; it.guest_arguments = "\"unbalanced"; cases.push_back({"unbalanced quote", it}); }
+    { CatalogItemRecord it = base; it.guest_arguments = "a\nMOUNT H C:\\"; cases.push_back({"newline in args", it}); }
+    { CatalogItemRecord it = base; it.guest_working_dir = "C:\\GAME\nMOUNT H C:\\"; cases.push_back({"newline in dir", it}); }
+    { CatalogItemRecord it = base; it.guest_working_dir = "C:\\GAME&MOUNT"; cases.push_back({"ampersand in dir", it}); }
+    { CatalogItemRecord it = base; it.guest_executable = "Z:\\MOUNT.COM"; cases.push_back({"drive-qualified exe", it}); }
+    { CatalogItemRecord it = base; it.guest_executable = "CONFIG -set"; cases.push_back({"extensionless exe with options", it}); }
+    { CatalogItemRecord it = base; it.guest_working_dir = "Z:\\"; it.guest_executable = "MOUNT.COM";
+      it.guest_arguments = "H /"; cases.push_back({"Z: working drive", it}); }
+    { CatalogItemRecord it = base; it.guest_working_dir = "Y:\\"; cases.push_back({"unmounted working drive", it}); }
+
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const std::string conf = ConfigSynthesizer::GetInstance().SynthesizeAutoexec(m, &cases[i].item, {});
+        EXPECT_EQ(std::string::npos, conf.find("MOUNT H")) << cases[i].name;
+        EXPECT_EQ(std::string::npos, conf.find("MOUNT.COM")) << cases[i].name;
+        EXPECT_EQ(std::string::npos, conf.find("%PATH%")) << cases[i].name;
+        EXPECT_EQ(std::string::npos, conf.find("OUT.TXT")) << cases[i].name;
+        EXPECT_EQ(std::string::npos, conf.find("GAME.EXE")) << cases[i].name;
+        // A rejected launch returns to the kiosk shell instead of leaving a DOS prompt
+        EXPECT_NE(std::string::npos, conf.find("launch command rejected (unsafe characters).\nEXIT\n")) << cases[i].name;
+    }
+
+    // Host paths that would break out of the quoted MOUNT/IMGMOUNT argument are dropped.
+    CatalogItemRecord quoted = base;
+    quoted.host_container_dir = "C:\\games\\x\" & MOUNT H \"C:\\";
+    CaddyBindingRecord bad;
+    bad.target_drive = "A";
+    bad.slot_order = 1;
+    bad.resolved_file_path = "C:\\disk%TEMP%.img";
+    const std::string conf = ConfigSynthesizer::GetInstance().SynthesizeAutoexec(m, &quoted, {bad});
+    EXPECT_EQ(std::string::npos, conf.find("MOUNT C"));
+    EXPECT_EQ(std::string::npos, conf.find("IMGMOUNT A"));
+    EXPECT_EQ(std::string::npos, conf.find("MOUNT H"));
+
+    // Non-numeric CHS overrides are ignored instead of being spliced into IMGMOUNT.
+    MachineRecord hdd;
+    hdd.id = "mach-hdd-chs";
+    hdd.archetype_id = KioskArchetypes::DX_386;
+    hdd.boot_mode = "REAL_HDD_BOOT";
+    hdd.primary_hdd_path = "C:\\kiosk\\hdd_c.img";
+    hdd.primary_hdd_chs = "1024,16,63 -ro";
+    const std::string hdd_conf = ConfigSynthesizer::GetInstance().SynthesizeAutoexec(hdd, nullptr, {});
+    EXPECT_NE(std::string::npos, hdd_conf.find("IMGMOUNT 2 \"C:\\kiosk\\hdd_c.img\" -t hdd -fs none -ide 1m"));
+    EXPECT_EQ(std::string::npos, hdd_conf.find("-ro"));
 }
 
 TEST(KioskSynthesizerTest, CustomOverridesMerge) {
@@ -650,6 +764,7 @@ TEST_F(KioskLifecycleTest, Port8900ShutdownSequenceAndGuestTrap) {
     EXPECT_EQ(KioskState::STATE_EMULATION_RUNNING, mgr.GetState());
 
     Kiosk_ResetPort8900State();
+    Kiosk_ClearPendingGuestShutdown();
 
     // Partial or mismatched write should not throw
     EXPECT_NO_THROW({
@@ -658,13 +773,22 @@ TEST_F(KioskLifecycleTest, Port8900ShutdownSequenceAndGuestTrap) {
         bochs_port_8900_write(0x8900, 'X', 1);
     });
 
-    // Complete "Shutdown" sequence on port 0x8900 throws KioskGuestShutdownException
+    EXPECT_EQ(KioskShutdownReason::NONE, Kiosk_GetPendingGuestShutdown());
+
+    // Complete "Shutdown" sequence on port 0x8900 must NOT throw (the handler can be
+    // called from dynamic-core generated code); it posts a deferred request instead.
     const char* seq = "Shutdown";
-    bool caught_shutdown = false;
-    try {
+    EXPECT_NO_THROW({
         for (size_t i = 0; seq[i] != '\0'; ++i) {
             bochs_port_8900_write(0x8900, static_cast<Bitu>(seq[i]), 1);
         }
+    });
+    EXPECT_EQ(KioskShutdownReason::PORT_8900_SHUTDOWN, Kiosk_GetPendingGuestShutdown());
+
+    // normal_loop() raises the posted request from a safe frame, clearing it.
+    bool caught_shutdown = false;
+    try {
+        Kiosk_RaisePendingGuestShutdown();
     } catch (const KioskGuestShutdownException& ex) {
         caught_shutdown = true;
         EXPECT_EQ(KioskShutdownReason::PORT_8900_SHUTDOWN, ex.reason);
@@ -672,6 +796,8 @@ TEST_F(KioskLifecycleTest, Port8900ShutdownSequenceAndGuestTrap) {
     }
 
     EXPECT_TRUE(caught_shutdown);
+    EXPECT_EQ(KioskShutdownReason::NONE, Kiosk_GetPendingGuestShutdown());
+    EXPECT_NO_THROW(Kiosk_RaisePendingGuestShutdown());
     EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, mgr.GetState());
     EXPECT_EQ(KioskShutdownReason::PORT_8900_SHUTDOWN, mgr.GetLastShutdownReason());
     EXPECT_EQ(1, mgr.GetCompletedSessionCount());
@@ -782,11 +908,13 @@ TEST(KioskBootInjectorTest, KioskExtComBinaryLayoutAndPort8900Execution) {
     ASSERT_TRUE(mgr.SynthesizeAndPrepareLaunch(conf));
 
     Kiosk_ResetPort8900State();
+    Kiosk_ClearPendingGuestShutdown();
     bool trapped = false;
     try {
         for (size_t i = 0; i < 8; ++i) {
             bochs_port_8900_write(0x8900, KIOSKEXT_COM_BYTES[49 + i], 1);
         }
+        Kiosk_RaisePendingGuestShutdown();
     } catch (const KioskGuestShutdownException& ex) {
         trapped = true;
         EXPECT_EQ(KioskShutdownReason::PORT_8900_SHUTDOWN, ex.reason);

@@ -8,6 +8,7 @@
 #include "../kiosk_host.h"
 #include "../kiosk_main.h"
 #include "../ingest/usb_bridge.h"
+#include "logging.h"
 #include <fstream>
 #include <sstream>
 #include <map>
@@ -28,6 +29,67 @@ bool ConfigSynthesizer::IsSafeAutoexecMountPath(const std::string& path) {
             return false;
         }
     }
+    return true;
+}
+
+bool ConfigSynthesizer::IsSafeGuestDosPath(const std::string& path) {
+    for (size_t i = 0; i < path.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(path[i]);
+        if (ch >= 0x80u || std::isalnum(ch)) continue; // DOS codepage characters are plain filename bytes
+        switch (ch) {
+            case '\\': case '.': case '_': case '-': case '~': case '!': case '#': case '$':
+            case '\'': case '(': case ')': case '@': case '^': case '{': case '}': case ' ':
+                continue;
+            default:
+                return false; // rejects ':', '"', '%', '|', '<', '>', '&', '/', control chars
+        }
+    }
+    return true;
+}
+
+bool ConfigSynthesizer::IsSafeGuestExecutable(const std::string& exe) {
+    if (exe.empty() || exe[0] == '\\' || exe[exe.size() - 1] == '\\' || !IsSafeGuestDosPath(exe)) return false;
+    // Bare names ("TIE") are legal: the shell resolves .COM/.EXE/.BAT in the given directory.
+    // A space is only meaningful inside a real filename, so require an extension then.
+    std::string ext = exe.size() >= 4 ? exe.substr(exe.size() - 4) : std::string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    const bool has_known_ext = ext == ".EXE" || ext == ".COM" || ext == ".BAT";
+    return has_known_ext || exe.find(' ') == std::string::npos;
+}
+
+bool ConfigSynthesizer::IsLaunchableGuestDrive(char drive_letter) {
+    // Only drives the kiosk [autoexec] itself mounts. Never Z: (DOSBox-X built-in programs).
+    const char d = static_cast<char>(std::toupper(static_cast<unsigned char>(drive_letter)));
+    return d == 'A' || d == 'B' || d == 'C' || d == 'D' || d == 'E';
+}
+
+bool ConfigSynthesizer::IsSafeGuestArguments(const std::string& args) {
+    bool in_quotes = false;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(args[i]);
+        if (ch < 0x20u || ch == '%' || ch == '|' || ch == '<' || ch == '>' || ch == '&') {
+            return false;
+        }
+        if (ch == '"') in_quotes = !in_quotes;
+    }
+    return !in_quotes;
+}
+
+static bool IsDecimalToken(const std::string& s) {
+    if (s.empty() || s.size() > 6) return false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(s[i]))) return false;
+    }
+    return true;
+}
+
+// Emits a quoted host path, or a REM marker when the path cannot be emitted safely.
+static bool EmitQuotedHostPath(std::ostringstream& ss, const std::string& path) {
+    if (!ConfigSynthesizer::IsSafeAutoexecMountPath(path)) {
+        LOG_MSG("KIOSK: Rejected unsafe host path for [autoexec] mount (length %u)", static_cast<unsigned>(path.size()));
+        return false;
+    }
+    ss << " \"" << path << "\"";
     return true;
 }
 
@@ -76,15 +138,25 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
     ss << "[autoexec]\n"
        << "@echo off\n";
 
+    // Internally generated, but validated like every other host path before emission
+    std::string safe_dispatch_path = dispatch_image_path;
+    if (!safe_dispatch_path.empty() && !IsSafeAutoexecMountPath(safe_dispatch_path)) {
+        LOG_MSG("KIOSK: Rejected unsafe dispatch image path");
+        safe_dispatch_path.clear();
+    }
+
     // Group caddy bindings by target drive ('A', 'B', 'D', 'E'), verifying USB path containment
     std::map<std::string, std::vector<CaddyBindingRecord>> drive_bindings;
     for (const auto& b : caddy) {
+        if (!IsSafeAutoexecMountPath(b.resolved_file_path)) {
+            LOG_MSG("KIOSK: Rejected unsafe caddy media path for drive %s", b.target_drive.c_str());
+            continue; // Quotes, '%' or control chars would break out of the quoted IMGMOUNT argument
+        }
         if (!b.media_id.empty() && KioskDatabase::GetInstance().IsOpen()) {
             MediaPoolRecord mrec;
             if (KioskDatabase::GetInstance().GetMedia(b.media_id, mrec) && mrec.is_removable_usb) {
-                if (!IsSafeAutoexecMountPath(b.resolved_file_path) ||
-                    !KioskUsbBridge::GetInstance().IsPathContainedInActiveRemovableMount(b.resolved_file_path)) {
-                    continue; // Reject unsafe or escaped USB media path before emitting IMGMOUNT
+                if (!KioskUsbBridge::GetInstance().IsPathContainedInActiveRemovableMount(b.resolved_file_path)) {
+                    continue; // Reject escaped USB media path before emitting IMGMOUNT
                 }
             }
         }
@@ -98,9 +170,11 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
 
     if (machine.boot_mode == "REAL_HDD_BOOT") {
         // 1. Mount primary HDD
-        if (!machine.primary_hdd_path.empty()) {
+        if (!machine.primary_hdd_path.empty() && IsSafeAutoexecMountPath(machine.primary_hdd_path)) {
             ss << "# Mount primary boot hard drive on Primary IDE Master\n"
-               << "IMGMOUNT 2 \"" << machine.primary_hdd_path << "\" -t hdd -fs none";
+               << "IMGMOUNT 2";
+            EmitQuotedHostPath(ss, machine.primary_hdd_path);
+            ss << " -t hdd -fs none";
             if (!machine.primary_hdd_chs.empty()) {
                 // Parse primary_hdd_chs (C,H,S format) and convert to -size 512,S,H,C
                 std::vector<std::string> tokens;
@@ -111,14 +185,17 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
                     token.erase(token.find_last_not_of(" \t\r\n") + 1);
                     if (!token.empty()) tokens.push_back(token);
                 }
-                if (tokens.size() == 3) {
+                if (tokens.size() == 3 && IsDecimalToken(tokens[0]) &&
+                    IsDecimalToken(tokens[1]) && IsDecimalToken(tokens[2])) {
                     // tokens: C, H, S -> IMGMOUNT -size 512,S,H,C
                     ss << " -size 512," << tokens[2] << "," << tokens[1] << "," << tokens[0];
-                } else if (!tokens.empty()) {
-                    ss << " -size " << machine.primary_hdd_chs;
+                } else {
+                    LOG_MSG("KIOSK: Ignoring malformed primary_hdd_chs geometry override");
                 }
             }
             ss << " -ide 1m\n";
+        } else if (!machine.primary_hdd_path.empty()) {
+            LOG_MSG("KIOSK: Rejected unsafe primary HDD path for machine %s", machine.id.c_str());
         }
 
         // 2. Mount floppy caddy (Drive A = 0, Drive B = 1)
@@ -126,7 +203,7 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
         // reserved exclusively for the ephemeral dispatch floppy (B:\KIOSKGO.BAT + B:\KIOSKEXT.COM)
         // so the boot hook and post-exit return script are never shadowed or ejected.
         // Any B: caddy bindings are coalesced into Drive A:'s multi-disk swap queue.
-        const bool reserve_b_for_dispatch = (item != nullptr && !dispatch_image_path.empty());
+        const bool reserve_b_for_dispatch = (item != nullptr && !safe_dispatch_path.empty());
         std::vector<CaddyBindingRecord> floppy_a_queue = drive_bindings["A"];
         if (reserve_b_for_dispatch && !drive_bindings["B"].empty()) {
             const auto& b_list = drive_bindings["B"];
@@ -144,7 +221,7 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
 
         if (reserve_b_for_dispatch) {
             ss << "# Ephemeral Kiosk Dispatch Floppy (Drive B:)\n"
-               << "IMGMOUNT 1 \"" << dispatch_image_path << "\" -t floppy -fs none\n";
+               << "IMGMOUNT 1 \"" << safe_dispatch_path << "\" -t floppy -fs none\n";
         } else if (drive_bindings.find("B") != drive_bindings.end() && !drive_bindings["B"].empty()) {
             ss << "# Floppy Drive B: Session Caddy\n"
                << "IMGMOUNT 1";
@@ -152,9 +229,9 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
                 ss << " \"" << b.resolved_file_path << "\"";
             }
             ss << " -t floppy -fs none\n";
-        } else if (!dispatch_image_path.empty()) {
+        } else if (!safe_dispatch_path.empty()) {
             ss << "# Ephemeral Kiosk Dispatch Floppy (Drive B:)\n"
-               << "IMGMOUNT 1 \"" << dispatch_image_path << "\" -t floppy -fs none\n";
+               << "IMGMOUNT 1 \"" << safe_dispatch_path << "\" -t floppy -fs none\n";
         }
 
         // 3. Mount optical caddy (Drive D on Secondary IDE Master, Drive E on Secondary IDE Slave)
@@ -197,11 +274,21 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
         // INTEGRATED_DOS mode
         // 1. Mount container or default C: drive
         if (item != nullptr && !item->host_container_dir.empty()) {
-            ss << "# Mount container directory as C:\n"
-               << "MOUNT C \"" << item->host_container_dir << "\"\n";
-        } else if (!machine.primary_hdd_path.empty()) {
+            if (IsSafeAutoexecMountPath(item->host_container_dir)) {
+                ss << "# Mount container directory as C:\n"
+                   << "MOUNT C";
+                EmitQuotedHostPath(ss, item->host_container_dir);
+                ss << "\n";
+            } else {
+                LOG_MSG("KIOSK: Rejected unsafe container directory for item %s", item->id.c_str());
+            }
+        } else if (!machine.primary_hdd_path.empty() && IsSafeAutoexecMountPath(machine.primary_hdd_path)) {
             ss << "# Mount machine directory as C:\n"
-               << "MOUNT C \"" << machine.primary_hdd_path << "\"\n";
+               << "MOUNT C";
+            EmitQuotedHostPath(ss, machine.primary_hdd_path);
+            ss << "\n";
+        } else if (!machine.primary_hdd_path.empty()) {
+            LOG_MSG("KIOSK: Rejected unsafe machine directory for machine %s", machine.id.c_str());
         }
 
         // 2. Mount floppies if queued (Drive A and Drive B with DOS filesystem)
@@ -249,6 +336,9 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
         }
 
         // 4. Dispatch executable
+        // Working dir, executable and arguments may originate from an imported (untrusted)
+        // dosbox.conf, and this [autoexec] runs in the DOSBox-X shell, which can MOUNT host
+        // paths. Unsafe launches are dropped, never sanitised into something else.
         if (item != nullptr && !item->guest_executable.empty()) {
             std::string work_dir = item->guest_working_dir;
             char drive_letter = 'C';
@@ -258,22 +348,42 @@ std::string ConfigSynthesizer::SynthesizeAutoexec(
                 drive_letter = static_cast<char>(std::toupper(static_cast<unsigned char>(work_dir[0])));
                 work_dir = work_dir.substr(2);
             }
-            ss << drive_letter << ":\n";
-            if (!work_dir.empty()) {
-                ss << "CD " << work_dir << "\n";
+            work_dir.erase(0, work_dir.find_first_not_of('\\'));
+            while (!work_dir.empty() && work_dir[work_dir.size() - 1] == '\\') {
+                work_dir.erase(work_dir.size() - 1);
             }
-            bool needs_quotes = item->guest_executable.find(' ') != std::string::npos;
-            if (needs_quotes) {
-                ss << "\"" << item->guest_executable << "\"";
+
+            if (!IsLaunchableGuestDrive(drive_letter) ||
+                !IsSafeGuestDosPath(work_dir) ||
+                !IsSafeGuestExecutable(item->guest_executable) ||
+                !IsSafeGuestArguments(item->guest_arguments)) {
+                LOG_MSG("KIOSK: Rejected unsafe launch command for item %s", item->id.c_str());
+                // Return to the kiosk shell instead of leaving an interactive DOSBox-X prompt
+                ss << "ECHO Kiosk: launch command rejected (unsafe characters).\n"
+                   << "EXIT\n";
             } else {
-                ss << item->guest_executable;
-            }
-            if (!item->guest_arguments.empty()) {
-                ss << " " << item->guest_arguments;
-            }
-            ss << "\n";
-            if (item->return_on_exit) {
-                ss << "EXIT\n";
+                ss << drive_letter << ":\n";
+                if (!work_dir.empty()) {
+                    ss << "CD \\" << work_dir << "\n";
+                }
+                // Absolute guest path: a bare name such as MOUNT.COM must never fall
+                // through the PATH search to the DOSBox-X Z:\ built-in programs.
+                std::string exe_path(1, drive_letter);
+                exe_path += ":\\";
+                if (!work_dir.empty()) exe_path += work_dir + "\\";
+                exe_path += item->guest_executable;
+                if (exe_path.find(' ') != std::string::npos) {
+                    ss << "\"" << exe_path << "\"";
+                } else {
+                    ss << exe_path;
+                }
+                if (!item->guest_arguments.empty()) {
+                    ss << " " << item->guest_arguments;
+                }
+                ss << "\n";
+                if (item->return_on_exit) {
+                    ss << "EXIT\n";
+                }
             }
         }
     }
