@@ -1219,6 +1219,7 @@ TEST(KioskBootInjectorTest, RealHddMachineOnlyBootMountsIdleDispatchVolumeWithou
     m_missing.primary_hdd_path = "C:\\kiosk\\nonexistent_hdd_image_12345.img";
     ASSERT_TRUE(db.InsertMachine(m_missing));
 
+    mgr.OnGuestShutdown(KioskShutdownReason::SHELL_EXIT); // End the previous session first
     ASSERT_TRUE(mgr.RequestLaunchMachine("mach-missing-hdd"));
     std::string conf_failed;
     EXPECT_FALSE(mgr.SynthesizeAndPrepareLaunch(conf_failed));
@@ -1314,6 +1315,7 @@ TEST(KioskBootInjectorTest, RealHddCarouselLaunchReservesDriveBForDispatchAndQue
     mach_bind_b.slot_order = 1;
     ASSERT_TRUE(db.AddCaddyBinding(mach_bind_b));
 
+    mgr.OnGuestShutdown(KioskShutdownReason::SHELL_EXIT); // End the item session before booting the machine
     ASSERT_TRUE(mgr.RequestLaunchMachine("mach-b-conflict"));
     std::string conf_mach;
     ASSERT_TRUE(mgr.SynthesizeAndPrepareLaunch(conf_mach));
@@ -1975,14 +1977,13 @@ TEST_F(KioskDatabaseFixture, OverlayCachesSessionCaddyAndTogglesViewMode) {
     b2.slot_order = 2;
     ASSERT_TRUE(db.AddCaddyBinding(b2));
 
-    // Set active launch context and enter STATE_RUNTIME_OVERLAY
+    // Launch the item through the real lifecycle, then enter STATE_RUNTIME_OVERLAY
     KioskManager& km = KioskManager::GetInstance();
-    LaunchContext ctx;
-    ctx.machine_id = mach.id;
-    ctx.catalog_item_id = item.id;
-    ctx.is_real_hdd_boot = false;
-    km.SetLaunchContext(ctx);
-    km.SetState(KioskState::STATE_EMULATION_RUNNING);
+    ASSERT_TRUE(km.Initialize("", "")); // Keeps the fixture database open
+    ASSERT_TRUE(km.RequestLaunchItem(item.id));
+    std::string session_conf;
+    ASSERT_TRUE(km.SynthesizeAndPrepareLaunch(session_conf));
+    ASSERT_EQ(KioskState::STATE_EMULATION_RUNNING, km.GetState());
     km.EnterRuntimeOverlay();
     EXPECT_EQ(KioskState::STATE_RUNTIME_OVERLAY, km.GetState());
 
@@ -2229,7 +2230,7 @@ TEST(KioskInputRouterTest, SuppressesLetterHotkeysDuringTextInput) {
 TEST(KioskCarouselTest, FiltersSortsAndNavigatesItems) {
     ASSERT_TRUE(KioskDatabase::GetInstance().Open(":memory:"));
     KioskManager::GetInstance().Initialize("", "");
-    KioskManager::GetInstance().SetState(KioskState::STATE_SHELL_INTERACTIVE);
+    KioskManager::GetInstance().CancelWatchdog(); // COUNTDOWN_IDLE -> SHELL_INTERACTIVE
 
     MachineRecord mach;
     mach.id = "mach-carousel-1";
@@ -5201,6 +5202,63 @@ TEST_F(KioskDatabaseFixture, MutationsBumpChangeGenerationAndUiReloadsWithoutCal
     ASSERT_TRUE(db.UpdateConfig(cfg));
     EXPECT_GT(db.GetConfigGeneration(), cfg0);
     EXPECT_GT(db.GetChangeGeneration(), gen1);
+}
+
+TEST(KioskLifecycleTableTest, OnlyListedTransitionsAreLegal) {
+    typedef KioskState S;
+    // Happy path
+    EXPECT_TRUE(KioskManager::IsLegalTransition(S::STATE_KIOSK_BOOT, S::STATE_COUNTDOWN_IDLE));
+    EXPECT_TRUE(KioskManager::IsLegalTransition(S::STATE_COUNTDOWN_IDLE, S::STATE_SHELL_INTERACTIVE));
+    EXPECT_TRUE(KioskManager::IsLegalTransition(S::STATE_SHELL_INTERACTIVE, S::STATE_SYNTHESIZE_LAUNCH));
+    EXPECT_TRUE(KioskManager::IsLegalTransition(S::STATE_SYNTHESIZE_LAUNCH, S::STATE_EMULATION_RUNNING));
+    EXPECT_TRUE(KioskManager::IsLegalTransition(S::STATE_EMULATION_RUNNING, S::STATE_RUNTIME_OVERLAY));
+    EXPECT_TRUE(KioskManager::IsLegalTransition(S::STATE_RUNTIME_OVERLAY, S::STATE_EMULATION_RUNNING));
+    EXPECT_TRUE(KioskManager::IsLegalTransition(S::STATE_RUNTIME_OVERLAY, S::STATE_SHELL_INTERACTIVE));
+    EXPECT_TRUE(KioskManager::IsLegalTransition(S::STATE_EMULATION_RUNNING, S::DISABLED));
+    // Rejected: launching mid-session, skipping synthesis, leaving DISABLED, self-loops
+    EXPECT_FALSE(KioskManager::IsLegalTransition(S::STATE_EMULATION_RUNNING, S::STATE_SYNTHESIZE_LAUNCH));
+    EXPECT_FALSE(KioskManager::IsLegalTransition(S::STATE_RUNTIME_OVERLAY, S::STATE_SYNTHESIZE_LAUNCH));
+    EXPECT_FALSE(KioskManager::IsLegalTransition(S::STATE_SYNTHESIZE_LAUNCH, S::STATE_SYNTHESIZE_LAUNCH));
+    EXPECT_FALSE(KioskManager::IsLegalTransition(S::STATE_SHELL_INTERACTIVE, S::STATE_EMULATION_RUNNING));
+    EXPECT_FALSE(KioskManager::IsLegalTransition(S::STATE_SHELL_INTERACTIVE, S::STATE_SHELL_INTERACTIVE));
+    EXPECT_FALSE(KioskManager::IsLegalTransition(S::DISABLED, S::STATE_SHELL_INTERACTIVE));
+}
+
+TEST_F(KioskDatabaseFixture, LifecycleRejectsOutOfOrderRequests) {
+    KioskManager& km = KioskManager::GetInstance();
+    ASSERT_TRUE(km.Initialize("", ""));
+    km.CancelWatchdog();
+    ASSERT_EQ(KioskState::STATE_SHELL_INTERACTIVE, km.GetState());
+
+    // Synthesis without a request does nothing
+    std::string conf;
+    EXPECT_FALSE(km.SynthesizeAndPrepareLaunch(conf));
+    EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, km.GetState());
+
+    ASSERT_TRUE(km.RequestDefaultDosboxLaunch());
+    // A second launch request while one is pending is refused
+    EXPECT_FALSE(km.RequestDefaultDosboxLaunch());
+    ASSERT_TRUE(km.SynthesizeAndPrepareLaunch(conf));
+    ASSERT_EQ(KioskState::STATE_EMULATION_RUNNING, km.GetState());
+    // ... and so is a launch while a session is running
+    EXPECT_FALSE(km.RequestDefaultDosboxLaunch());
+    EXPECT_EQ(KioskState::STATE_EMULATION_RUNNING, km.GetState());
+
+    // Ending the session twice (overlay abort, then the unwinding handler) counts once
+    const int sessions = km.GetCompletedSessionCount();
+    km.EnterRuntimeOverlay();
+    km.AbortSessionToShell();
+    km.OnGuestShutdown(KioskShutdownReason::USER_OVERLAY_ABORT);
+    km.OnGuestShutdown(KioskShutdownReason::SHELL_EXIT);
+    EXPECT_EQ(sessions + 1, km.GetCompletedSessionCount());
+    EXPECT_EQ(KioskShutdownReason::USER_OVERLAY_ABORT, km.GetLastShutdownReason());
+    EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, km.GetState());
+
+    // Resume / overlay calls outside a session are ignored
+    km.ResumeEmulation();
+    km.EnterRuntimeOverlay();
+    EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, km.GetState());
+    km.Shutdown();
 }
 
 #endif // defined(C_DEBUG) && defined(C_KIOSK)
