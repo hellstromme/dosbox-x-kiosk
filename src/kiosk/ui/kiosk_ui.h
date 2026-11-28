@@ -83,7 +83,8 @@ private:
     bool m_context_initialized = false;
     bool m_backend_initialized = false;
     std::atomic<uint64_t> m_cache_generation{1};
-    uint64_t m_loaded_generation = 0;
+    uint64_t m_loaded_generation = 0;        // m_cache_generation + DB change generation at load
+    uint64_t m_loaded_config_generation = 0; // DB config generation the settings draft was taken from
     SDL_Window* m_window = nullptr;
 
     KioskHubTab m_active_tab = KioskHubTab::GAMES;

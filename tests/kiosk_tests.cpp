@@ -5168,4 +5168,39 @@ TEST(KioskFatVolumeTest, ImageLocksAreKeyedByCanonicalPath) {
     std::remove(hdd.c_str());
 }
 
+TEST_F(KioskDatabaseFixture, MutationsBumpChangeGenerationAndUiReloadsWithoutCallbacks) {
+    KioskDatabase& db = KioskDatabase::GetInstance();
+    KioskUI& ui = KioskUI::GetInstance();
+    ui.EnsureCatalogCacheLoaded();
+    const size_t machines_before = ui.GetCachedMachines().size();
+
+    const uint64_t gen0 = db.GetChangeGeneration();
+    const uint64_t cfg0 = db.GetConfigGeneration();
+    MachineRecord m;
+    m.id = "mach-generation";
+    m.display_name = "Generation Test";
+    m.archetype_id = KioskArchetypes::DX_386;
+    m.archetype_tier = 3;
+    m.boot_mode = "INTEGRATED_DOS";
+    ASSERT_TRUE(db.InsertMachine(m));
+    const uint64_t gen1 = db.GetChangeGeneration();
+    EXPECT_GT(gen1, gen0);
+    EXPECT_EQ(cfg0, db.GetConfigGeneration()); // Not a settings change
+
+    // A failed mutation (duplicate primary key) must not report a change
+    EXPECT_FALSE(db.InsertMachine(m));
+    EXPECT_EQ(gen1, db.GetChangeGeneration());
+
+    // The UI notices on its own: the data layer no longer calls into KioskUI
+    ui.EnsureCatalogCacheLoaded();
+    EXPECT_EQ(machines_before + 1, ui.GetCachedMachines().size());
+
+    KioskConfigRecord cfg;
+    ASSERT_TRUE(db.GetConfig(cfg));
+    cfg.boot_timeout_sec = cfg.boot_timeout_sec + 1;
+    ASSERT_TRUE(db.UpdateConfig(cfg));
+    EXPECT_GT(db.GetConfigGeneration(), cfg0);
+    EXPECT_GT(db.GetChangeGeneration(), gen1);
+}
+
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

@@ -120,6 +120,62 @@ const char* KioskHost::GetHostProfileDisplayName(KioskHostProfile profile) {
     }
 }
 
+namespace {
+std::string HostToLowerAscii(const std::string& s) {
+    std::string out(s);
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (out[i] >= 'A' && out[i] <= 'Z') out[i] = static_cast<char>(out[i] - 'A' + 'a');
+    }
+    return out;
+}
+} // anonymous namespace
+
+std::string KioskHost::NormalizeDirPath(const std::string& path) {
+    std::string out = path;
+    while (out.size() > 1) {
+        const char back = out[out.size() - 1];
+#if defined(_WIN32)
+        if (back != '/' && back != '\\') break;
+        // Preserve Windows drive root trailing slash ("E:\")
+        if (out.size() == 3 && out[1] == ':') break;
+#else
+        if (back != '/') break;
+#endif
+        out.pop_back();
+    }
+    return out;
+}
+
+bool KioskHost::PathIsWithin(const std::string& file_path, const std::string& mount_path) {
+    const std::string norm_mount = NormalizeDirPath(mount_path);
+    if (norm_mount.empty() || file_path.size() < norm_mount.size()) {
+        return false;
+    }
+
+    std::string lhs = file_path;
+    std::string rhs = norm_mount;
+#if defined(_WIN32)
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        if (lhs[i] == '\\') lhs[i] = '/';
+    }
+    for (size_t i = 0; i < rhs.size(); ++i) {
+        if (rhs[i] == '\\') rhs[i] = '/';
+    }
+    lhs = HostToLowerAscii(lhs);
+    rhs = HostToLowerAscii(rhs);
+#endif
+    if (lhs.compare(0, rhs.size(), rhs) != 0) {
+        return false;
+    }
+    if (lhs.size() == rhs.size()) {
+        return true;
+    }
+    if (!rhs.empty() && rhs[rhs.size() - 1] == '/') {
+        return true;
+    }
+    return lhs[rhs.size()] == '/';
+}
+
 std::string KioskHost::JoinPath(const std::string& base, const std::string& child) {
     if (base.empty()) return child;
     if (child.empty()) return base;

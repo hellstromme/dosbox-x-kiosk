@@ -245,10 +245,17 @@ void KioskUI::InvalidateSettingsDraft() {
 }
 
 void KioskUI::EnsureCatalogCacheLoaded() {
-    const uint64_t target_gen = m_cache_generation.load(std::memory_order_acquire);
+    KioskDatabase& db = KioskDatabase::GetInstance();
+    // Both counters only grow, so their sum moves whenever either does: UI-local
+    // invalidations and data-layer mutations (which no longer call into the UI).
+    const uint64_t target_gen = m_cache_generation.load(std::memory_order_acquire) + db.GetChangeGeneration();
+    const uint64_t config_gen = db.GetConfigGeneration();
+    if (config_gen != m_loaded_config_generation) {
+        m_settings_draft_loaded = false; // Persisted settings changed underneath the draft
+        m_loaded_config_generation = config_gen;
+    }
     if (m_loaded_generation == target_gen) return;
 
-    KioskDatabase& db = KioskDatabase::GetInstance();
     if (db.IsOpen()) {
         if (!db.GetConfig(m_cached_config)) {
             m_cached_config = KioskManager::GetInstance().GetConfig();
