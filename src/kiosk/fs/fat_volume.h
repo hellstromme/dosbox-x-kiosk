@@ -82,6 +82,7 @@ public:
     bool CommitSectorsAtomically(const SectorMap& sectors) override;
     void AbandonAfterFailedCommit() override;
 
+    // Journal of the canonical image path (symlinks resolved / full path), shared with the lock
     static std::string JournalPathFor(const std::string& image_path);
     static bool HasPendingJournal(const std::string& image_path);
     // Rolls back an interrupted commit and deletes the journal. A torn journal is discarded
@@ -105,6 +106,8 @@ public:
     // many sectors were applied. simulate_power_cut leaves the journal as a dead process
     // would; otherwise it behaves like an I/O error (immediate rollback). Fires once.
     static void SetCommitFaultInjection(int sectors_applied_before_abort, bool simulate_power_cut = true);
+    // Test hook: the next commit fails to invalidate its journal (the durable commit point).
+    static void SetCommitInvalidateFault(bool fail_next_invalidation);
 
 private:
     std::FILE* m_file = nullptr;
@@ -243,7 +246,7 @@ private:
     bool GetFatEntry(uint32_t cluster, uint32_t& out_value) const;
     bool SetFatEntry(uint32_t cluster, uint32_t value);
     bool AllocateChain(uint32_t count, std::vector<uint32_t>& out_chain);
-    void FreeChain(const std::vector<uint32_t>& chain);
+    bool FreeChain(const std::vector<uint32_t>& chain);
     bool CollectChain(uint32_t first_cluster, std::vector<uint32_t>& out_chain) const;
     bool WriteClusterData(uint32_t cluster, const uint8_t* data);
 
@@ -285,6 +288,7 @@ private:
     std::set<uint32_t> m_fresh_clusters;   // Free at mount, allocated since: written directly
     std::set<uint32_t> m_freed_clusters;   // Freed since mount: never reused before commit
     int64_t m_free_cluster_delta = 0;
+    bool m_poisoned = false;            // A FAT update half-staged: only DiscardChanges() is safe
     uint32_t m_alloc_hint = 2;
 };
 

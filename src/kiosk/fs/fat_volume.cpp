@@ -34,15 +34,17 @@ namespace {
 const uint32_t kSector = 512U;
 const size_t kMaxFatCacheSectors = 16384U; // 8 MB of clean FAT sectors
 const uint32_t kMaxChainClusters = 1U << 22;
-const char kJournalMagic[8] = {'K', 'S', 'K', 'J', 'R', 'N', 'L', '2'};
-const char kJournalEndMagic[8] = {'K', 'S', 'K', 'J', 'E', 'N', 'D', '2'};
-const size_t kJournalHeaderSize = 8U + 8U + 4U;
-const size_t kJournalEntrySize = 8U + 4U + kSector;
+const char kJournalMagic[8] = {'K', 'S', 'K', 'J', 'R', 'N', 'L', '3'};
+const char kLegacyJournalMagicV2[8] = {'K', 'S', 'K', 'J', 'R', 'N', 'L', '2'};
+const char kJournalEndMagic[8] = {'K', 'S', 'K', 'J', 'E', 'N', 'D', '3'};
+const size_t kJournalHeaderSize = 8U + 8U + 8U + 4U + 4U;
+const size_t kJournalEntrySize = 8U + kSector;
 const size_t kJournalTrailerSize = 4U + 8U;
 const uint64_t kMaxJournalBytes = 1ULL << 30;
 
 std::atomic<int> g_commit_fault_after(-1);
 std::atomic<bool> g_commit_fault_power_cut(true);
+std::atomic<bool> g_commit_fault_invalidate(false);
 
 uint16_t ReadLe16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
@@ -316,18 +318,20 @@ bool SyncHostFile(std::FILE* f) {
 #endif
 }
 
-// Makes a journal create/delete durable (POSIX directory entry); no-op on Windows.
-void SyncParentDirectory(const std::string& path) {
+// Makes a journal create/delete durable (POSIX directory entry). Returns false if the
+// directory could not be synced. Windows has no directory fsync; NTFS journals the entry.
+bool SyncParentDirectory(const std::string& path) {
 #if !defined(_WIN32)
     const size_t slash = path.find_last_of('/');
     const std::string dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash == 0 ? 1 : slash);
     const int fd = ::open(dir.c_str(), O_RDONLY);
-    if (fd >= 0) {
-        (void)fsync(fd);
-        ::close(fd);
-    }
+    if (fd < 0) return false;
+    const bool ok = fsync(fd) == 0;
+    ::close(fd);
+    return ok;
 #else
     (void)path;
+    return true;
 #endif
 }
 
@@ -431,26 +435,37 @@ bool ParseFatGeometry(const uint8_t* vbr, uint32_t part_lba, uint32_t max_part_s
 // ---- Per-image lock registry ----
 // Serialises every open, commit and recovery of one image across threads (import worker,
 // launch path, crawler): readers share, writers and recovery are exclusive.
-// Canonical key so relative/absolute spellings (and POSIX symlinks) share one mutex.
-std::string NormalizeLockKey(const std::string& path) {
+// One identity per image for both its lock and its journal: the absolute path with
+// symlinks resolved (POSIX realpath) or the full path (Windows GetFullPathNameW).
+std::string CanonicalImagePath(const std::string& path) {
 #if defined(_WIN32)
     std::wstring wide = Utf8ToWide(path);
     wchar_t full[4096];
     const DWORD n = GetFullPathNameW(wide.c_str(), 4096, full, nullptr);
     if (n > 0 && n < 4096) wide.assign(full, n);
-    std::string key;
+    std::string out;
     for (size_t i = 0; i < wide.size(); ++i) {
-        const wchar_t c = (wide[i] == L'/') ? L'\\' : static_cast<wchar_t>(towlower(wide[i]));
-        AppendUtf8(key, static_cast<uint32_t>(c));
+        AppendUtf8(out, static_cast<uint32_t>(wide[i] == L'/' ? L'\\' : wide[i]));
     }
-    return key;
+    return out;
 #else
     char* resolved = realpath(path.c_str(), nullptr);
     if (!resolved) return path; // Not created yet: the raw spelling is all there is
-    std::string key(resolved);
+    std::string out(resolved);
     std::free(resolved);
-    return key;
+    return out;
 #endif
+}
+
+// Lock key: the canonical path, case-folded on Windows (case-insensitive filesystem)
+std::string NormalizeLockKey(const std::string& path) {
+    std::string key = CanonicalImagePath(path);
+#if defined(_WIN32)
+    for (size_t i = 0; i < key.size(); ++i) {
+        if (key[i] >= 'A' && key[i] <= 'Z') key[i] = static_cast<char>(key[i] - 'A' + 'a');
+    }
+#endif
+    return key;
 }
 
 std::shared_ptr<std::shared_timed_mutex> AcquireImageMutex(const std::string& path) {
@@ -530,32 +545,57 @@ void QuarantineJournalFile(const std::string& jpath, const char* reason) {
     LOG_MSG("KIOSK: FAT journal %s not applied (%s); moved to .bad", jpath.c_str(), reason);
 }
 
-// Journal v2 layout:
-//   "KSKJRNL2" | u64 image_bytes | u32 count | count x { u64 lba | u32 crc32(new) | 512 original }
-//   | u32 crc32(everything before) | "KSKJEND2"
+// Journal v3 layout:
+//   "KSKJRNL3" | u64 image_bytes | u64 anchor_lba | u32 crc32(anchor sector) | u32 count
+//   | count x { u64 lba | 512 original } | u32 crc32(everything before) | "KSKJEND3"
+// The anchor is the lowest sector the commit does not touch (normally the MBR/boot sector at
+// LBA 0, which the FAT layer never writes). Image size + anchor CRC bind the journal to the
+// image independently of the sectors being rewritten, so recovery can restore every journaled
+// original even when a power cut left a sector half-written, yet still rejects journals that
+// belong to a replaced or resized image.
 // Caller holds the image's exclusive lock.
-// trusted: the caller wrote this journal and held the exclusive lock throughout (in-process
-// I/O failure), so every journaled sector is restored even if it was only partly written.
-bool RecoverJournalLocked(const std::string& image_path, bool* out_rolled_back, bool trusted = false) {
-    if (out_rolled_back) *out_rolled_back = false;
-    const std::string jpath = image_path + ".kiosk-journal";
-    std::FILE* jf = OpenHostFile(jpath, "rb");
-    if (!jf) return true; // Nothing to recover
+enum class JournalReadStatus { MISSING, IO_ERROR, TOO_LARGE, LOADED };
 
-    std::vector<uint8_t> journal;
+JournalReadStatus ReadJournalFile(const std::string& jpath, std::vector<uint8_t>& out) {
+    out.clear();
+    std::FILE* jf = OpenHostFile(jpath, "rb");
+    if (!jf) return HostFileExists(jpath) ? JournalReadStatus::IO_ERROR : JournalReadStatus::MISSING;
     const int64_t jsize = HostFileSize(jf);
-    bool read_ok = jsize >= 0 && static_cast<uint64_t>(jsize) <= kMaxJournalBytes && SeekHostFile(jf, 0);
-    if (read_ok) {
-        journal.resize(static_cast<size_t>(jsize));
-        read_ok = journal.empty() || std::fread(journal.data(), 1, journal.size(), jf) == journal.size();
+    bool ok = jsize >= 0 && SeekHostFile(jf, 0);
+    if (ok && static_cast<uint64_t>(jsize) > kMaxJournalBytes) {
+        std::fclose(jf);
+        return JournalReadStatus::TOO_LARGE; // Commits never write journals this large
+    }
+    if (ok) {
+        out.resize(static_cast<size_t>(jsize));
+        ok = out.empty() || std::fread(out.data(), 1, out.size(), jf) == out.size();
     }
     std::fclose(jf);
+    return ok ? JournalReadStatus::LOADED : JournalReadStatus::IO_ERROR;
+}
 
-    bool valid = read_ok && journal.size() >= kJournalHeaderSize + kJournalTrailerSize &&
+bool RecoverOneJournal(const std::string& image_path, const std::string& jpath, bool* out_rolled_back) {
+    std::vector<uint8_t> journal;
+    const JournalReadStatus rs = ReadJournalFile(jpath, journal);
+    if (rs == JournalReadStatus::MISSING) return true;
+    if (rs == JournalReadStatus::TOO_LARGE) {
+        QuarantineJournalFile(jpath, "larger than any journal a commit writes");
+        return true;
+    }
+    if (rs == JournalReadStatus::IO_ERROR) {
+        LOG_MSG("KIOSK: Cannot read FAT journal %s; keeping it for the next attempt", jpath.c_str());
+        return false;
+    }
+
+    if (journal.size() >= 8 && std::memcmp(journal.data(), kLegacyJournalMagicV2, 8) == 0) {
+        QuarantineJournalFile(jpath, "journal from an older kiosk build");
+        return true;
+    }
+    bool valid = journal.size() >= kJournalHeaderSize + kJournalTrailerSize &&
                  std::memcmp(journal.data(), kJournalMagic, 8) == 0;
     uint32_t count = 0;
     if (valid) {
-        count = ReadLe32(journal.data() + 16);
+        count = ReadLe32(journal.data() + 28);
         const size_t body_bytes = journal.size() - kJournalHeaderSize - kJournalTrailerSize;
         // Overflow-safe: compare count against what the file can actually hold
         valid = body_bytes % kJournalEntrySize == 0 && count == body_bytes / kJournalEntrySize;
@@ -566,8 +606,9 @@ bool RecoverJournalLocked(const std::string& image_path, bool* out_rolled_back, 
                 std::memcmp(journal.data() + body + 4, kJournalEndMagic, 8) == 0;
     }
     if (!valid) {
-        // Torn journal: the image is only modified after the journal is durable, so it is intact.
-        LOG_MSG("KIOSK: Discarding incomplete FAT journal %s (image untouched)", jpath.c_str());
+        // Positively identified as incomplete (crash while writing it) or invalidated at the
+        // commit point: in both cases the image needs no rollback.
+        LOG_MSG("KIOSK: Discarding incomplete or committed FAT journal %s", jpath.c_str());
         if (!RemoveHostFile(jpath)) QuarantineJournalFile(jpath, "incomplete and not removable");
         SyncParentDirectory(jpath);
         return true;
@@ -583,39 +624,54 @@ bool RecoverJournalLocked(const std::string& image_path, bool* out_rolled_back, 
         return false;
     }
     const int64_t img_size = HostFileSize(img);
-    if (img_size < 0 || static_cast<uint64_t>(img_size) != ReadLe64(journal.data() + 8)) {
+    if (img_size < 0) {
+        std::fclose(img);
+        return false; // I/O error: keep the journal
+    }
+    if (static_cast<uint64_t>(img_size) != ReadLe64(journal.data() + 8)) {
         std::fclose(img);
         QuarantineJournalFile(jpath, "image size changed since the journal was written");
         return true;
     }
     const uint64_t img_sectors = static_cast<uint64_t>(img_size) / kSector;
-
-    // Validate every sector before touching anything: each must hold either the journaled
-    // original (already rolled back) or exactly the new contents this journal wrote.
-    std::vector<uint32_t> to_restore;
+    const uint64_t anchor_lba = ReadLe64(journal.data() + 16);
     uint8_t current[kSector];
+    if (anchor_lba >= img_sectors) {
+        std::fclose(img);
+        QuarantineJournalFile(jpath, "journal does not match this image");
+        return true;
+    }
+    if (!SeekHostFile(img, anchor_lba * kSector) || std::fread(current, 1, kSector, img) != kSector) {
+        std::fclose(img);
+        return false; // I/O error: keep the journal
+    }
+    if (Crc32(current, kSector) != ReadLe32(journal.data() + 24)) {
+        std::fclose(img);
+        QuarantineJournalFile(jpath, "journal belongs to a different image");
+        return true;
+    }
+
+    // Same image: restore every journaled original (torn or fully written alike)
+    std::vector<uint32_t> to_restore;
     for (uint32_t i = 0; i < count; ++i) {
         const uint8_t* ent = journal.data() + kJournalHeaderSize + static_cast<size_t>(i) * kJournalEntrySize;
         const uint64_t lba = ReadLe64(ent);
-        if (lba >= img_sectors || !SeekHostFile(img, lba * kSector) ||
-            std::fread(current, 1, kSector, img) != kSector) {
+        if (lba >= img_sectors) {
             std::fclose(img);
             QuarantineJournalFile(jpath, "journal does not match this image");
             return true;
         }
-        if (std::memcmp(current, ent + 12, kSector) == 0) continue;
-        if (!trusted && Crc32(current, kSector) != ReadLe32(ent + 8)) {
+        if (!SeekHostFile(img, lba * kSector) || std::fread(current, 1, kSector, img) != kSector) {
             std::fclose(img);
-            QuarantineJournalFile(jpath, "image was modified after the interrupted write");
-            return true;
+            return false; // I/O error: keep the journal
         }
-        to_restore.push_back(i);
+        if (std::memcmp(current, ent + 8, kSector) != 0) to_restore.push_back(i);
     }
 
     bool ok = true;
     for (size_t k = 0; k < to_restore.size() && ok; ++k) {
         const uint8_t* ent = journal.data() + kJournalHeaderSize + static_cast<size_t>(to_restore[k]) * kJournalEntrySize;
-        ok = SeekHostFile(img, ReadLe64(ent) * kSector) && std::fwrite(ent + 12, 1, kSector, img) == kSector;
+        ok = SeekHostFile(img, ReadLe64(ent) * kSector) && std::fwrite(ent + 8, 1, kSector, img) == kSector;
     }
     ok = ok && SyncHostFile(img);
     std::fclose(img);
@@ -629,6 +685,29 @@ bool RecoverJournalLocked(const std::string& image_path, bool* out_rolled_back, 
             static_cast<unsigned>(to_restore.size()), count);
     if (out_rolled_back) *out_rolled_back = true;
     return true;
+}
+
+// Journals live next to the canonical image path; a journal left next to another spelling
+// of the same image by an earlier build is recovered too.
+std::vector<std::string> CandidateJournalPaths(const std::string& image_path) {
+    std::vector<std::string> paths;
+    paths.push_back(CanonicalImagePath(image_path) + ".kiosk-journal");
+    const std::string raw = image_path + ".kiosk-journal";
+    if (raw != paths[0]) paths.push_back(raw);
+    return paths;
+}
+
+bool RecoverJournalLocked(const std::string& image_path, bool* out_rolled_back) {
+    if (out_rolled_back) *out_rolled_back = false;
+    const std::string canonical = CanonicalImagePath(image_path);
+    const std::vector<std::string> journals = CandidateJournalPaths(image_path);
+    bool ok = true;
+    for (size_t i = 0; i < journals.size(); ++i) {
+        bool rolled = false;
+        if (!RecoverOneJournal(canonical, journals[i], &rolled)) ok = false;
+        if (rolled && out_rolled_back) *out_rolled_back = true;
+    }
+    return ok;
 }
 
 } // anonymous namespace
@@ -667,11 +746,19 @@ KioskFileSectorDevice::~KioskFileSectorDevice() {
 }
 
 std::string KioskFileSectorDevice::JournalPathFor(const std::string& image_path) {
-    return image_path + ".kiosk-journal";
+    return CanonicalImagePath(image_path) + ".kiosk-journal";
 }
 
 bool KioskFileSectorDevice::HasPendingJournal(const std::string& image_path) {
-    return HostFileExists(JournalPathFor(image_path));
+    const std::vector<std::string> journals = CandidateJournalPaths(image_path);
+    for (size_t i = 0; i < journals.size(); ++i) {
+        if (HostFileExists(journals[i])) return true;
+    }
+    return false;
+}
+
+void KioskFileSectorDevice::SetCommitInvalidateFault(bool fail_next_invalidation) {
+    g_commit_fault_invalidate.store(fail_next_invalidation);
 }
 
 void KioskFileSectorDevice::SetCommitFaultInjection(int sectors_applied_before_abort, bool simulate_power_cut) {
@@ -699,8 +786,9 @@ void KioskFileSectorDevice::QuarantinePendingJournal(const std::string& image_pa
         LOG_MSG("KIOSK: Could not lock %s to quarantine a stale FAT journal (busy)", image_path.c_str());
         return;
     }
-    if (HasPendingJournal(image_path)) {
-        QuarantineJournalFile(JournalPathFor(image_path), "image was recreated");
+    const std::vector<std::string> journals = CandidateJournalPaths(image_path);
+    for (size_t i = 0; i < journals.size(); ++i) {
+        if (HostFileExists(journals[i])) QuarantineJournalFile(journals[i], "image was recreated");
     }
     mtx->unlock();
 }
@@ -714,6 +802,13 @@ bool KioskFileSectorDevice::PinForGuestSession(const std::string& image_path) {
     ReleaseGuestSessionPin();
     std::shared_ptr<std::shared_timed_mutex> mtx = AcquireImageMutex(image_path);
     if (!mtx->try_lock_shared()) return false;
+    // Checked under the shared lock: no writer can create a journal while we hold it, so a
+    // guest never mounts an image that still has an interrupted write pending.
+    if (HasPendingJournal(image_path)) {
+        mtx->unlock_shared();
+        LOG_MSG("KIOSK: Refusing guest session on %s: interrupted write pending rollback", image_path.c_str());
+        return false;
+    }
     std::lock_guard<std::mutex> guard(g_guest_pin_mutex);
     g_guest_pin = mtx;
     return true;
@@ -742,6 +837,7 @@ bool KioskFileSectorDevice::Open(const std::string& path, bool writable, std::st
         return false;
     }
     m_lock_exclusive = writable;
+    const std::string canonical = CanonicalImagePath(path);
 
     if (writable) {
         if (!RecoverJournalLocked(path, nullptr)) {
@@ -756,7 +852,7 @@ bool KioskFileSectorDevice::Open(const std::string& path, bool writable, std::st
         return false;
     }
 
-    m_file = OpenHostFile(path, writable ? "rb+" : "rb");
+    m_file = OpenHostFile(canonical, writable ? "rb+" : "rb");
     if (!m_file) {
         if (out_error) *out_error = std::string("Failed to open disk image ") + (writable ? "for writing: " : ": ") + path;
         Close();
@@ -768,7 +864,7 @@ bool KioskFileSectorDevice::Open(const std::string& path, bool writable, std::st
         Close();
         return false;
     }
-    m_path = path;
+    m_path = canonical;
     m_file_bytes = static_cast<uint64_t>(size);
     m_sector_count = static_cast<uint64_t>(size) / kSector;
     m_writable = writable;
@@ -816,32 +912,41 @@ bool KioskFileSectorDevice::CommitSectorsAtomically(const SectorMap& sectors) {
     if (!SyncHostFile(m_file)) return false;
     if (sectors.empty()) return true;
 
-    // 1. Undo journal: original contents of every sector about to change (+ CRC of the new contents)
+    // Anchor: the lowest sector this commit does not rewrite (binds the journal to the image)
+    uint64_t anchor_lba = 0;
+    while (sectors.count(anchor_lba) != 0) ++anchor_lba;
+    uint8_t anchor[kSector];
+    if (anchor_lba >= m_sector_count || !ReadSectors(anchor_lba, 1, anchor)) return false;
+
+    // 1. Undo journal: original contents of every sector about to change
     std::vector<uint8_t> journal;
     journal.reserve(kJournalHeaderSize + sectors.size() * kJournalEntrySize + kJournalTrailerSize);
     journal.insert(journal.end(), kJournalMagic, kJournalMagic + 8);
     AppendLe64(journal, m_file_bytes); // Exact size, so odd-tail images still recover
+    AppendLe64(journal, anchor_lba);
+    AppendLe32(journal, Crc32(anchor, kSector));
     AppendLe32(journal, static_cast<uint32_t>(sectors.size()));
     uint8_t original[kSector];
     for (SectorMap::const_iterator it = sectors.begin(); it != sectors.end(); ++it) {
         if (it->second.size() != kSector || !ReadSectors(it->first, 1, original)) return false;
         AppendLe64(journal, it->first);
-        AppendLe32(journal, Crc32(it->second.data(), kSector));
         journal.insert(journal.end(), original, original + kSector);
     }
     AppendLe32(journal, Crc32(journal.data(), journal.size()));
     journal.insert(journal.end(), kJournalEndMagic, kJournalEndMagic + 8);
-    if (journal.size() > kMaxJournalBytes) return false; // Recovery would treat it as torn
+    if (journal.size() > kMaxJournalBytes) return false; // Recovery would quarantine it
 
     std::FILE* jf = CreateHostFileExclusive(jpath, 0600);
     if (!jf) return false;
     const bool journal_ok = std::fwrite(journal.data(), 1, journal.size(), jf) == journal.size() && SyncHostFile(jf);
     std::fclose(jf);
-    if (!journal_ok) {
+    // The journal's directory entry must be durable too, or a power cut could lose the only
+    // way back. Nothing live has been written yet, so failing here is always safe.
+    if (!journal_ok || !SyncParentDirectory(jpath)) {
+        LOG_MSG("KIOSK: FAT journal %s could not be made durable; commit aborted before any write", jpath.c_str());
         RemoveHostFile(jpath);
         return false;
     }
-    SyncParentDirectory(jpath);
 
     // 2. Apply. A crash from here on leaves a complete journal that rolls the image back.
     int applied = 0;
@@ -862,27 +967,32 @@ bool KioskFileSectorDevice::CommitSectorsAtomically(const SectorMap& sectors) {
         ++applied;
     }
     ok = ok && SyncHostFile(m_file);
-    if (!ok) {
+
+    // 3. Commit point: durably invalidate the journal header. Only then is the write
+    // acknowledged; removing the (now inert) file afterwards is mere cleanup.
+    bool committed = false;
+    if (ok) {
+        if (g_commit_fault_invalidate.exchange(false)) {
+            committed = false; // Test hook: simulate an invalidation failure
+        } else if (std::FILE* inval = OpenHostFile(jpath, "rb+")) {
+            const uint8_t zeros[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            committed = SeekHostFile(inval, 0) && std::fwrite(zeros, 1, sizeof(zeros), inval) == sizeof(zeros) &&
+                        SyncHostFile(inval);
+            std::fclose(inval);
+        }
+    }
+    if (!committed) {
         // Roll back immediately (we hold the exclusive lock) and refuse further use
         std::fflush(m_file);
         m_failed = true;
-        if (!RecoverJournalLocked(m_path, nullptr, /*trusted=*/true)) {
+        if (!RecoverOneJournal(m_path, jpath, nullptr)) {
             LOG_MSG("KIOSK: FAT commit on %s failed and rollback is still pending (journal kept)", m_path.c_str());
         }
         return false;
     }
-
-    // 3. Commit point: invalidate the journal header durably before unlinking it. If the
-    // unlink is lost (no directory fsync on Windows), recovery sees a torn journal and keeps
-    // the committed image instead of rolling it back.
-    if (std::FILE* inval = OpenHostFile(jpath, "rb+")) {
-        const uint8_t zeros[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        const bool ok_inval = SeekHostFile(inval, 0) && std::fwrite(zeros, 1, sizeof(zeros), inval) == sizeof(zeros) &&
-                              SyncHostFile(inval);
-        std::fclose(inval);
-        if (!ok_inval) LOG_MSG("KIOSK: Could not invalidate FAT journal %s before removal", jpath.c_str());
+    if (!RemoveHostFile(jpath)) {
+        LOG_MSG("KIOSK: Committed, but could not remove invalidated FAT journal %s (harmless)", jpath.c_str());
     }
-    RemoveHostFile(jpath);
     SyncParentDirectory(jpath);
     return true;
 }
@@ -1120,6 +1230,7 @@ void KioskFatVolume::DiscardChanges() {
     m_fresh_clusters.clear();
     m_freed_clusters.clear();
     m_free_cluster_delta = 0;
+    m_poisoned = false;
 }
 
 // ============================================================================
@@ -1292,7 +1403,7 @@ bool KioskFatVolume::SetFatEntry(uint32_t cluster, uint32_t value) {
 bool KioskFatVolume::AllocateChain(uint32_t count, std::vector<uint32_t>& out_chain) {
     out_chain.clear();
     if (count == 0) return true;
-    if (!IsWritable()) return false;
+    if (!IsWritable() || m_poisoned) return false;
     const uint32_t end = m_alloc_limit + 2U;
     uint32_t c = (m_alloc_hint >= 2 && m_alloc_hint < end) ? m_alloc_hint : 2U;
     for (uint32_t scanned = 0; scanned < m_alloc_limit && out_chain.size() < count; ++scanned) {
@@ -1310,6 +1421,9 @@ bool KioskFatVolume::AllocateChain(uint32_t count, std::vector<uint32_t>& out_ch
     for (size_t i = 0; i < out_chain.size(); ++i) {
         const uint32_t next = (i + 1 < out_chain.size()) ? out_chain[i + 1] : EndOfChainValue();
         if (!SetFatEntry(out_chain[i], next)) {
+            // Partially linked chain: never commit it
+            for (size_t k = 0; k < out_chain.size(); ++k) m_freed_clusters.insert(out_chain[k]);
+            m_poisoned = true;
             out_chain.clear();
             return false;
         }
@@ -1321,14 +1435,24 @@ bool KioskFatVolume::AllocateChain(uint32_t count, std::vector<uint32_t>& out_ch
     return true;
 }
 
-void KioskFatVolume::FreeChain(const std::vector<uint32_t>& chain) {
+bool KioskFatVolume::FreeChain(const std::vector<uint32_t>& chain) {
+    bool ok = true;
     for (size_t i = 0; i < chain.size(); ++i) {
+        // Reserve first: even if the FAT update only half-stages (e.g. one mirror), the
+        // cluster can never be reallocated or written directly in this transaction.
+        m_freed_clusters.insert(chain[i]);
+        m_fresh_clusters.erase(chain[i]);
         if (SetFatEntry(chain[i], 0)) {
-            m_freed_clusters.insert(chain[i]);
-            m_fresh_clusters.erase(chain[i]);
             ++m_free_cluster_delta;
+        } else {
+            ok = false;
         }
     }
+    if (!ok) {
+        m_poisoned = true; // FAT copies may now disagree: this transaction must be discarded
+        LOG_MSG("KIOSK: FAT free failed; transaction can only be discarded");
+    }
+    return ok;
 }
 
 bool KioskFatVolume::CollectChain(uint32_t first_cluster, std::vector<uint32_t>& out_chain) const {
@@ -1918,7 +2042,10 @@ bool KioskFatVolume::WriteFileReplacing(uint32_t parent_dir, const std::string& 
             out_error = "Failed to truncate cluster chain of " + name;
             return false;
         }
-        FreeChain(tail);
+        if (!FreeChain(tail)) {
+            out_error = "Failed to free truncated clusters of " + name;
+            return false;
+        }
         chain.resize(needed);
     }
 
@@ -1974,6 +2101,10 @@ bool KioskFatVolume::StageFsInfoUpdate() {
 bool KioskFatVolume::Commit(std::string* out_error) {
     if (!IsWritable()) {
         if (out_error) *out_error = "Volume is not writable";
+        return false;
+    }
+    if (m_poisoned) {
+        if (out_error) *out_error = "A FAT update failed earlier in this transaction; discard and retry";
         return false;
     }
     if (m_dirty.empty() && m_fresh_clusters.empty() && m_freed_clusters.empty()) return true;

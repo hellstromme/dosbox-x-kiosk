@@ -690,6 +690,13 @@ std::string KioskManager::GetDefaultSessionConfPath() const {
 }
 
 bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf) {
+    // Releases the guest-session HDD pin on every failure path after it was taken
+    struct GuestPinGuard {
+        bool armed = false;
+        ~GuestPinGuard() {
+            if (armed) KioskFileSectorDevice::ReleaseGuestSessionPin();
+        }
+    } guest_pin;
     if (m_state.load() != KioskState::STATE_SYNTHESIZE_LAUNCH) {
         LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch ignored: no launch was requested (state %s).",
                 KioskStateName(m_state.load()));
@@ -824,8 +831,10 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
 
         // Keep kiosk writers (e.g. a background Mode B import) off this image while the guest
         // has it mounted; the pin lasts until teardown / re-exec.
-        if (hdd_file_exists && !KioskFileSectorDevice::PinForGuestSession(machine.primary_hdd_path)) {
-            LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: '%s' is being written by another kiosk operation.",
+        if (hdd_file_exists && KioskFileSectorDevice::PinForGuestSession(machine.primary_hdd_path)) {
+            guest_pin.armed = true; // Released by the guard on any failure below
+        } else if (hdd_file_exists) {
+            LOG_MSG("KIOSK: SynthesizeAndPrepareLaunch failed: '%s' is being written or has an interrupted write pending.",
                     machine.primary_hdd_path.c_str());
             KioskUI::GetInstance().ShowToast("Disk image is busy (an import may be running). Try again shortly.", 4.0f);
             if (!active_dispatch_path.empty()) {
@@ -862,6 +871,7 @@ bool KioskManager::SynthesizeAndPrepareLaunch(std::string& out_synthesized_conf)
         m_session_conf_path = session_conf_path;
     }
 
+    guest_pin.armed = false; // Launch succeeded: the pin stays until session teardown
     TryTransitionFrom(KioskState::STATE_SYNTHESIZE_LAUNCH, KioskState::STATE_EMULATION_RUNNING);
     LOG_MSG("KIOSK: Configuration synthesized (%u bytes); entering STATE_EMULATION_RUNNING.",
             static_cast<unsigned int>(out_synthesized_conf.size()));

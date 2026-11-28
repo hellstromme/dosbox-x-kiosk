@@ -2805,7 +2805,10 @@ IngestResult ArchiveImporter::ImportArchive(const IngestOptions& options) {
         {
             KioskFatVolume probe;
             std::string probe_err;
-            if (!probe.OpenImageFile(target_mach.primary_hdd_path, /*writable=*/false, &probe_err)) {
+            // Writable (recovery-capable) open: a retry after an interrupted write rolls the
+            // image back here instead of being refused forever. Nothing is staged, so the
+            // probe never commits. Still refused if the image is busy or recovery fails.
+            if (!probe.OpenImageFile(target_mach.primary_hdd_path, /*writable=*/true, &probe_err)) {
                 // Never fall back to the default folder blindly: it may belong to another game
                 result.error_message = probe_err.empty() ? "Cannot inspect target HDD image" : probe_err;
                 return result;

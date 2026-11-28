@@ -4560,7 +4560,10 @@ const size_t kSynthFat16RootBytes = 16U * 512U;
 
 // Disarms the commit fault hook even when an assertion aborts the test early
 struct FatFaultInjectionGuard {
-    ~FatFaultInjectionGuard() { KioskFileSectorDevice::SetCommitFaultInjection(-1); }
+    ~FatFaultInjectionGuard() {
+        KioskFileSectorDevice::SetCommitFaultInjection(-1);
+        KioskFileSectorDevice::SetCommitInvalidateFault(false);
+    }
 };
 
 uint16_t TestReadFat12Raw(const std::vector<uint8_t>& img, uint32_t cluster) {
@@ -5259,6 +5262,90 @@ TEST_F(KioskDatabaseFixture, LifecycleRejectsOutOfOrderRequests) {
     km.EnterRuntimeOverlay();
     EXPECT_EQ(KioskState::STATE_SHELL_INTERACTIVE, km.GetState());
     km.Shutdown();
+}
+
+TEST(KioskFatVolumeTest, PowerTornSectorIsStillRolledBack) {
+    // A power cut can leave a journaled sector holding neither the original nor the new bytes.
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fattorn.img";
+    const std::string journal = KioskFileSectorDevice::JournalPathFor(hdd);
+    std::remove(journal.c_str());
+    std::remove((journal + ".bad").c_str());
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    const std::vector<uint8_t> original = TestReadWholeFile(hdd);
+    FatFaultInjectionGuard guard;
+    KioskFileSectorDevice::SetCommitFaultInjection(1);
+    EXPECT_FALSE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(hdd));
+    ASSERT_TRUE(TestFileExists(journal));
+    {
+        // Tear the first FAT sector (a journaled metadata sector) with garbage
+        std::fstream f(hdd.c_str(), std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(static_cast<std::streamoff>(kSynthFat16FatOffset));
+        const std::vector<uint8_t> garbage(512, 0xA7);
+        f.write(reinterpret_cast<const char*>(garbage.data()), 512);
+    }
+    bool rolled_back = false;
+    ASSERT_TRUE(KioskFileSectorDevice::RecoverPendingJournal(hdd, &rolled_back));
+    EXPECT_TRUE(rolled_back);
+    EXPECT_FALSE(TestFileExists(journal + ".bad"));
+    const std::vector<uint8_t> after = TestReadWholeFile(hdd);
+    EXPECT_TRUE(std::equal(original.begin(), original.begin() + kSynthFat16RootOffset + kSynthFat16RootBytes,
+                           after.begin()));
+    std::remove(hdd.c_str());
+}
+
+TEST(KioskFatVolumeTest, CommitIsOnlyAcknowledgedAfterDurableCommitPoint) {
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatcp.img";
+    const std::string journal = KioskFileSectorDevice::JournalPathFor(hdd);
+    std::remove(journal.c_str());
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    const std::vector<uint8_t> original = TestReadWholeFile(hdd);
+    FatFaultInjectionGuard guard;
+    KioskFileSectorDevice::SetCommitInvalidateFault(true);
+    // Every sector was applied, but the journal could not be invalidated: report failure and
+    // roll back so a later recovery can never revert an acknowledged write.
+    EXPECT_FALSE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(hdd));
+    KioskFileSectorDevice::SetCommitInvalidateFault(false);
+    EXPECT_FALSE(TestFileExists(journal));
+    const std::vector<uint8_t> after = TestReadWholeFile(hdd);
+    EXPECT_TRUE(std::equal(original.begin(), original.begin() + kSynthFat16RootOffset + kSynthFat16RootBytes,
+                           after.begin()));
+    EXPECT_TRUE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(hdd)); // Clean retry works
+    std::remove(hdd.c_str());
+}
+
+TEST(KioskFatVolumeTest, GuestPinIsRefusedWhileAJournalIsPending) {
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatpin.img";
+    const std::string journal = KioskFileSectorDevice::JournalPathFor(hdd);
+    std::remove(journal.c_str());
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    FatFaultInjectionGuard guard;
+    KioskFileSectorDevice::SetCommitFaultInjection(0);
+    EXPECT_FALSE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(hdd));
+    ASSERT_TRUE(KioskFileSectorDevice::HasPendingJournal(hdd));
+    EXPECT_FALSE(KioskFileSectorDevice::PinForGuestSession(hdd)); // Never mount a half-written image
+    ASSERT_TRUE(KioskFileSectorDevice::RecoverPendingJournal(hdd));
+    EXPECT_TRUE(KioskFileSectorDevice::PinForGuestSession(hdd));
+    KioskFileSectorDevice::ReleaseGuestSessionPin();
+    std::remove(hdd.c_str());
+}
+
+TEST(KioskFatVolumeTest, AliasPathsShareOneJournalIdentity) {
+    const std::string hdd = BootInjector::GetInstance().GetDefaultDispatchImagePath() + ".fatalias.img";
+    const size_t slash = hdd.find_last_of("\\/");
+    ASSERT_NE(std::string::npos, slash);
+    const std::string alias = hdd.substr(0, slash + 1) + "." + hdd.substr(slash, 1) + hdd.substr(slash + 1);
+    EXPECT_EQ(KioskFileSectorDevice::JournalPathFor(hdd), KioskFileSectorDevice::JournalPathFor(alias));
+    std::remove(KioskFileSectorDevice::JournalPathFor(hdd).c_str());
+    ASSERT_TRUE(WriteSyntheticFat16HddImage(hdd));
+    FatFaultInjectionGuard guard;
+    KioskFileSectorDevice::SetCommitFaultInjection(1);
+    EXPECT_FALSE(BootInjector::GetInstance().EnsureOneTimeAutoexecHook(alias)); // Interrupted via the alias
+    EXPECT_TRUE(KioskFileSectorDevice::HasPendingJournal(hdd));               // ... visible via the real path
+    FatReadOnlyVfs vfs;
+    EXPECT_FALSE(vfs.OpenImageFile(hdd)); // A reader via the other spelling still refuses the torn image
+    ASSERT_TRUE(KioskFileSectorDevice::RecoverPendingJournal(hdd));
+    EXPECT_FALSE(KioskFileSectorDevice::HasPendingJournal(alias));
+    std::remove(hdd.c_str());
 }
 
 #endif // defined(C_DEBUG) && defined(C_KIOSK)

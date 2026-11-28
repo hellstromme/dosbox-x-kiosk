@@ -246,6 +246,22 @@ bool BootInjector::EnsureOneTimeAutoexecHook(const std::string& hdd_or_autoexec_
     // shared journaled FAT layer: the image is either fully hooked or left untouched.
     KioskFatVolume volume;
     std::string err;
+    std::string upper_ext = hdd_or_autoexec_path.size() >= 4 ? ToUpperAscii(hdd_or_autoexec_path.substr(hdd_or_autoexec_path.size() - 4)) : "";
+    if (upper_ext == ".VHD") {
+        // The kiosk FAT writer never modifies VHD containers, but an image that is already
+        // hooked can still boot: verify read-only and refuse only if the hook is missing.
+        FatDirEntry hooked;
+        std::vector<uint8_t> bytes;
+        if (volume.OpenImageFile(hdd_or_autoexec_path, /*writable=*/false, &err) &&
+            volume.FindPath("\\AUTOEXEC.BAT", hooked) && !hooked.is_directory &&
+            volume.ReadFile(hooked, bytes, 1024U * 1024U) &&
+            HasAutoexecHook(std::string(bytes.begin(), bytes.end()))) {
+            return true;
+        }
+        LOG_MSG("KIOSK: AUTOEXEC hook missing on VHD image %s; VHDs cannot be modified by the kiosk",
+                hdd_or_autoexec_path.c_str());
+        return false;
+    }
     if (!volume.OpenImageFile(hdd_or_autoexec_path, /*writable=*/true, &err)) {
         LOG_MSG("KIOSK: AUTOEXEC hook skipped: %s", err.c_str());
         return false;
